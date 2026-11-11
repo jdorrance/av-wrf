@@ -1,0 +1,16 @@
+# NOAA GFS 0.25 deg operational forcing profile (34+ isobaric levels + dedicated SST).
+# References:
+# - AWS Open Data Registry: https://registry.opendata.aws/noaa-gfs-bdp-pds/
+# - Noah-MP 4-layer soil centers [5, 25, 70, 150 cm]: https://github.com/NCAR/noahmp
+profile_id: noaa-gfs-0p25-v1
+provider: NOAA
+grid_spacing_deg: 0.25
+pressure_level_count: 34
+soil_layer_centers_cm: [5.0, 25.0, 70.0, 150.0]
+has_dedicated_sst: true
+source_ready_lag_p95_hours: 4.8
+mirrors:
+  - https://noaa-gfs-bdp-pds.s3.amazonaws.com
+  - https://storage.googleapis.com/global-forecast-system
+  - https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod
+fail_closed: true

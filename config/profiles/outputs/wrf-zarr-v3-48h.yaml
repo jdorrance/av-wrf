@@ -1,0 +1,12 @@
+# Zarr v3 sharded native model-level output profile.
+# References:
+# - Zarr v3 sharding_indexed & zstd/crc32c codecs: https://zarr.readthedocs.io/en/stable/api/zarr/codecs/
+# - GeoZarr CRS conventions: https://github.com/zarr-developers/geozarr-spec
+profile_id: wrf-zarr-v3-48h
+schema_id: wrf-zarr-v3
+map_end_hour: 48
+hourly_through_hour: 36
+tail_step_hours: 3
+shard_time_steps: 1
+inner_chunk_yx: [64, 64]
+zstd_level: 3

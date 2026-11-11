@@ -1,0 +1,18 @@
+# Third-Party Software & Data Attributions
+
+Upstream solver repositories and operational datasets referenced by av-wrf:
+
+- WRF Model v4.8.0 & WPS v4.7.0 (UCAR/NCAR):
+  https://github.com/wrf-model/WRF
+  https://github.com/wrf-model/WPS
+- Noah-MP Land Surface Model (NCAR):
+  https://github.com/NCAR/noahmp
+- ECMWF Open Data (IFS 0.1 deg / 0.25 deg, CC BY 4.0, Copyright ECMWF):
+  https://www.ecmwf.int/en/forecasts/datasets/open-data
+- NOAA GFS & NOAA RRFS Open Data (NOAA/NODD, CC0-1.0 / U.S. public domain):
+  https://registry.opendata.aws/noaa-gfs-bdp-pds/
+  https://registry.opendata.aws/noaa-rrfs-ops/
+- Copernicus DEM GLO-30 & GLO-90 (DGED 2023_1 / 2024_1, European Union / ESA / DLR / Airbus):
+  https://dataspace.copernicus.eu/explore-data/data-collections/copernicus-contributing-missions/collections-description/COP-DEM
+  https://opentopography.org/news/updated-copernicus-30m-DEM-available
+- ESA WorldCover 10 m (CC BY 4.0) & ISRIC SoilGrids 250 m v2.0 (CC BY 4.0) for Phase 5 ablations.

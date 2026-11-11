@@ -1,0 +1,49 @@
+# Python & uv
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+coverage.xml
+
+# Secrets & local environment
+.env*
+!.env.example
+
+# Local runs, Zarr outputs, & WRF/WPS transient artifacts
+output/
+runs/
+work/
+scratch/
+*.zarr/
+*.nc
+*.grib*
+*.grb*
+*.idx
+wrfout_*
+wrfrst_*
+wrfinput_*
+wrfbdy_*
+wrflowinp_*
+geo_em.*
+met_em.*
+FILE:*
+PFILE:*
+GRIBFILE.*
+rsl.out.*
+rsl.error.*
+namelist.wps
+namelist.input
+
+# OS & editor
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/settings.json

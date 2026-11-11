@@ -1,0 +1,48 @@
+{
+  "schemaId": "wrf-zarr-v3",
+  "schemaVersion": 1,
+  "status": "provisional-phase-1",
+  "targetConsumerOwner": "windy-av-layer/packages/contracts/schemas/wrf-zarr-v3.schema.json",
+  "zarrFormat": 3,
+  "verticalCoordinate": "model-levels",
+  "moistureSourceOfTruth": "spfh_kgkg",
+  "temperatureDefinition": "sensible-air-temperature-k",
+  "capeParcelDefinition": "afwa-mucape-lowest-300hpa-virtual-temp-undiluted",
+  "lowCloudDefinition": "ecmwf-sigma-ge-0p8-max-random-overlap",
+  "earthRadiusM": 6370000.0,
+  "maxVerticalLevels": 40,
+  "shardTimeStep": 1,
+  "innerSpatialChunk": [64, 64],
+  "innerCodecs": [
+    {"name": "bytes", "configuration": {"endian": "little"}},
+    {"name": "zstd", "configuration": {"level": 3}}
+  ],
+  "indexCodecs": [
+    {"name": "bytes", "configuration": {"endian": "little"}},
+    {"name": "crc32c"}
+  ],
+  "fields": [
+    {"name": "terrain_m", "dims": ["y", "x"], "units": "m", "target": "terrainM", "timeSupport": "static", "keepbits": 17},
+    {"name": "surface_pressure_pa", "dims": ["time", "y", "x"], "units": "Pa", "target": "surfacePressurePa", "timeSupport": "instant", "keepbits": 17},
+    {"name": "temp_2m_k", "dims": ["time", "y", "x"], "units": "K", "target": "temp2mK", "timeSupport": "instant", "keepbits": 15},
+    {"name": "spfh_2m_kgkg", "dims": ["time", "y", "x"], "units": "kg/kg", "target": "specificHumidity2mKgKg", "timeSupport": "instant", "keepbits": 15},
+    {"name": "sensible_heat_flux_wm2", "dims": ["time", "y", "x"], "units": "W/m2", "target": "sensibleHeatFluxWm2", "timeSupport": "window-mean", "keepbits": 15},
+    {"name": "latent_heat_flux_wm2", "dims": ["time", "y", "x"], "units": "W/m2", "target": "latentHeatFluxWm2", "timeSupport": "window-mean", "keepbits": 15},
+    {"name": "precip_mm_hr", "dims": ["time", "y", "x"], "units": "mm/h", "target": "precipitationMmPerHour", "timeSupport": "window-rate", "keepbits": 15},
+    {"name": "mslp_pa", "dims": ["time", "y", "x"], "units": "Pa", "target": "auxSurface.mslpPa", "timeSupport": "instant", "keepbits": 17},
+    {"name": "u_10m_earth_mps", "dims": ["time", "y", "x"], "units": "m/s", "target": "auxSurface.u10mMps", "timeSupport": "instant", "keepbits": 15},
+    {"name": "v_10m_earth_mps", "dims": ["time", "y", "x"], "units": "m/s", "target": "auxSurface.v10mMps", "timeSupport": "instant", "keepbits": 15},
+    {"name": "gust_10m_mps", "dims": ["time", "y", "x"], "units": "m/s", "target": "auxSurface.gust10mMps", "timeSupport": "instant-parameterized", "keepbits": 15},
+    {"name": "pbl_height_m", "dims": ["time", "y", "x"], "units": "m", "target": "auxSurface.pblHeightM", "timeSupport": "instant", "keepbits": 15},
+    {"name": "cape_jkg", "dims": ["time", "y", "x"], "units": "J/kg", "target": "auxSurface.capeJkg", "timeSupport": "instant", "keepbits": 15},
+    {"name": "cloud_total_pct", "dims": ["time", "y", "x"], "units": "%", "target": "auxSurface.cloudTotalPct", "timeSupport": "instant", "keepbits": 15},
+    {"name": "cloud_low_pct", "dims": ["time", "y", "x"], "units": "%", "target": "auxSurface.cloudLowPct", "timeSupport": "instant", "keepbits": 15},
+    {"name": "pressure_pa", "dims": ["time", "level", "y", "x"], "units": "Pa", "target": "pressurePa", "timeSupport": "instant", "keepbits": 17},
+    {"name": "height_msl_m", "dims": ["time", "level", "y", "x"], "units": "m", "target": "hgtM", "timeSupport": "instant", "keepbits": 17},
+    {"name": "temp_k", "dims": ["time", "level", "y", "x"], "units": "K", "target": "tempK", "timeSupport": "instant", "keepbits": 15},
+    {"name": "spfh_kgkg", "dims": ["time", "level", "y", "x"], "units": "kg/kg", "target": "auxLevels.spfhKgKg", "timeSupport": "instant", "keepbits": 15},
+    {"name": "u_earth_mps", "dims": ["time", "level", "y", "x"], "units": "m/s", "target": "auxLevels.uWindMps", "timeSupport": "instant", "keepbits": 15},
+    {"name": "v_earth_mps", "dims": ["time", "level", "y", "x"], "units": "m/s", "target": "auxLevels.vWindMps", "timeSupport": "instant", "keepbits": 15},
+    {"name": "omega_pas", "dims": ["time", "level", "y", "x"], "units": "Pa/s", "target": "auxLevels.omegaPaS", "timeSupport": "instant", "keepbits": 15}
+  ]
+}

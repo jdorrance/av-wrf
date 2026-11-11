@@ -1,0 +1,137 @@
+"""Pure lead-hour selection, cron arrival buffer, remaining-horizon, and cycle-window math.
+
+References:
+- Consumer horizon & lead rules: windy-av-layer/packages/contracts/src/products.ts
+- Consumer cycle-age admission: windy-av-layer/apps/batch/src/publication.ts
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+from av_wrf.contracts import CycleWindow, ForcingProfile, OutputProfile, ProductSpec, RunLock
+
+MIN_SPINUP_HOURS = 6
+MIN_CRON_ARRIVAL_BUFFER_HOURS = 0.25
+
+
+def selected_lead_hours(output: OutputProfile) -> tuple[int, ...]:
+    """Return strictly increasing consumer lead hours (>= 1) for an OutputProfile."""
+    if output.hourly_through_hour < 1 or output.hourly_through_hour > output.map_end_hour:
+        raise ValueError("hourly_through_hour must lie in 1..map_end_hour")
+    if output.tail_step_hours < 1:
+        raise ValueError("tail_step_hours must be >= 1")
+    tail_span = output.map_end_hour - output.hourly_through_hour
+    if tail_span % output.tail_step_hours != 0:
+        raise ValueError("Tail horizon must be evenly divisible by tail_step_hours")
+    hourly = tuple(range(1, output.hourly_through_hour + 1))
+    tail = tuple(
+        range(
+            output.hourly_through_hour + output.tail_step_hours,
+            output.map_end_hour + 1,
+            output.tail_step_hours,
+        )
+    )
+    return hourly + tail
+
+
+def _parse_cron_hour_minute(cron_expr: str) -> tuple[int, int]:
+    parts = cron_expr.strip().split()
+    if len(parts) != 5:
+        raise ValueError(f"Expected 5-field UTC cron expression, got '{cron_expr}'")
+    minute = int(parts[0])
+    hour = int(parts[1])
+    if not (0 <= minute < 60 and 0 <= hour < 24):
+        raise ValueError(f"Invalid cron minute/hour in '{cron_expr}'")
+    return hour, minute
+
+
+def validate_horizon_policy(
+    product: ProductSpec,
+    source: ForcingProfile,
+    output: OutputProfile,
+) -> int:
+    """Verify spin-up floor, cron arrival margin, and remaining-horizon admission budget."""
+    if product.spinup_hours < MIN_SPINUP_HOURS:
+        raise ValueError(f"spinup_hours ({product.spinup_hours}) must be >= {MIN_SPINUP_HOURS}")
+    if product.min_horizon_hours >= output.map_end_hour:
+        raise ValueError("min_horizon_hours must be strictly less than map_end_hour")
+    remaining_floor = output.map_end_hour - product.max_cycle_age_hours
+    if remaining_floor < product.min_horizon_hours:
+        raise ValueError(
+            f"Remaining horizon at max_cycle_age_hours ({remaining_floor}h) "
+            f"is below min_horizon_hours ({product.min_horizon_hours}h)"
+        )
+    origin_gap = (product.publish_origin_hour_utc - product.forcing_cycle_hour_utc) % 24
+    if origin_gap < product.spinup_hours:
+        raise ValueError(
+            f"Gap from forcing_cycle_hour_utc to publish_origin_hour_utc ({origin_gap}h) "
+            f"is shorter than spinup_hours ({product.spinup_hours}h)"
+        )
+    cron_h, cron_m = _parse_cron_hour_minute(product.schedule_cron_utc)
+    cron_offset_h = ((cron_h + cron_m / 60.0) - product.forcing_cycle_hour_utc) % 24.0
+    required_ready_h = source.source_ready_lag_p95_hours + MIN_CRON_ARRIVAL_BUFFER_HOURS
+    if cron_offset_h < required_ready_h:
+        raise ValueError(
+            f"Schedule '{product.schedule_cron_utc}' triggers {cron_offset_h:.2f}h after "
+            f"{product.forcing_cycle_hour_utc:02d}Z, before ready window ({required_ready_h:.2f}h)"
+        )
+    if not source.fail_closed:
+        raise ValueError(f"ForcingProfile '{source.profile_id}' must enforce fail_closed=True")
+    return remaining_floor
+
+
+def _parse_iso_utc(iso_str: str) -> datetime:
+    cleaned = iso_str.strip()
+    if cleaned.endswith("Z"):
+        cleaned = cleaned[:-1] + "+00:00"
+    return datetime.fromisoformat(cleaned).astimezone(timezone.utc)
+
+
+def _format_iso_utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def resolve_cycle_window(
+    product: ProductSpec,
+    output: OutputProfile,
+    publish_origin_iso_utc: str,
+) -> CycleWindow:
+    """Resolve forcing, WRF spin-up init, publish origin, and trailing windows in UTC."""
+    origin_dt = _parse_iso_utc(publish_origin_iso_utc)
+    if origin_dt.minute != 0 or origin_dt.second != 0:
+        raise ValueError("publish_origin_iso_utc must align to an exact UTC hour")
+    cfg_h = product.publish_origin_hour_utc
+    if origin_dt.hour != cfg_h:
+        raise ValueError(f"Origin hour {origin_dt.hour:02d}Z != configured {cfg_h:02d}Z")
+    origin_gap_h = (cfg_h - product.forcing_cycle_hour_utc) % 24
+    forcing_dt = origin_dt - timedelta(hours=origin_gap_h)
+    wrf_init_dt = origin_dt - timedelta(hours=product.spinup_hours)
+    leads = selected_lead_hours(output)
+    valid_times: list[str] = []
+    window_starts: list[str] = []
+    prev_h = 0
+    for h in leads:
+        valid_times.append(_format_iso_utc(origin_dt + timedelta(hours=h)))
+        window_starts.append(_format_iso_utc(origin_dt + timedelta(hours=prev_h)))
+        prev_h = h
+    return CycleWindow(
+        forcing_cycle_utc=_format_iso_utc(forcing_dt),
+        wrf_init_utc=_format_iso_utc(wrf_init_dt),
+        publish_origin_utc=_format_iso_utc(origin_dt),
+        cycle_partition=origin_dt.strftime("%Y%m%d/%H"),
+        lead_hours=leads,
+        valid_times_utc=tuple(valid_times),
+        window_starts_utc=tuple(window_starts),
+    )
+
+
+def verify_run_lock_timestamps(lock: RunLock) -> None:
+    """Enforce wrf_init + spinup == publish_origin and forcing_cycle <= wrf_init."""
+    forcing_dt = _parse_iso_utc(lock.forcing_cycle_utc)
+    init_dt = _parse_iso_utc(lock.wrf_init_utc)
+    origin_dt = _parse_iso_utc(lock.publish_origin_utc)
+    if init_dt < forcing_dt:
+        raise ValueError("wrf_init_utc precedes forcing_cycle_utc")
+    if init_dt + timedelta(hours=lock.spinup_hours) != origin_dt:
+        raise ValueError("wrf_init_utc + spinup_hours does not equal publish_origin_utc")

@@ -1,0 +1,100 @@
+[build-system]
+requires = ["hatchling>=1.26.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "av-wrf"
+version = "0.1.0"
+description = "Cloud-agnostic regional WRF-ARW producer emitting native model-level Zarr v3 stores for windy-av-layer."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+  "numpy>=2.1.0",
+  "zarr>=3.0.0",
+  "netCDF4>=1.7.2",
+  "pyyaml>=6.0.2",
+  "httpx>=0.28.0",
+  "obstore>=0.6.0",
+]
+
+[project.scripts]
+av-wrf = "av_wrf.cli.main:main"
+verify = "scripts.verify:main"
+
+[dependency-groups]
+dev = [
+  "hypothesis>=6.122.0",
+  "import-linter>=2.1",
+  "mypy>=1.14.0",
+  "pyproj>=3.7.0",
+  "pytest>=8.3.0",
+  "ruff>=0.9.0",
+  "tach>=0.24.0",
+  "types-PyYAML>=6.0.12",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/av_wrf", "scripts"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "scripts", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "C901", "PLR0915", "TID251", "ANN401", "RUF"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-statements = 50
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"typing.Any".msg = "Replace Any with a concrete dataclass, Protocol, or NewType in av_wrf.contracts."
+"abc.ABC".msg = "Class inheritance hierarchies are forbidden; use plain functions or typing.Protocol when >= 2 implementations exist."
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+disallow_any_explicit = true
+files = ["src", "scripts", "tests"]
+
+[tool.importlinter]
+root_packages = ["av_wrf"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Five-layer top-down DAG"
+type = "layers"
+exhaustive = true
+layers = [
+  "av_wrf.cli",
+  "av_wrf.runner | av_wrf.verify",
+  "av_wrf.codecs",
+  "av_wrf.core",
+  "av_wrf.contracts",
+]
+
+[[tool.importlinter.contracts]]
+name = "Runner and verify are mutually independent"
+type = "independence"
+modules = ["av_wrf.runner", "av_wrf.verify"]
+
+[[tool.importlinter.contracts]]
+name = "Contracts and core forbid side-effecting packages"
+type = "forbidden"
+source_modules = ["av_wrf.contracts", "av_wrf.core"]
+forbidden_modules = ["os", "sys", "subprocess", "socket", "httpx", "obstore", "netCDF4", "zarr", "random"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+  "unit: fast deterministic pure-core and schema tests",
+  "property: Hypothesis property-based invariant tests",
+  "contract: windy-av-layer wrf-zarr-v3 wire conformance tests",
+  "integration: local filesystem store and recovery tests",
+  "container: Linux OCI WRF/WPS solver smoke tests",
+]

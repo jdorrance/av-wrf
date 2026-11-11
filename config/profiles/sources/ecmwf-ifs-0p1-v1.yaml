@@ -1,0 +1,17 @@
+# ECMWF IFS 0.1 deg Open Data candidate forcing profile (14 pressure levels, ~2h lag after 0.25 deg).
+# Gated on Phase 2 `real` vertical interpolation verification over 850-700 hPa mountain plateaus.
+# References:
+# - ECMWF Open Data specification: https://www.ecmwf.int/en/forecasts/datasets/open-data
+# - ECMWF 0.1 deg release & dissemination schedule:
+#   https://forum.ecmwf.int/t/ecmwf-free-and-open-data-at-9-km-soon-to-come/15366
+profile_id: ecmwf-ifs-0p1-v1
+provider: ECMWF
+grid_spacing_deg: 0.1
+pressure_level_count: 14
+soil_layer_centers_cm: [3.5, 17.5, 64.0, 194.5]
+has_dedicated_sst: false
+source_ready_lag_p95_hours: 8.5
+mirrors:
+  - https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com
+  - https://data.ecmwf.int/forecasts
+fail_closed: true

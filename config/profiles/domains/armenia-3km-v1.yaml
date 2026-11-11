@@ -1,0 +1,39 @@
+# Armenia 3 km computational & published domain + vertical stretching profile.
+# Assumptions & Terrain Constraints:
+# - Spherical datum: R = 6,370,000 m (`WPS/geogrid/src/module_map_utils.F`); standard parallels
+#   38.5N / 41.8N keep Lambert map scale within 0.9996..1.0004 (< 0.05% ground-step distortion).
+# - Vertical datum: Copernicus DEM DGED 2023_1 GLO-30 uses EGM2008 orthometric heights, matching
+#   `windy-av-layer` GLO-90 DEM patches with zero geoid-ellipsoid datum shift.
+# - `max_dz_m: 850.0` leaves >= 15% summer thermal-expansion headroom below `windy-av-layer`
+#   `maximumProfileGapM = 1000.0 m` (`packages/soaring/src/column.ts:159`), preventing hot
+#   afternoon columns from flipping to `STATUS_UNAVAILABLE`.
+# - Checked across 800 m Ararat valley, 4,090 m Mount Aragats, and 5,137 m Mount Ararat.
+# References:
+# - WPS spherical Lambert: https://github.com/wrf-model/WPS/blob/master/geogrid/src/module_map_utils.F
+# - WPS domain sizing (>= 100x100): https://www2.mmm.ucar.edu/wrf/site/documentation/namelist.wps_best_practices.html
+# - WRF auto_levels_opt = 2: https://www2.mmm.ucar.edu/wrf/site/users_guide/real_initialization.html
+# - Surface-layer dzbot >= 25 m: https://forum.mmm.ucar.edu/threads/increase-eta-level-and-decrease-dzbot.8325/
+# - Copernicus DEM DGED 2023_1 GLO-30: https://opentopography.org/news/updated-copernicus-30m-DEM-available
+profile_id: armenia-3km-v1
+earth_radius_m: 6370000.0
+center_lat_deg: 40.20
+center_lon_deg: 44.50
+std_parallel_1_deg: 38.50
+std_parallel_2_deg: 41.80
+central_meridian_deg: 44.50
+dx_m: 3000.0
+dy_m: 3000.0
+e_we: 197
+e_sn: 165
+bdy_trim_cells: 8
+e_vert: 55
+exported_levels_k: 40
+p_top_pa: 5000.0
+auto_levels_opt: 2
+dzbot_m: 34.0
+dzstretch_s: 1.11
+dzstretch_u: 1.06
+max_dz_m: 850.0
+min_bl_levels_2km_agl: 18
+dem_source: copernicus-dged-2023-1-glo30
+landuse_source: modis-30s
