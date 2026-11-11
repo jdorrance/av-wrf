@@ -1,4 +1,4 @@
-"""Pure lead-hour selection, UTC/partition parsing, remaining-horizon, and cycle-window math.
+"""Pure lead-hour selection, UTC/partition parsing, live freshness, and cycle-window math.
 
 References:
 - Consumer horizon & lead rules: windy-av-layer/packages/contracts/src/products.ts
@@ -21,6 +21,7 @@ from av_wrf.contracts import (
 
 MIN_SPINUP_HOURS = 6
 MIN_CRON_ARRIVAL_BUFFER_HOURS = 0.25
+MAX_FUTURE_CLOCK_SKEW_MINUTES = 15
 
 
 def selected_lead_hours(output: OutputProfile) -> tuple[int, ...]:
@@ -87,6 +88,29 @@ def validate_horizon_policy(
     if not source.fail_closed:
         raise ValueError(f"ForcingProfile '{source.profile_id}' must enforce fail_closed=True")
     return remaining_floor
+
+
+def is_cycle_live_fresh(
+    product: ProductSpec,
+    output: OutputProfile,
+    publish_origin_utc: str,
+    now_utc_iso: str,
+) -> bool:
+    """Return True iff cycle satisfies live clock, max_cycle_age, and min_horizon bounds."""
+    origin_dt = parse_iso_utc(publish_origin_utc)
+    now_dt = parse_iso_utc(now_utc_iso)
+    # Allow early publication during the spinup window (e.g. 23:45Z for a 00Z publish_origin)
+    earliest_live_dt = origin_dt - timedelta(
+        hours=product.spinup_hours, minutes=MAX_FUTURE_CLOCK_SKEW_MINUTES
+    )
+    if now_dt < earliest_live_dt:
+        return False
+    age_s = (now_dt - origin_dt).total_seconds()
+    if age_s > product.max_cycle_age_hours * 3600.0:
+        return False
+    horizon_end_dt = origin_dt + timedelta(hours=output.map_end_hour)
+    remaining_s = (horizon_end_dt - max(now_dt, origin_dt)).total_seconds()
+    return remaining_s >= product.min_horizon_hours * 3600.0
 
 
 def parse_cycle_arg(raw_cycle: str, product: ProductSpec) -> tuple[str, str]:

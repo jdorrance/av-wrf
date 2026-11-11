@@ -1,4 +1,4 @@
-"""ObjectStore protocol, key builders, idempotent writes, hardlink copy, and flock CAS."""
+"""ObjectStore protocol, key builders, atomic link-install writes, and flock CAS."""
 
 from __future__ import annotations
 
@@ -30,6 +30,11 @@ def run_lock_key(product_id: str, cycle_partition: str, attempt_id: str) -> str:
     return f"runs/{product_id}/{cycle_partition}/attempts/{attempt_id}/run.lock.json"
 
 
+def solver_receipt_key(product_id: str, cycle_partition: str, attempt_id: str) -> str:
+    """Return canonical ObjectStore key for an attempt's verified SolverReceipt."""
+    return f"runs/{product_id}/{cycle_partition}/attempts/{attempt_id}/solver_receipt.json"
+
+
 def post_manifest_key(product_id: str, cycle_partition: str, attempt_id: str) -> str:
     """Return canonical ObjectStore key for an attempt's staged post manifest."""
     return f"runs/{product_id}/{cycle_partition}/attempts/{attempt_id}/post_manifest.json"
@@ -43,6 +48,11 @@ def attempt_stage_prefix(product_id: str, cycle_partition: str, attempt_id: str)
 def published_cycle_prefix(model_id: str, cycle_partition: str) -> str:
     """Return canonical upstream published cycle prefix."""
     return f"upstream/{model_id}/{cycle_partition}"
+
+
+def synthetic_cycle_prefix(model_id: str, cycle_partition: str) -> str:
+    """Return isolated synthetic fixture prefix outside live upstream/ namespace."""
+    return f"fixtures/synthetic/{model_id}/{cycle_partition}"
 
 
 class ObjectStore(Protocol):
@@ -76,8 +86,16 @@ def put_idempotent(
         raise
 
 
+def _install_temp_exclusively(tmp_path: Path, dst_path: Path, key: str) -> None:
+    """Atomically publish fully written `tmp_path` at `dst_path` without overwriting winners."""
+    try:
+        os.link(tmp_path, dst_path)
+    except FileExistsError as exc:
+        raise FileExistsError(f"Immutable object already exists: {key}") from exc
+
+
 class LocalFileStore:
-    """Filesystem ObjectStore enforcing exclusive puts, hardlink promotion, and flock CAS."""
+    """Filesystem ObjectStore enforcing atomic exclusive puts, hardlinks, and flock CAS."""
 
     def __init__(self, root_dir: Path) -> None:
         self._root = root_dir.resolve()
@@ -98,13 +116,32 @@ class LocalFileStore:
 
     def put_if_absent(self, key: str, payload: bytes) -> str:
         path = self._resolve(key)
+        if path.is_file():
+            raise FileExistsError(f"Immutable object already exists: {key}")
         path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
         try:
-            with path.open("xb") as handle:
+            with tmp.open("xb") as handle:
                 handle.write(payload)
-        except FileExistsError as exc:
-            raise FileExistsError(f"Immutable object already exists: {key}") from exc
+                handle.flush()
+            _install_temp_exclusively(tmp, path, key)
+        finally:
+            tmp.unlink(missing_ok=True)
         return sha256_hex(payload)
+
+    def _copy_cross_mount(self, src: Path, dst: Path, src_key: str, dst_key: str, sha: str) -> None:
+        tmp = dst.parent / f".{dst.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            shutil.copy2(src, tmp)
+            if sha256_hex(tmp.read_bytes()) != sha:
+                raise ValueError(f"Staged source SHA-256 mismatch on {src_key}")
+            try:
+                _install_temp_exclusively(tmp, dst, dst_key)
+            except FileExistsError:
+                if sha256_hex(dst.read_bytes()) != sha:
+                    raise
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def copy_if_absent(self, src_key: str, dst_key: str, expected_sha256: str) -> str:
         src = self._resolve(src_key)
@@ -115,8 +152,6 @@ class LocalFileStore:
             raise FileExistsError(f"Immutable destination differs from expected SHA-256: {dst_key}")
         if not src.is_file():
             raise FileNotFoundError(f"Missing staged source object: {src_key}")
-        if sha256_hex(src.read_bytes()) != expected_sha256:
-            raise ValueError(f"Staged source SHA-256 mismatch on {src_key}")
         dst.parent.mkdir(parents=True, exist_ok=True)
         try:
             os.link(src, dst)
@@ -126,9 +161,7 @@ class LocalFileStore:
         except OSError as exc:
             if exc.errno != errno.EXDEV:
                 raise
-            tmp = dst.parent / f".{dst.name}.{uuid.uuid4().hex}.tmp"
-            shutil.copy2(src, tmp)
-            tmp.replace(dst)
+            self._copy_cross_mount(src, dst, src_key, dst_key, expected_sha256)
         return expected_sha256
 
     def delete_prefix(self, prefix: str) -> None:
@@ -152,8 +185,13 @@ class LocalFileStore:
                         f"CAS conflict on {key}: expected {expected_sha256}, found {actual}"
                     )
                 tmp = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
-                tmp.write_bytes(payload)
-                tmp.replace(path)
+                try:
+                    with tmp.open("xb") as out_f:
+                        out_f.write(payload)
+                        out_f.flush()
+                    tmp.replace(path)
+                finally:
+                    tmp.unlink(missing_ok=True)
             finally:
                 fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
         return sha256_hex(payload)

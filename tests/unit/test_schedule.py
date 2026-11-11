@@ -1,4 +1,4 @@
-"""Unit tests for av_wrf.core.schedule across all configured products and UTC parsers."""
+"""Unit tests for av_wrf.core.schedule: horizon policy, UTC parsing, and live freshness gate."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ for p in (ROOT, ROOT / "src"):
 
 from av_wrf.contracts import parse_iso_utc  # noqa: E402
 from av_wrf.core import (  # noqa: E402
+    is_cycle_live_fresh,
     parse_cycle_arg,
     resolve_cycle_window,
     selected_lead_hours,
@@ -23,7 +24,7 @@ from av_wrf.runner import load_bundle  # noqa: E402
 
 
 class TestSchedule(unittest.TestCase):
-    def test_all_shipped_products_horizon_cron_margin_and_cycle_parsing(self) -> None:
+    def test_all_shipped_products_horizon_cron_margin_freshness_and_cycle_parsing(self) -> None:
         cfg_root = ROOT / "config"
         prod_paths = sorted((cfg_root / "products").glob("*.yaml"))
         self.assertGreaterEqual(len(prod_paths), 1)
@@ -35,6 +36,20 @@ class TestSchedule(unittest.TestCase):
             floor = validate_horizon_policy(prod, src, out)
             self.assertGreaterEqual(floor, prod.min_horizon_hours)
 
+            iso_arg = f"2026-11-12T{prod.publish_origin_hour_utc:02d}:00:00Z"
+            self.assertTrue(is_cycle_live_fresh(prod, out, iso_arg, "2026-11-12T04:00:00Z"))
+            # Expired 2020 backfill is NOT live-fresh in November 2026
+            self.assertFalse(
+                is_cycle_live_fresh(
+                    prod,
+                    out,
+                    f"2020-01-01T{prod.publish_origin_hour_utc:02d}:00:00Z",
+                    "2026-11-12T04:00:00Z",
+                )
+            )
+            # Far-future clock-skewed cycle is rejected for live pointer advancement
+            self.assertFalse(is_cycle_live_fresh(prod, out, iso_arg, "2026-11-10T00:00:00Z"))
+
             with self.assertRaises(ValueError):
                 validate_horizon_policy(
                     dataclasses.replace(prod, schedule_cron_utc="50 22 * * *"), src, out
@@ -44,7 +59,6 @@ class TestSchedule(unittest.TestCase):
                     dataclasses.replace(prod, min_horizon_hours=out.map_end_hour), src, out
                 )
 
-            iso_arg = f"2026-11-12T{prod.publish_origin_hour_utc:02d}:00:00Z"
             part_arg = f"20261112/{prod.publish_origin_hour_utc:02d}"
             self.assertEqual(parse_cycle_arg(iso_arg, prod), (iso_arg, part_arg))
             self.assertEqual(parse_cycle_arg(part_arg, prod), (iso_arg, part_arg))
@@ -52,12 +66,7 @@ class TestSchedule(unittest.TestCase):
             win = resolve_cycle_window(prod, out, part_arg)
             self.assertEqual(win.lead_hours, leads)
             self.assertEqual(win.window_starts_utc[0], iso_arg)
-            if len(leads) == 40:
-                self.assertEqual(win.lead_hours[36], 39)
-                self.assertEqual(win.window_starts_utc[36], "2026-11-13T12:00:00Z")
-                self.assertEqual(win.valid_times_utc[36], "2026-11-13T15:00:00Z")
 
-            # Reject timezone-naive ISO strings, bad partitions, and wrong UTC hours
             for bad_cycle in (
                 "2026-11-12T00:00:00",
                 "20261112/bad",

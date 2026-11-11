@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 
-from av_wrf.codecs.zarr_shard import divisor_chunk
+from av_wrf.codecs.zarr_shard import resolve_inner_chunk_yx
 from av_wrf.contracts import (
     CAPE_PARCEL_DEFINITION,
     LOW_CLOUD_DEFINITION,
@@ -95,8 +95,7 @@ def _field_array_meta(
     ni: int,
     output: OutputProfile,
 ) -> dict[str, object]:
-    iy = divisor_chunk(nj, output.inner_chunk_yx[0])
-    ix = divisor_chunk(ni, output.inner_chunk_yx[1])
+    iy, ix = resolve_inner_chunk_yx(nj, ni, output)
     t_shard = min(t_len, output.shard_time_steps)
     if spec.dims == ("y", "x"):
         shape, outer, inner = [nj, ni], [nj, ni], [iy, ix]

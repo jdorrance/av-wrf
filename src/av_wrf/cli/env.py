@@ -10,10 +10,12 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class RuntimeEnv:
     store_uri: str
+    stage_store_uri: str
     mpi_ranks: int
     webhook_url: str
     build_manifest_path: str
     oci_digest: str
+    solver_prefix: str
 
 
 def load_runtime_env(environ: Mapping[str, str] | None = None) -> RuntimeEnv:
@@ -25,13 +27,17 @@ def load_runtime_env(environ: Mapping[str, str] | None = None) -> RuntimeEnv:
     store_uri = env.get("AV_WRF_STORE_URI", "file:///tmp/av-wrf-store").strip()
     if not store_uri:
         raise ValueError("AV_WRF_STORE_URI must be non-empty")
+    stage_uri = env.get("AV_WRF_STAGE_STORE_URI", "").strip() or store_uri
     webhook_url = env.get("AV_WRF_WEBHOOK_URL", "").strip()
     manifest_path = env.get("AV_WRF_BUILD_MANIFEST", "/opt/av-wrf/build-manifest.json").strip()
     oci_digest = env.get("AV_WRF_OCI_DIGEST", "").strip()
+    solver_prefix = env.get("AV_WRF_SOLVER_PREFIX", "/opt/av-wrf").strip() or "/opt/av-wrf"
     return RuntimeEnv(
         store_uri=store_uri,
+        stage_store_uri=stage_uri,
         mpi_ranks=ranks,
         webhook_url=webhook_url,
         build_manifest_path=manifest_path,
         oci_digest=oci_digest,
+        solver_prefix=solver_prefix,
     )

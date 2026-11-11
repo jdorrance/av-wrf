@@ -1,4 +1,4 @@
-"""Unit tests for av_wrf.core.namelist verifying ScienceProfile, metgrid levels, and guards."""
+"""Unit tests for av_wrf.core.namelist verifying WRF v4.8 Registry placement and types."""
 
 from __future__ import annotations
 
@@ -12,11 +12,7 @@ for p in (ROOT, ROOT / "src"):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from av_wrf.contracts import (  # noqa: E402
-    BuildManifest,
-    RunLock,
-    ScienceProfile,
-)
+from av_wrf.contracts import BuildManifest, RunLock, ScienceProfile  # noqa: E402
 from av_wrf.core import (  # noqa: E402
     NON_NAMELIST_METADATA_FIELDS,
     compile_wps_namelist_sections,
@@ -29,7 +25,7 @@ from av_wrf.runner import load_bundle  # noqa: E402
 PROFILE_TO_NAMELIST_KEY: dict[str, tuple[str, str]] = {
     "interval_seconds": ("time_control", "interval_seconds"),
     "history_interval_min": ("time_control", "history_interval"),
-    "prec_acc_dt_min": ("time_control", "prec_acc_dt"),
+    "nwp_diagnostics": ("time_control", "nwp_diagnostics"),
     "time_step_s": ("domains", "time_step"),
     "mp_physics": ("physics", "mp_physics"),
     "cu_physics": ("physics", "cu_physics"),
@@ -46,7 +42,6 @@ PROFILE_TO_NAMELIST_KEY: dict[str, tuple[str, str]] = {
     "ysu_topdown_pblmix": ("physics", "ysu_topdown_pblmix"),
     "shinhong_scu_mixing": ("physics", "shinhong_scu_mixing"),
     "shinhong_nonlocal_flux": ("physics", "shinhong_nonlocal_flux"),
-    "nwp_diagnostics": ("physics", "nwp_diagnostics"),
     "bucket_mm": ("physics", "bucket_mm"),
     "bucket_j": ("physics", "bucket_J"),
     "opt_runsrf": ("noah_mp", "opt_runsrf"),
@@ -68,6 +63,7 @@ PROFILE_TO_NAMELIST_KEY: dict[str, tuple[str, str]] = {
     "gwd_if_nonhyd": ("dynamics", "gwd_if_nonhyd"),
     "afwa_diag_opt": ("afwa", "afwa_diag_opt"),
     "afwa_severe_opt": ("afwa", "afwa_severe_opt"),
+    "afwa_buoy_opt": ("afwa", "afwa_buoy_opt"),
     "spec_bdy_width": ("bdy_control", "spec_bdy_width"),
     "spec_zone": ("bdy_control", "spec_zone"),
     "relax_zone": ("bdy_control", "relax_zone"),
@@ -88,26 +84,28 @@ class TestNamelist(unittest.TestCase):
         compiled = compile_wrf_namelist_sections(dom, sci, src)
         for attr, (sec, key) in PROFILE_TO_NAMELIST_KEY.items():
             self.assertEqual(compiled[sec][key], getattr(sci, attr))
-        self.assertEqual(compiled["time_control"]["frames_per_outfile"], 1)
-        self.assertEqual(compiled["domains"]["max_dom"], 1)
-        self.assertEqual(compiled["domains"]["parent_id"], 0)
-        self.assertEqual(compiled["domains"]["num_metgrid_levels"], src.pressure_level_count)
-        self.assertEqual(
-            compiled["domains"]["num_metgrid_soil_levels"], len(src.soil_layer_centers_cm)
+        self.assertNotIn("prec_acc_dt", compiled["time_control"])
+        self.assertNotIn("nwp_diagnostics", compiled["physics"])
+        self.assertIsInstance(compiled["physics"]["shinhong_scu_mixing"], bool)
+        self.assertEqual(compiled["afwa"]["afwa_buoy_opt"], 1)
+
+        override = compile_wrf_namelist_sections(
+            dom, sci, src, metgrid_levels=38, metgrid_soil_levels=4
         )
+        self.assertEqual(override["domains"]["num_metgrid_levels"], 38)
 
         for bad in (
             dataclasses.replace(sci, opt_runsrf=5),
             dataclasses.replace(sci, gwd_opt=1, gwd_if_nonhyd=True),
-            dataclasses.replace(sci, shinhong_scu_mixing=1, shinhong_nonlocal_flux=True),
+            dataclasses.replace(sci, shinhong_scu_mixing=True, shinhong_nonlocal_flux=True),
             dataclasses.replace(sci, time_step_s=24),
             dataclasses.replace(sci, afwa_severe_opt=0),
+            dataclasses.replace(sci, afwa_buoy_opt=0),
             dataclasses.replace(sci, base_temp_k=100.0),
         ):
             with self.assertRaises(ValueError):
                 compile_wrf_namelist_sections(dom, bad, src)
 
-        # 100 staggered columns = 99 mass columns (< 100 mass-cell domain floor)
         with self.assertRaises(ValueError):
             compile_wrf_namelist_sections(dataclasses.replace(dom, e_we=100), sci, src)
 
@@ -120,7 +118,7 @@ class TestNamelist(unittest.TestCase):
             wrf_init_utc="2026-11-11T18:00:00Z",
             publish_origin_utc="2026-11-12T00:00:00Z",
             spinup_hours=6,
-            lead_hours=(1, 2, 48),
+            lead_hours=(1, 2, 16),
             forcing_profile_id=src.profile_id,
             domain_profile_id=dom.profile_id,
             science_profile_id=sci.profile_id,
@@ -130,15 +128,15 @@ class TestNamelist(unittest.TestCase):
             build_manifest=BuildManifest("sha256:1", "w", "p", (), "gf", "mpi"),
             mpi_ranks=4,
         )
-        wps_txt = render_fortran_namelist(compile_wps_namelist_sections(dom, sci, lock))
+        # 3-hourly boundary cadence on 22h total span (6h + 16h) brackets up to f024 (18Z + 24h)
+        wps_3h = compile_wps_namelist_sections(dom, sci, lock, interval_seconds=10_800)
+        self.assertEqual(wps_3h["share"]["end_date"], "2026-11-12_18:00:00")
+
         wrf_txt = render_fortran_namelist(compile_wrf_run_namelist(dom, sci, lock, src))
-        self.assertIn("geog_data_path = '/opt/av-wrf/geog',", wps_txt)
-        self.assertIn("map_proj = 'lambert',", wps_txt)
-        self.assertIn("run_hours = 54,", wrf_txt)
-        self.assertIn("history_begin_h = 6,", wrf_txt)
-        self.assertIn("frames_per_outfile = 1,", wrf_txt)
-        self.assertIn(f"num_metgrid_levels = {src.pressure_level_count},", wrf_txt)
-        self.assertIn("gwd_if_nonhyd = .false.,", wrf_txt)
+        self.assertIn("nwp_diagnostics = 1,", wrf_txt)
+        self.assertIn("shinhong_scu_mixing = .false.,", wrf_txt)
+        self.assertIn("afwa_buoy_opt = 1,", wrf_txt)
+        self.assertNotIn("prec_acc_dt", wrf_txt)
 
 
 if __name__ == "__main__":

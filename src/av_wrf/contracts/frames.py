@@ -17,6 +17,22 @@ from av_wrf.contracts.quantities import (
 
 
 @dataclass(frozen=True)
+class RawWrfBaselineInput:
+    """Minimal 2D computational-grid f000 baseline fields (avoids reading 3D volumes at f000)."""
+
+    valid_time_utc: str
+    valid_time_unix_s: int
+    terrain_m: CompMass2D
+    psfc_pa: CompMass2D
+    achfx_j_m2: CompMass2D
+    aclhf_j_m2: CompMass2D
+    rainc_mm: CompMass2D
+    i_rainc: CompBucket2D
+    rainnc_mm: CompMass2D
+    i_rainnc: CompBucket2D
+
+
+@dataclass(frozen=True)
 class RawWrfStepInput:
     """Croppable computational-grid WRF fields for one output timestamp."""
 
@@ -35,9 +51,7 @@ class RawWrfStepInput:
     pblh_m: CompMass2D
     afwa_cape_jkg: CompMass2D
     achfx_j_m2: CompMass2D
-    i_achfx: CompBucket2D
     aclhf_j_m2: CompMass2D
-    i_aclhf: CompBucket2D
     rainc_mm: CompMass2D
     i_rainc: CompBucket2D
     rainnc_mm: CompMass2D
@@ -52,11 +66,12 @@ class RawWrfStepInput:
     u_stag_mps: CompStagX3D
     v_stag_mps: CompStagY3D
     w_stag_mps: CompStagZ3D
+    afwa_mslp_pa: CompMass2D | None = None
 
 
 @dataclass(frozen=True)
 class NormalizedWrfFrame:
-    """All 22 Published-Grid arrays plus full-domain column and CFL invariants."""
+    """All 22 Published-Grid arrays plus full-domain column and output-frame Courant invariants."""
 
     valid_time_utc: str
     window_start_unix_s: int
@@ -69,4 +84,4 @@ class NormalizedWrfFrame:
     max_cfl: float
 
 
-__all__ = ["NormalizedWrfFrame", "RawWrfStepInput"]
+__all__ = ["NormalizedWrfFrame", "RawWrfBaselineInput", "RawWrfStepInput"]

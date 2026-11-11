@@ -1,4 +1,4 @@
-"""Contract tests verifying wrf-zarr-v3 sync, 30-node Zarr v3 metadata, and ZEP-0002 shards."""
+"""Contract tests verifying wrf-zarr-v3 sync, 30-node Zarr v3 metadata, and ZEP-0002 guards."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from av_wrf.codecs import (  # noqa: E402
     encode_2d_shard_bytes,
     encode_3d_shard_bytes,
     expected_shard_keys,
+    resolve_inner_chunk_yx,
     synthetic_thm_from_dry_theta,
     verify_shard_index,
     zarr_shard_relpath,
@@ -90,15 +91,16 @@ class TestVendorZarrContract(unittest.TestCase):
             self.assertEqual(spec.time_support, expected["timeSupport"])
             self.assertEqual(spec.keepbits, expected["keepbits"])
 
-    def test_zep0002_multitile_partial_shard_and_index_verification(self) -> None:
+    def test_zep0002_multitile_partial_shard_and_prime_chunk_explosion_guard(self) -> None:
         self.assertEqual(crc32c_u32(b"123456789"), 0xE3069283)
 
         prod_id = sorted((ROOT / "config" / "products").glob("*.yaml"))[0].stem
-        out = dataclasses.replace(
-            load_bundle(ROOT / "config", prod_id).output,
-            inner_chunk_yx=(5, 7),
-            shard_time_steps=3,
-        )
+        base_out = load_bundle(ROOT / "config", prod_id).output
+        out = dataclasses.replace(base_out, inner_chunk_yx=(5, 7), shard_time_steps=3)
+        # Prime 149 x 181 grid resize must fail closed instead of creating 26,969 1x1 chunks
+        with self.assertRaises(ValueError):
+            resolve_inner_chunk_yx(149, 181, base_out)
+
         f0 = PubMass2D(Slab2DF32.from_values(10, 14, [float(i) for i in range(140)]))
         f1 = PubMass2D(Slab2DF32.from_values(10, 14, [float(i) + 500.0 for i in range(140)]))
         shard2d = encode_2d_shard_bytes([f0, f1], out, shard_time_steps=3)
@@ -108,7 +110,6 @@ class TestVendorZarrContract(unittest.TestCase):
         self.assertEqual(list(dec2d[:140]), list(f0.buf))
         self.assertEqual(list(dec2d[140:280]), list(f1.buf))
         self.assertTrue(all(math.isnan(v) for v in dec2d[280:]))
-        # Claiming 3 populated frames when slot 2 holds sentinels must fail index verification
         with self.assertRaises(ValueError):
             verify_shard_index(shard2d, shard_time_steps=3, n_frames=3, ny=10, nx=14, output=out)
 
@@ -118,7 +119,6 @@ class TestVendorZarrContract(unittest.TestCase):
         dec3d = decode_shard_f32(shard3d, shard_time_steps=2, nz=2, ny=10, nx=14, output=out)
         self.assertEqual(list(dec3d), [*v0.buf, *v1.buf])
 
-        # Re-CRC'd bad offset in tile 0 must still fail verify_shard_index bounds check
         idx_len = 8 * 16
         body = shard3d[: -(idx_len + 4)]
         bad_idx = bytearray(shard3d[-(idx_len + 4) : -4])
@@ -127,7 +127,7 @@ class TestVendorZarrContract(unittest.TestCase):
         with self.assertRaises(ValueError):
             verify_shard_index(forged, shard_time_steps=2, n_frames=2, ny=10, nx=14, output=out)
 
-    def test_complete_zarr_v3_hierarchy_for_all_configured_products(self) -> None:
+    def test_complete_zarr_v3_hierarchy_and_cli_check(self) -> None:
         cfg_dir = ROOT / "config"
         for p_path in sorted((cfg_dir / "products").glob("*.yaml")):
             b = load_bundle(cfg_dir, p_path.stem)
@@ -140,7 +140,6 @@ class TestVendorZarrContract(unittest.TestCase):
             self.assertEqual(zarr_shard_relpath("terrain_m", b.output), "terrain_m/c/0/0")
             self.assertIn("terrain_m/c/0/0", expected_shard_keys(b.output, len(leads)))
 
-    def test_cli_check_and_t_thm_guard(self) -> None:
         self.assertEqual(cli_main(["check", "--config-dir", str(ROOT / "config")]), 0)
         prod_id = sorted((ROOT / "config" / "products").glob("*.yaml"))[0].stem
         sci = load_bundle(ROOT / "config", prod_id).science
@@ -148,7 +147,7 @@ class TestVendorZarrContract(unittest.TestCase):
         qv = CompMass3D(Slab3DF32.from_values(1, 2, 2, [0.012] * 4))
         p0 = CompMass3D(Slab3DF32.from_values(1, 2, 2, [0.0] * 4))
         pb = CompMass3D(Slab3DF32.from_values(1, 2, 2, [85_000.0] * 4))
-        thm_val = synthetic_thm_from_dry_theta(8.0, 0.012, sci.base_temp_k)
+        thm_val = synthetic_thm_from_dry_theta(8.0, 0.012)
         thm_ok = CompMass3D(Slab3DF32.from_values(1, 2, 2, [thm_val] * 4))
         verify_t_thm_consistency(t_dry, thm_ok, p0, pb, qv, sci)
         with self.assertRaises(ValueError):

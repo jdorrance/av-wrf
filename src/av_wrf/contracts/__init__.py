@@ -17,7 +17,7 @@ from av_wrf.contracts.config_parsers import (
     parse_product_spec,
     parse_science_profile,
 )
-from av_wrf.contracts.frames import NormalizedWrfFrame, RawWrfStepInput
+from av_wrf.contracts.frames import NormalizedWrfFrame, RawWrfBaselineInput, RawWrfStepInput
 from av_wrf.contracts.lock import (
     AccumBaseline,
     BuildManifest,
@@ -26,6 +26,7 @@ from av_wrf.contracts.lock import (
     DiagnosticsReceipt,
     ReadyReceipt,
     RunLock,
+    SolverReceipt,
     StagedPostManifest,
     format_iso_utc,
     parse_iso_utc,
@@ -143,6 +144,7 @@ __all__ = [
     "PubBucket2D",
     "PubMass2D",
     "PubMass3D",
+    "RawWrfBaselineInput",
     "RawWrfStepInput",
     "ReadyReceipt",
     "RunLock",
@@ -150,6 +152,7 @@ __all__ = [
     "Slab2DF32",
     "Slab2DI32",
     "Slab3DF32",
+    "SolverReceipt",
     "SpecificHumidityKgKg",
     "StagedPostManifest",
     "TempK",

@@ -39,20 +39,33 @@ RUN git clone --depth 1 --branch "${JASPER_TAG}" https://github.com/jasper-softw
     CFLAGS="-O2 -fPIC" ./configure --prefix=/opt/av-wrf --enable-shared --disable-opengl && \
     make -j "${JOBS}" && make install
 
+# CMake lists Noah-MP, MMM physics, MYNN, TEMPO, and GFL on the core library.
+# Those trees are submodules pinned by the WRF tag; a depth-1 clone leaves them empty.
 RUN git clone --depth 1 --branch "${WRF_TAG}" https://github.com/wrf-model/WRF.git && \
+    git -C /build/WRF submodule update --init --depth 1 -- \
+      phys/noahmp phys/physics_mmm phys/MYNN-EDMF phys/MYNN-SFC phys/TEMPO phys/GFL && \
     git clone --depth 1 --branch "${WPS_TAG}" https://github.com/wrf-model/WPS.git && \
-    for p in /build/patches/wrf-*.patch; do [ -f "$p" ] && git -C /build/WRF apply "$p" || true; done && \
-    for p in /build/patches/wps-*.patch; do [ -f "$p" ] && git -C /build/WPS apply "$p" || true; done
+    for p in /build/patches/wrf-*.patch; do if [ -f "$p" ]; then git -C /build/WRF apply "$p"; fi; done && \
+    for p in /build/patches/wps-*.patch; do if [ -f "$p" ]; then git -C /build/WPS apply "$p"; fi; done && \
+    test -f /build/WRF/phys/noahmp/drivers/wrf/NoahmpWRFinitMod.F90 && \
+    test -f /build/WRF/phys/physics_mmm/bl_ysu.F90
 
 # WRF v4.8 FindNetCDF searches <nf-config --prefix>/{lib,lib64} with NO_DEFAULT_PATH;
 # symlink Debian multiarch libnetcdff onto /usr/lib before configure (arm64 & amd64).
-# Jasper 1.900.29 is built for WPS ungrib GRIB2 decoding; wrf.exe reads metgrid NetCDF.
+# Direct CMake bypasses ./configure_new's arch_config.cmake, so pass /usr/bin/cpp,
+# WRF_FCOPTIM (CMakeLists.txt clears CMAKE_Fortran_FLAGS_RELEASE), and big-endian I/O.
 RUN multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)" && \
     ln -sf "/usr/lib/${multiarch}/libnetcdff.so" /usr/lib/libnetcdff.so && \
     cmake -B /build/wrf-build -S /build/WRF -G Ninja \
       -DCMAKE_INSTALL_PREFIX=/opt/av-wrf \
       -DCMAKE_PREFIX_PATH=/opt/av-wrf \
       -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_PREPROCESSOR=/usr/bin/cpp \
+      -DCMAKE_C_FLAGS="-w -O3 -DRPC_TYPES=1" \
+      -DCMAKE_Fortran_FLAGS="-w -fconvert=big-endian -frecord-marker=4 -fallow-argument-mismatch -fallow-invalid-boz" \
+      -DWRF_FCOPTIM="-O2 -ftree-vectorize -funroll-loops" \
+      -DWRF_FCNOOPT="-O0" \
+      -DWRF_ARCH_LOCAL="NONSTANDARD_SYSTEM_SUBR" \
       -DUSE_MPI=ON \
       -DUSE_JASPER=OFF \
       -DWRF_CORE=ARW \
@@ -64,13 +77,26 @@ RUN multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)" && \
 RUN cmake -B /build/wps-build -S /build/WPS -G Ninja \
       -DCMAKE_INSTALL_PREFIX=/opt/av-wrf \
       -DCMAKE_PREFIX_PATH=/opt/av-wrf \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_PREPROCESSOR=/usr/bin/cpp \
+      -DCMAKE_C_FLAGS="-w -O3" \
+      -DCMAKE_Fortran_FLAGS="-w -O2 -ftree-vectorize -funroll-loops -fconvert=big-endian -frecord-marker=4 -ffree-line-length-none -fallow-argument-mismatch -fallow-invalid-boz" \
+      -DWPS_DEFINITIONS="-D_UNDERSCORE -DBYTESWAP -DLINUX -DIO_NETCDF -DBIT32 -DNO_SIGNAL" \
       -DWRF_DIR=/opt/av-wrf \
-      -DUSE_MPI=ON \
-      -DCMAKE_BUILD_TYPE=Release && \
+      -DUSE_MPI=ON && \
     cmake --build /build/wps-build -j "${JOBS}" && \
     cmake --install /build/wps-build
 
-RUN python3 - <<'PY'
+RUN set -eux; \
+    mkdir -p /opt/av-wrf/share/wrf/run /opt/av-wrf/share/wps/Variable_Tables; \
+    for f in /build/WRF/run/*; do \
+      if [ -f "$f" ]; then cp -Lf "$f" /opt/av-wrf/share/wrf/run/; fi; \
+    done; \
+    cp -f /build/WRF/phys/noahmp/parameters/MPTABLE.TBL /opt/av-wrf/share/wrf/run/MPTABLE.TBL; \
+    cp -Lf /build/WPS/geogrid/GEOGRID.TBL.ARW* /opt/av-wrf/share/wps/; \
+    cp -Lf /build/WPS/metgrid/METGRID.TBL.ARW* /opt/av-wrf/share/wps/; \
+    cp -Lf /build/WPS/ungrib/Variable_Tables/Vtable.* /opt/av-wrf/share/wps/Variable_Tables/; \
+    python3 - <<'PY'
 import hashlib, json, pathlib, subprocess
 
 wrf_sha = subprocess.check_output(["git", "-C", "/build/WRF", "rev-parse", "HEAD"], text=True).strip()
@@ -91,9 +117,20 @@ manifest = {
 out = pathlib.Path("/opt/av-wrf/build-manifest.json")
 out.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 for exe in ("wrf.exe", "real.exe", "geogrid.exe", "metgrid.exe", "ungrib.exe"):
-    matches = list(pathlib.Path("/opt/av-wrf").rglob(exe))
-    if not matches:
-        raise SystemExit(f"Missing compiled solver executable: {exe}")
+    resolved = (pathlib.Path("/opt/av-wrf/bin") / exe).resolve()
+    if not resolved.is_file():
+        raise SystemExit(f"Missing compiled solver executable target for {exe}: {resolved}")
+for tbl in (
+    "share/wrf/run/RRTMG_LW_DATA",
+    "share/wrf/run/RRTMG_SW_DATA",
+    "share/wrf/run/LANDUSE.TBL",
+    "share/wrf/run/MPTABLE.TBL",
+    "share/wps/GEOGRID.TBL.ARW",
+    "share/wps/METGRID.TBL.ARW",
+    "share/wps/Variable_Tables/Vtable.GFS",
+):
+    if not (pathlib.Path("/opt/av-wrf") / tbl).is_file():
+        raise SystemExit(f"Missing required WRF/WPS runtime table: {tbl}")
 PY
 
 # Stage 3: Complete MPI solver + producer image (`docker buildx build --target solver`)
@@ -110,10 +147,14 @@ ENV PATH="/opt/av-wrf/bin:${PATH}" \
     LD_LIBRARY_PATH="/opt/av-wrf/lib"
 RUN set -eux; \
     for b in wrf.exe real.exe geogrid.exe metgrid.exe ungrib.exe; do \
-      exe_path="$(find /opt/av-wrf -name "$b" -type f | head -n 1)"; \
-      test -x "${exe_path}"; \
+      exe_path="$(readlink -f "/opt/av-wrf/bin/$b")"; \
+      test -f "${exe_path}" -a -x "${exe_path}"; \
       ! ldd "${exe_path}" | grep -q "not found"; \
-    done
+    done; \
+    test -f /opt/av-wrf/share/wrf/run/MPTABLE.TBL; \
+    test -f /opt/av-wrf/share/wps/GEOGRID.TBL.ARW; \
+    test -f /opt/av-wrf/share/wps/METGRID.TBL.ARW; \
+    test -f /opt/av-wrf/share/wps/Variable_Tables/Vtable.GFS
 ENTRYPOINT ["av-wrf"]
 CMD ["check"]
 

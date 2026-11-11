@@ -69,8 +69,7 @@ def _req_int_pair(raw: Mapping[str, object], key: str) -> tuple[int, int]:
     if len(items) != 2 or any(isinstance(x, bool) or not isinstance(x, int) for x in items):
         raise TypeError(f"Expected 2-int sequence for '{key}'")
     a, b = items[0], items[1]
-    assert isinstance(a, int) and isinstance(b, int)
-    if a < 1 or b < 1:
+    if not isinstance(a, int) or not isinstance(b, int) or a < 1 or b < 1:
         raise ValueError(f"Chunk dimensions in '{key}' must be >= 1")
     return (a, b)
 
@@ -138,7 +137,7 @@ def parse_science_profile(raw: Mapping[str, object]) -> ScienceProfile:
         _req_int(raw, "sf_sfclay_physics"),
         _req_int(raw, "topo_wind"),
         _req_int(raw, "ysu_topdown_pblmix"),
-        _req_int(raw, "shinhong_scu_mixing"),
+        _req_bool(raw, "shinhong_scu_mixing"),
         _req_bool(raw, "shinhong_nonlocal_flux"),
         _req_int(raw, "cu_physics"),
         _req_int(raw, "gwd_opt"),
@@ -164,8 +163,8 @@ def parse_science_profile(raw: Mapping[str, object]) -> ScienceProfile:
         _req_int(raw, "nwp_diagnostics"),
         _req_int(raw, "afwa_diag_opt"),
         _req_int(raw, "afwa_severe_opt"),
+        _req_int(raw, "afwa_buoy_opt"),
         _req_int(raw, "history_interval_min"),
-        _req_int(raw, "prec_acc_dt_min"),
         _req_float(raw, "bucket_mm"),
         _req_float(raw, "bucket_j"),
     )

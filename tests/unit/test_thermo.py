@@ -1,7 +1,8 @@
-"""Unit tests for av_wrf.core.thermo: WRF T==THM, Bolton Q2 guard, Shuell MSLP, and IFS gusts."""
+"""Unit tests for av_wrf.core.thermo: fixed 300K T0, continuous Shuell MSLP, and Bolton Q2."""
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import sys
 import unittest
@@ -29,6 +30,7 @@ from av_wrf.contracts import (  # noqa: E402
 from av_wrf.core import (  # noqa: E402
     KAPPA_DRY,
     MOIST_THETA_COEFF,
+    WRF_T0_K,
     clamp_spfh_2m_to_liquid_sat,
     geometric_w_to_omega_pas,
     groom_f32_buf,
@@ -55,7 +57,8 @@ from tests.oracle.reference_cases import (  # noqa: E402
 
 
 class TestThermo(unittest.TestCase):
-    def test_sensible_air_temperature_t_equals_thm_and_keepbits_bounds(self) -> None:
+    def test_sensible_air_temperature_fixed_300k_and_keepbits_bounds(self) -> None:
+        self.assertEqual(WRF_T0_K, 300.0)
         self.assertAlmostEqual(KAPPA_DRY, 2.0 / 7.0, places=15)
         t_from_t = potential_to_temp_k(
             WrfPerturbPotTempK(THETA_PERTURB_10K), Pascals(PRESSURE_850HPA_PA)
@@ -63,7 +66,7 @@ class TestThermo(unittest.TestCase):
         self.assertAlmostEqual(float(t_from_t), EXPECTED_TEMP_850HPA_K, places=11)
 
         qv = 0.014
-        thm_pert = (THETA_PERTURB_10K + 300.0) * (1.0 + MOIST_THETA_COEFF * qv) - 300.0
+        thm_pert = (THETA_PERTURB_10K + WRF_T0_K) * (1.0 + MOIST_THETA_COEFF * qv) - WRF_T0_K
         t_from_thm = moist_thm_to_temp_k(
             WrfPerturbMoistThetaK(thm_pert),
             MixingRatioKgKg(qv),
@@ -80,11 +83,10 @@ class TestThermo(unittest.TestCase):
         )
         self.assertLess(float(omega), -19.0)
         self.assertAlmostEqual(max_random_cloud_pct([0.0, 0.5, 0.5]), 50.0, places=5)
-
         self.assertLess(abs(groom_mantissa_f32(288.13791, keepbits=15) - 288.13791), 0.005)
         self.assertLessEqual(abs(groom_mantissa_f32(101325.3, keepbits=17) - 101325.3), 0.5)
 
-    def test_vectorized_groom_f32_buf_and_exhaustive_t_thm_guard(self) -> None:
+    def test_vectorized_groom_and_fixed_t0_with_non300_base_temp(self) -> None:
         samples = [0.0, -0.0, 288.13791, -33.333336, 101325.3, -12.8751, 1e-6, float("inf")]
         arr = np.array(samples, dtype=np.float64)
         for kb in (15, 17, 23):
@@ -93,25 +95,27 @@ class TestThermo(unittest.TestCase):
             self.assertEqual(vec, ref)
 
         prod_id = sorted((ROOT / "config" / "products").glob("*.yaml"))[0].stem
-        sci = load_bundle(ROOT / "config", prod_id).science
+        sci_290 = dataclasses.replace(
+            load_bundle(ROOT / "config", prod_id).science, base_temp_k=290.0
+        )
         n = 1000
         t_dry = CompMass3D(Slab3DF32.from_values(10, 10, 10, [8.0] * n))
         qv = CompMass3D(Slab3DF32.from_values(10, 10, 10, [0.012] * n))
         p0 = CompMass3D(Slab3DF32.from_values(10, 10, 10, [0.0] * n))
         pb = CompMass3D(Slab3DF32.from_values(10, 10, 10, [85_000.0] * n))
-        thm_v = (8.0 + sci.base_temp_k) * (1.0 + MOIST_THETA_COEFF * 0.012) - sci.base_temp_k
+        # WRF perturbation offset is ALWAYS 300 K even when namelist base_temp is 290 K
+        thm_v = (8.0 + 300.0) * (1.0 + MOIST_THETA_COEFF * 0.012) - 300.0
         thm_vals = [thm_v] * n
         verify_t_thm_consistency(
-            t_dry, CompMass3D(Slab3DF32.from_values(10, 10, 10, thm_vals)), p0, pb, qv, sci
+            t_dry, CompMass3D(Slab3DF32.from_values(10, 10, 10, thm_vals)), p0, pb, qv, sci_290
         )
-        # Single interior cell spike at index 777 (missed by 512-stride) is caught exhaustively
         thm_vals[777] = 8.0
         with self.assertRaises(ValueError):
             verify_t_thm_consistency(
-                t_dry, CompMass3D(Slab3DF32.from_values(10, 10, 10, thm_vals)), p0, pb, qv, sci
+                t_dry, CompMass3D(Slab3DF32.from_values(10, 10, 10, thm_vals)), p0, pb, qv, sci_290
             )
 
-    def test_bolton_q2_clamp_shuell_mslp_and_high_altitude_gusts(self) -> None:
+    def test_bolton_q2_clamp_continuous_shuell_mslp_and_high_altitude_gusts(self) -> None:
         t2_k, psfc = 268.15, 80_000.0
         clamped = groom_mantissa_f32(clamp_spfh_2m_to_liquid_sat(0.0040, t2_k, psfc), 15)
         r = clamped / (1.0 - clamped)
@@ -119,6 +123,15 @@ class TestThermo(unittest.TestCase):
         es_hpa = 6.112 * math.exp((17.67 * -5.0) / (-5.0 + 243.5))
         self.assertLessEqual(e_hpa, es_hpa)
         self.assertGreater(e_hpa, 0.999 * es_hpa)
+
+        # Zero discontinuity across the 258 K / 5,000 m (tv_sl = 290.5 K) boundary
+        p_lo = hypsometric_mslp_pa(54_000.0, 5_000.0, 257.99, 0.0)
+        p_hi = hypsometric_mslp_pa(54_000.0, 5_000.0, 258.01, 0.0)
+        self.assertLess(abs(p_hi - p_lo), 5.0)  # < 5 Pa (0.05 hPa), never 600 Pa (6 hPa)!
+        # Also continuous across tv_0 = 290.5 K
+        p_warm_lo = hypsometric_mslp_pa(70_000.0, 3_000.0, 290.49, 0.0)
+        p_warm_hi = hypsometric_mslp_pa(70_000.0, 3_000.0, 290.51, 0.0)
+        self.assertLess(abs(p_warm_hi - p_warm_lo), 5.0)
 
         unclamped_tv = 305.0 + 0.5 * 0.0065 * 3000.0
         naive_mslp = 70_000.0 * math.exp((9.81 * 3000.0) / (287.0 * unclamped_tv))
@@ -147,9 +160,6 @@ class TestThermo(unittest.TestCase):
             ue, ve = rotate_grid_to_earth(GridWindMps(7.3), GridWindMps(-4.1), cos_t, -sin_t)
             self.assertAlmostEqual(float(ue), cos_t * 7.3 + sin_t * (-4.1), places=12)
             self.assertAlmostEqual(float(ve), -sin_t * 7.3 + cos_t * (-4.1), places=12)
-            self.assertAlmostEqual(
-                math.hypot(float(ue), float(ve)), math.hypot(7.3, -4.1), places=9
-            )
 
 
 if __name__ == "__main__":

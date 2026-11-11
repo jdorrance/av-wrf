@@ -53,7 +53,7 @@ class ScienceProfile:
     sf_sfclay_physics: int
     topo_wind: int
     ysu_topdown_pblmix: int
-    shinhong_scu_mixing: int
+    shinhong_scu_mixing: bool
     shinhong_nonlocal_flux: bool
     cu_physics: int
     gwd_opt: int
@@ -79,8 +79,8 @@ class ScienceProfile:
     nwp_diagnostics: int
     afwa_diag_opt: int
     afwa_severe_opt: int
+    afwa_buoy_opt: int
     history_interval_min: int
-    prec_acc_dt_min: int
     bucket_mm: float
     bucket_j: float
 

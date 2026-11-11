@@ -1,4 +1,4 @@
-"""ZEP-0002 sharding_indexed binary encoder/decoder, index verifier, and coordinate chunks.
+"""ZEP-0002 sharding_indexed binary encoder/decoder, tile-cap guard, and coordinate chunks.
 
 References:
 - ZEP-0002 sharding binary layout: https://zarr.dev/zeps/accepted/ZEP0002.html
@@ -25,6 +25,9 @@ from av_wrf.contracts import (
 from av_wrf.core import published_grid_origin_xy_m, published_grid_shape
 
 EMPTY_CHUNK_SENTINEL = 0xFFFFFFFFFFFFFFFF
+MAX_SPATIAL_TILES_PER_FRAME = 64
+MIN_LARGE_GRID_AXIS = 24
+MIN_LARGE_GRID_CHUNK = 8
 
 
 def _make_crc32c_table() -> tuple[int, ...]:
@@ -57,6 +60,22 @@ def divisor_chunk(full_len: int, target: int) -> int:
     return 1
 
 
+def resolve_inner_chunk_yx(ny: int, nx: int, output: OutputProfile) -> tuple[int, int]:
+    """Resolve `(iy, ix)` inner chunk dimensions and fail closed on pathological 1x1 tiling."""
+    iy = divisor_chunk(ny, output.inner_chunk_yx[0])
+    ix = divisor_chunk(nx, output.inner_chunk_yx[1])
+    spatial_tiles = (ny // iy) * (nx // ix)
+    bad_y = ny >= MIN_LARGE_GRID_AXIS and iy < MIN_LARGE_GRID_CHUNK
+    bad_x = nx >= MIN_LARGE_GRID_AXIS and ix < MIN_LARGE_GRID_CHUNK
+    if bad_y or bad_x or spatial_tiles > MAX_SPATIAL_TILES_PER_FRAME:
+        raise ValueError(
+            f"Published grid ({ny}x{nx}) yields degenerate {iy}x{ix} inner chunks "
+            f"({spatial_tiles} spatial tiles > {MAX_SPATIAL_TILES_PER_FRAME} cap); "
+            "choose composite published grid dimensions or matching inner_chunk_yx"
+        )
+    return iy, ix
+
+
 def _pack_volume_shard(
     vols_4d: npt.NDArray[np.float32],
     output: OutputProfile,
@@ -65,8 +84,9 @@ def _pack_volume_shard(
     n_frames, _, ny, nx = vols_4d.shape
     if n_frames < 1 or n_frames > shard_time_steps:
         raise ValueError(f"Invalid frame count {n_frames} for shard_time_steps={shard_time_steps}")
-    iy = divisor_chunk(ny, output.inner_chunk_yx[0])
-    ix = divisor_chunk(nx, output.inner_chunk_yx[1])
+    if not bool(np.all(np.isfinite(vols_4d))):
+        raise ValueError("Refusing to encode non-finite float32 values into ZEP-0002 shard")
+    iy, ix = resolve_inner_chunk_yx(ny, nx, output)
     spatial_tiles = (ny // iy) * (nx // ix)
     body = bytearray()
     index = bytearray()
@@ -134,8 +154,7 @@ def verify_shard_index(
     """Verify ZEP-0002 CRC-32C, contiguous populated tile bounds, and sentinel tail slots."""
     if n_frames < 1 or n_frames > shard_time_steps:
         raise ValueError("Invalid n_frames / shard_time_steps for shard index verification")
-    iy = divisor_chunk(ny, output.inner_chunk_yx[0])
-    ix = divisor_chunk(nx, output.inner_chunk_yx[1])
+    iy, ix = resolve_inner_chunk_yx(ny, nx, output)
     spatial_tiles = (ny // iy) * (nx // ix)
     n_tiles = shard_time_steps * spatial_tiles
     idx_len = n_tiles * 16
@@ -164,7 +183,7 @@ def verify_shard_index(
     return idx_raw, iy, ix, spatial_tiles
 
 
-def decode_shard_f32(
+def decode_shard_f32_array(
     shard_bytes: bytes,
     *,
     shard_time_steps: int = 1,
@@ -173,8 +192,8 @@ def decode_shard_f32(
     ny: int,
     nx: int,
     output: OutputProfile,
-) -> array[float]:
-    """Verify ZEP-0002 index + CRC-32C and decode `shard_time_steps` slots to float32."""
+) -> npt.NDArray[np.float32]:
+    """Verify ZEP-0002 index + CRC-32C and decompress all populated tiles to a NumPy array."""
     populated = shard_time_steps if n_frames is None else n_frames
     idx_raw, iy, ix, spatial_tiles = verify_shard_index(
         shard_bytes,
@@ -192,11 +211,37 @@ def decode_shard_f32(
             for tx in range(0, nx, ix):
                 off, nbytes = struct.unpack_from("<QQ", idx_raw, (s * spatial_tiles + sp_idx) * 16)
                 sp_idx += 1
-                raw_tile = bytes(_zstd.decompress(shard_bytes[off : off + nbytes]))
+                try:
+                    raw_tile = bytes(_zstd.decompress(shard_bytes[off : off + nbytes]))
+                except Exception as exc:
+                    raise ValueError(f"Corrupt Zstd payload in tile {sp_idx - 1}") from exc
                 if len(raw_tile) != tile_bytes:
                     raise ValueError("Corrupt Zstd inner chunk byte length")
                 tile_vals = np.frombuffer(raw_tile, dtype="<f4").reshape(nz, iy, ix)
                 out_arr[s, :, ty : ty + iy, tx : tx + ix] = tile_vals.astype(np.float32, copy=False)
+    return out_arr
+
+
+def decode_shard_f32(
+    shard_bytes: bytes,
+    *,
+    shard_time_steps: int = 1,
+    n_frames: int | None = None,
+    nz: int,
+    ny: int,
+    nx: int,
+    output: OutputProfile,
+) -> array[float]:
+    """Verify ZEP-0002 index + CRC-32C and decode `shard_time_steps` slots to float32 array."""
+    out_arr = decode_shard_f32_array(
+        shard_bytes,
+        shard_time_steps=shard_time_steps,
+        n_frames=n_frames,
+        nz=nz,
+        ny=ny,
+        nx=nx,
+        output=output,
+    )
     out = array("f")
     out.frombytes(np.ascontiguousarray(out_arr, dtype=np.float32).tobytes())
     return out

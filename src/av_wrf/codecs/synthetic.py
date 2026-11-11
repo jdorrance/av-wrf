@@ -12,12 +12,13 @@ from av_wrf.contracts import (
     CompStagY3D,
     CompStagZ3D,
     DomainProfile,
+    RawWrfBaselineInput,
     RawWrfStepInput,
     Slab2DF32,
     Slab2DI32,
     Slab3DF32,
 )
-from av_wrf.core import MOIST_THETA_COEFF, estimate_auto_levels_agl_m
+from av_wrf.core import MOIST_THETA_COEFF, WRF_T0_K, estimate_auto_levels_agl_m
 
 
 def _synthetic_base_3d(
@@ -32,7 +33,8 @@ def _synthetic_base_3d(
     p_pb = array("f")
     z_phb = array("f", [(1200.0 + faces_agl[0]) * 9.81]) * n2
     for k in range(nz):
-        p_pb.extend(array("f", [88_000.0 * (0.97**k)]) * n2)
+        # Strictly < 88_000 Pa surface pressure and strictly decreasing upward
+        p_pb.extend(array("f", [87_800.0 * (0.97**k)]) * n2)
         z_phb.extend(array("f", [(1200.0 + faces_agl[k + 1]) * 9.81]) * n2)
     pb = CompMass3D(Slab3DF32(nz=nz, ny=ny, nx=nx, buf=p_pb))
     ph = CompStagZ3D(Slab3DF32(nz=nz + 1, ny=ny, nx=nx, buf=array("f", [0.0]) * ((nz + 1) * n2)))
@@ -47,11 +49,34 @@ def _synthetic_base_3d(
     return pb, ph, phb, u, v, w
 
 
-def synthetic_thm_from_dry_theta(
-    theta_pert_k: float, qv_kgkg: float, base_temp_k: float = 300.0
-) -> float:
+def synthetic_thm_from_dry_theta(theta_pert_k: float, qv_kgkg: float) -> float:
     """Compute exact WRF THM perturbation corresponding to dry T perturbation and QVAPOR."""
-    return (theta_pert_k + base_temp_k) * (1.0 + MOIST_THETA_COEFF * qv_kgkg) - base_temp_k
+    return (theta_pert_k + WRF_T0_K) * (1.0 + MOIST_THETA_COEFF * qv_kgkg) - WRF_T0_K
+
+
+def build_synthetic_wrf_baseline(
+    domain: DomainProfile, valid_time_utc: str, valid_time_unix_s: int
+) -> RawWrfBaselineInput:
+    """Build lightweight 2D synthetic f000 baseline without allocating 3D volumes."""
+    ny, nx = domain.e_sn - 1, domain.e_we - 1
+    n2 = ny * nx
+
+    def c2(val: float) -> CompMass2D:
+        return CompMass2D(Slab2DF32(ny=ny, nx=nx, buf=array("f", [val]) * n2))
+
+    zeros = CompBucket2D(Slab2DI32(ny=ny, nx=nx, buf=array("i", [0]) * n2))
+    return RawWrfBaselineInput(
+        valid_time_utc=valid_time_utc,
+        valid_time_unix_s=valid_time_unix_s,
+        terrain_m=c2(1200.0),
+        psfc_pa=c2(88_000.0),
+        achfx_j_m2=c2(0.0),
+        aclhf_j_m2=c2(0.0),
+        rainc_mm=c2(0.0),
+        i_rainc=zeros,
+        rainnc_mm=c2(0.0),
+        i_rainnc=zeros,
+    )
 
 
 def build_synthetic_wrf_step(
@@ -88,9 +113,7 @@ def build_synthetic_wrf_step(
         pblh_m=c2(1900.0),
         afwa_cape_jkg=c2(320.0),
         achfx_j_m2=c2(float(lead_hour) * 240.0 * 3600.0),
-        i_achfx=zeros,
         aclhf_j_m2=c2(float(lead_hour) * 80.0 * 3600.0),
-        i_aclhf=zeros,
         rainc_mm=c2(0.0),
         i_rainc=zeros,
         rainnc_mm=c2(float(lead_hour) * 0.25),
@@ -108,4 +131,8 @@ def build_synthetic_wrf_step(
     )
 
 
-__all__ = ["build_synthetic_wrf_step", "synthetic_thm_from_dry_theta"]
+__all__ = [
+    "build_synthetic_wrf_baseline",
+    "build_synthetic_wrf_step",
+    "synthetic_thm_from_dry_theta",
+]

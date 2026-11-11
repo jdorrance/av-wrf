@@ -1,31 +1,23 @@
-"""Vertical auto_levels_opt=2 + hybrid_opt=2 column estimation, BL, gap, and CFL gates.
+"""Vertical auto_levels_opt=2 + hybrid_opt=2 column estimation, solver ZNW check, and gates.
 
 Assumptions & High-Mountain Coordinate Math (Skamarock et al. 2019 NCAR/TN-556+STR):
-1. `real.exe` (`auto_levels_opt=2`) stretches full levels `znw` (`eta in [1, 0]`) in dry
-   log-pressure space using reference sea-level `p0 = 100,000 Pa`, `T0 = 290 K`, `A = 50 K`,
-   and `T_min = 200 K` (Sec. 5.2.2), transitioning from `dzstretch_s` to `dzstretch_u` by
-   `0.5 * max_dz` and capping at `max_dz` down to `p_top_pa`.
-2. Over elevated terrain (`terrain_m > 0`), `hybrid_opt = 2` (`etac`, Eqs. 2.2-2.6 & 5.3-5.4)
-   evaluates `p_d(eta) = B(eta)*(p_s - p_t) + [eta - B(eta)]*(p0 - p_t) + p_t` with cubic
-   `B(eta)` (`B(1)=1, B'(1)=1, B(etac)=0, B'(etac)=0`). Because `B'(eta)` peaks above `1.0`
-   at mid-levels (`1.68` for `etac=0.2`), layers compress over `4-5 km` massifs and can fold
-   (`dp_d <= 0`) if `etac` is set too high; this module checks `dp_d > 0` before any solver run.
-3. Consumer profile-gap ceiling: `windy-av-layer` (`column.ts:159`) marks an entire column
-   `unavailable` if ANY adjacent exported level gap exceeds `maximumProfileGapM = 1,000 m`
-   (`CONSUMER_MAX_PROFILE_GAP_M`). Because summer heatwaves expand hydrostatic thickness by
-   ~6-8% relative to the `290 K` reference state, `MAX_SAFE_REFERENCE_DZ_M = 900.0` enforces
-   >= 10% thermal headroom at config-check time, while `validate_frame_columns` checks actual
-   exported columns against `CONSUMER_MAX_PROFILE_GAP_M` and `MAX_ADMITTED_CFL` on every cell.
-4. Consumer near-ground screening: `column.ts` retains `k=0` (`~15-17 m` AGL), whereas
-   `native.ts` skips levels `<= minimumLevelAglM = 20 m` and starts at `k=1` (`~45-52 m` AGL).
+1. `real.exe` (`auto_levels_opt=2`, `dyn_em/module_initialize_real.F`) stretches `eta` levels
+   in dry log-pressure space from `dzbot` up to `max_dz` (`(max_dz/2 - dz) / (max_dz/2)` blend
+   from `dzstretch_s` to `dzstretch_u`) with `T0 = 300 K` (`WRF_T0_K`) and isothermal stratosphere
+   floor (`215 K`), failing with `not enough eta levels to reach p_top` if `e_vert` is too small
+   (e.g. `51` faces fails at `50 hPa`, while `55` faces passes). `validate_solver_znw` checks
+   actual solver-produced `ZNW` arrays directly when `wrfinput` / `wrfout` are available.
+2. Over elevated terrain (`terrain_m > 0`), `hybrid_opt = 2` (`etac`) maps `eta` via cubic `B(eta)`
+   and checks `dp_d > 0` across every configured `terrain_elevations_m`.
+3. `validate_frame_columns` verifies finite values, positive strictly-ordered thicknesses within
+   `CONSUMER_MAX_PROFILE_GAP_M = 1,000 m`, `0-2 km` BL level counts, and output-frame Courant
+   proxy (`max_cfl <= MAX_ADMITTED_CFL`; actual RK3 substep stability is gated on solver exit).
 
 References:
-- WRF v4 Technical Note (Ch. 2 & 5):
-  https://www2.mmm.ucar.edu/wrf/users/docs/technote/v4_technote.pdf
+- WRF level construction:
+  https://github.com/wrf-model/WRF/blob/v4.8.0/dyn_em/module_initialize_real.F
 - WRF auto_levels_opt = 2:
   https://www2.mmm.ucar.edu/wrf/site/users_guide/real_initialization.html
-- Surface-layer dzbot >= 25 m:
-  https://forum.mmm.ucar.edu/threads/increase-eta-level-and-decrease-dzbot.8325/
 """
 
 from __future__ import annotations
@@ -47,11 +39,11 @@ MIN_STABLE_DZBOT_M = 25.0
 MAX_SAFE_REFERENCE_DZ_M = 900.0
 REF_T0_K = 290.0
 REF_LAPSE_A_K = 50.0
-REF_TMIN_K = 200.0
+REF_TISO_K = 215.0
 
 
 def _ref_temp_k(p_pa: float) -> float:
-    return max(REF_TMIN_K, REF_T0_K + REF_LAPSE_A_K * math.log(max(1.0, p_pa) / P0_PA))
+    return max(REF_TISO_K, REF_T0_K + REF_LAPSE_A_K * math.log(max(1.0, p_pa) / P0_PA))
 
 
 def _hybrid_b(eta: float, etac: float) -> float:
@@ -66,35 +58,37 @@ def _hybrid_b(eta: float, etac: float) -> float:
 
 
 def _reference_eta_faces(domain: DomainProfile) -> list[float]:
+    """Mirror `real.exe` `auto_levels_opt=2` log-P stretching from `dzbot` up to `max_dz`."""
     n_mass = domain.e_vert - 1
     half_max = 0.5 * domain.max_dz_m
-    dz = domain.dzbot_m
-    dlnp_steps: list[float] = []
+    dlnp = (G0_MPS2 * domain.dzbot_m) / (R_DRY_J_KG_K * REF_T0_K)
     p_cur = P0_PA
-    for _ in range(n_mass):
+    dlnp_steps: list[float] = []
+    capped_indices: list[int] = []
+    for idx in range(n_mass):
         t_k = _ref_temp_k(p_cur)
-        step = (G0_MPS2 * dz) / (R_DRY_J_KG_K * t_k)
-        dlnp_steps.append(step)
-        p_cur *= math.exp(-step)
-        if dz < half_max:
-            frac = max(0.0, min(1.0, (dz - domain.dzbot_m) / max(1.0, half_max - domain.dzbot_m)))
-            stretch = domain.dzstretch_s + frac * (domain.dzstretch_u - domain.dzstretch_s)
-        else:
-            stretch = domain.dzstretch_u
-        dz = min(dz * stretch, domain.max_dz_m)
+        max_step = (G0_MPS2 * domain.max_dz_m) / (R_DRY_J_KG_K * t_k)
+        if dlnp >= max_step - 1e-9:
+            dlnp = max_step
+            capped_indices.append(idx)
+        dz_k = (R_DRY_J_KG_K * t_k / G0_MPS2) * dlnp
+        dlnp_steps.append(dlnp)
+        p_cur *= math.exp(-dlnp)
+        weight_s = max(0.0, (half_max - dz_k) / max(1.0, half_max))
+        stretch = domain.dzstretch_u + weight_s * (domain.dzstretch_s - domain.dzstretch_u)
+        dlnp *= stretch
 
     target_lnp = math.log(P0_PA / domain.p_top_pa)
     total_lnp = sum(dlnp_steps)
     if total_lnp < target_lnp:
         raise ValueError(
-            "Vertical e_vert / stretching fails to reach p_top_pa without exceeding max_dz_m"
+            f"not enough eta levels (e_vert={domain.e_vert}) to reach p_top_pa={domain.p_top_pa}"
         )
     excess = total_lnp - target_lnp
-    upper_start = min(domain.exported_levels_k, n_mass - 1)
-    upper_sum = sum(dlnp_steps[upper_start:])
-    if upper_sum > excess and upper_start < n_mass:
-        scale = (upper_sum - excess) / upper_sum
-        for idx in range(upper_start, n_mass):
+    capped_sum = sum(dlnp_steps[i] for i in capped_indices)
+    if capped_indices and capped_sum > excess:
+        scale = (capped_sum - excess) / capped_sum
+        for idx in capped_indices:
             dlnp_steps[idx] *= scale
     else:
         scale = target_lnp / total_lnp
@@ -107,6 +101,37 @@ def _reference_eta_faces(domain: DomainProfile) -> list[float]:
         etas.append((p_walk - domain.p_top_pa) / (P0_PA - domain.p_top_pa))
     etas.append(0.0)
     return etas
+
+
+def _midpoints_from_eta_faces(
+    etas: Sequence[float], domain: DomainProfile, terrain_m: float, etac: float
+) -> tuple[float, ...]:
+    phi_sfc = G0_MPS2 * max(0.0, terrain_m)
+    radicand = ((REF_T0_K / REF_LAPSE_A_K) ** 2) - (2.0 * phi_sfc / (REF_LAPSE_A_K * R_DRY_J_KG_K))
+    if radicand <= 0.0:
+        raise ValueError("terrain_m exceeds dry reference atmosphere ceiling")
+    ps_ref = P0_PA * math.exp(-(REF_T0_K / REF_LAPSE_A_K) + math.sqrt(radicand))
+    if ps_ref <= domain.p_top_pa * 1.2:
+        raise ValueError("Reference surface pressure at terrain_m is too close to p_top_pa")
+    pt = domain.p_top_pa
+    z_face = 0.0
+    midpoints: list[float] = []
+    b0 = _hybrid_b(etas[0], etac)
+    p_bot = b0 * (ps_ref - pt) + (etas[0] - b0) * (P0_PA - pt) + pt
+    for k in range(len(etas) - 1):
+        b_top = _hybrid_b(etas[k + 1], etac)
+        p_top_k = b_top * (ps_ref - pt) + (etas[k + 1] - b_top) * (P0_PA - pt) + pt
+        if p_top_k >= p_bot:
+            raise ValueError(
+                f"Hybrid vertical coordinate folded at level {k} over {terrain_m:.0f} m; "
+                f"lower etac ({etac})"
+            )
+        p_mid = 0.5 * (p_bot + p_top_k)
+        dz_k = (R_DRY_J_KG_K * _ref_temp_k(p_mid) / G0_MPS2) * math.log(p_bot / p_top_k)
+        midpoints.append(z_face + 0.5 * dz_k)
+        z_face += dz_k
+        p_bot = p_top_k
+    return tuple(midpoints)
 
 
 def estimate_auto_levels_agl_m(
@@ -124,38 +149,29 @@ def estimate_auto_levels_agl_m(
         raise ValueError(f"etac ({etac}) must be in [0.0, 0.7)")
     if domain.e_vert - 1 < domain.exported_levels_k:
         raise ValueError("e_vert - 1 must be >= exported_levels_k")
-
-    phi_sfc = G0_MPS2 * max(0.0, terrain_m)
-    radicand = ((REF_T0_K / REF_LAPSE_A_K) ** 2) - (2.0 * phi_sfc / (REF_LAPSE_A_K * R_DRY_J_KG_K))
-    if radicand <= 0.0:
-        raise ValueError("terrain_m exceeds dry reference atmosphere ceiling")
-    ps_ref = P0_PA * math.exp(-(REF_T0_K / REF_LAPSE_A_K) + math.sqrt(radicand))
-    if ps_ref <= domain.p_top_pa * 1.2:
-        raise ValueError("Reference surface pressure at terrain_m is too close to p_top_pa")
-
     etas = _reference_eta_faces(domain)
-    pt = domain.p_top_pa
-    z_face = 0.0
-    midpoints: list[float] = []
-    p_bot = (
-        _hybrid_b(etas[0], etac) * (ps_ref - pt)
-        + (etas[0] - _hybrid_b(etas[0], etac)) * (P0_PA - pt)
-        + pt
-    )
-    for k in range(len(etas) - 1):
-        b_top = _hybrid_b(etas[k + 1], etac)
-        p_top_k = b_top * (ps_ref - pt) + (etas[k + 1] - b_top) * (P0_PA - pt) + pt
-        if p_top_k >= p_bot:
-            raise ValueError(
-                f"Hybrid vertical coordinate folded at level {k} over {terrain_m:.0f} m; "
-                f"lower etac ({etac})"
-            )
-        p_mid = 0.5 * (p_bot + p_top_k)
-        dz_k = (R_DRY_J_KG_K * _ref_temp_k(p_mid) / G0_MPS2) * math.log(p_bot / p_top_k)
-        midpoints.append(z_face + 0.5 * dz_k)
-        z_face += dz_k
-        p_bot = p_top_k
-    return tuple(midpoints)
+    return _midpoints_from_eta_faces(etas, domain, terrain_m, etac)
+
+
+def validate_solver_znw(
+    znw: Sequence[float],
+    domain: DomainProfile,
+    *,
+    etac: float = 0.2,
+) -> int:
+    """Validate solver-emitted `ZNW` full eta faces across configured domain elevations."""
+    if len(znw) != domain.e_vert:
+        raise ValueError(f"Solver ZNW length {len(znw)} != configured e_vert {domain.e_vert}")
+    if abs(znw[0] - 1.0) > 1e-5 or abs(znw[-1]) > 1e-5:
+        raise ValueError("Solver ZNW must span [1.0, 0.0]")
+    for idx in range(1, len(znw)):
+        if not math.isfinite(znw[idx]) or znw[idx] >= znw[idx - 1]:
+            raise ValueError(f"Non-monotonic solver ZNW at index {idx}")
+    counts = [
+        validate_vertical_column(_midpoints_from_eta_faces(znw, domain, elev, etac), domain)
+        for elev in domain.terrain_elevations_m
+    ]
+    return min(counts)
 
 
 def _check_column_bounds(midpoints_agl_m: Sequence[float], domain: DomainProfile) -> None:
@@ -170,7 +186,7 @@ def _check_column_bounds(midpoints_agl_m: Sequence[float], domain: DomainProfile
         raise ValueError("exported_levels_k exceeds contract or computational level count")
     if len(midpoints_agl_m) < domain.exported_levels_k:
         raise ValueError("Column has fewer levels than exported_levels_k")
-    if midpoints_agl_m[0] <= 0.0 or midpoints_agl_m[0] > domain.max_dz_m:
+    if not math.isfinite(midpoints_agl_m[0]) or not (0.0 < midpoints_agl_m[0] <= domain.max_dz_m):
         raise ValueError("Lowest mass level midpoint must lie in (0, max_dz_m] AGL")
 
 
@@ -182,6 +198,8 @@ def validate_vertical_column(
     _check_column_bounds(midpoints_agl_m, domain)
     bl_count = 1 if midpoints_agl_m[0] <= BL_CEILING_AGL_M else 0
     for idx in range(1, domain.exported_levels_k):
+        if not math.isfinite(midpoints_agl_m[idx]):
+            raise ValueError(f"Non-finite vertical level at index {idx}")
         dz = midpoints_agl_m[idx] - midpoints_agl_m[idx - 1]
         if dz <= 0.0:
             raise ValueError(f"Non-monotonic vertical levels at index {idx}")
@@ -189,7 +207,6 @@ def validate_vertical_column(
             raise ValueError(f"Vertical gap {dz:.1f} m at level {idx} exceeds {domain.max_dz_m} m")
         if midpoints_agl_m[idx] <= BL_CEILING_AGL_M:
             bl_count += 1
-
     if bl_count < domain.min_bl_levels_2km_agl:
         raise ValueError(
             f"Only {bl_count} mass levels in 0-2000 m AGL; "
@@ -207,12 +224,20 @@ def local_cfl_3d(
     dy_m: float,
     dt_s: float,
 ) -> float:
-    """Compute 3D advective Courant number for one exported mass cell."""
+    """Compute output-frame 3D Courant proxy for one exported mass cell."""
+    if not all(math.isfinite(x) for x in (u_mps, v_mps, w_mps, dz_m, dx_m, dy_m, dt_s)):
+        raise ValueError("Non-finite input to local_cfl_3d")
     return (abs(u_mps) / dx_m + abs(v_mps) / dy_m + abs(w_mps) / max(10.0, dz_m)) * dt_s
 
 
 def validate_frame_columns(frame: NormalizedWrfFrame, domain: DomainProfile) -> float:
-    """Verify full-domain exported AGL gaps, 0-2 km BL counts, and CFL ceiling."""
+    """Verify finite full-domain exported AGL gaps, 0-2 km BL counts, and Courant proxy ceiling."""
+    if not (
+        math.isfinite(frame.min_dz_m)
+        and math.isfinite(frame.max_dz_m)
+        and math.isfinite(frame.max_cfl)
+    ):
+        raise ValueError("Non-finite column gap or Courant proxy in NormalizedWrfFrame")
     if frame.min_dz_m <= 0.0 or frame.max_dz_m > CONSUMER_MAX_PROFILE_GAP_M:
         raise ValueError(
             f"Exported column gap [{frame.min_dz_m:.1f}, {frame.max_dz_m:.1f}] m "
@@ -222,7 +247,7 @@ def validate_frame_columns(frame: NormalizedWrfFrame, domain: DomainProfile) -> 
         raise ValueError(
             f"Exported BL count {frame.min_bl_levels_2km} < {domain.min_bl_levels_2km_agl}"
         )
-    if frame.max_cfl > MAX_ADMITTED_CFL:
+    if frame.max_cfl < 0.0 or frame.max_cfl > MAX_ADMITTED_CFL:
         raise ValueError(f"Exported frame max_cfl {frame.max_cfl:.4f} > {MAX_ADMITTED_CFL}")
     return round(frame.max_cfl, 5)
 
@@ -236,5 +261,6 @@ __all__ = [
     "estimate_auto_levels_agl_m",
     "local_cfl_3d",
     "validate_frame_columns",
+    "validate_solver_znw",
     "validate_vertical_column",
 ]

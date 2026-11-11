@@ -1,4 +1,4 @@
-"""Public L3a runner surface: stores, mirrors, stage orchestration, and dispatch."""
+"""Public L3a runner surface: stores, mirrors, solver cold-start, staging, and dispatch."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from av_wrf.runner.bundle import (
     validate_bundle,
 )
 from av_wrf.runner.dispatch import (
+    dispatch_idempotency_key,
     dispatch_receipt_key,
     post_webhook_json,
     reconcile_dispatch,
@@ -23,7 +24,10 @@ from av_wrf.runner.publish import (
 from av_wrf.runner.solver import (
     load_build_manifest,
     parse_build_manifest,
+    run_geogrid,
+    run_wrf_cycle,
     verify_checkpoint_compatibility,
+    verify_solver_receipt,
 )
 from av_wrf.runner.stages import (
     check_all_products,
@@ -44,6 +48,8 @@ from av_wrf.runner.store import (
     put_idempotent,
     run_lock_key,
     sha256_hex,
+    solver_receipt_key,
+    synthetic_cycle_prefix,
 )
 
 __all__ = [
@@ -55,6 +61,7 @@ __all__ = [
     "build_verified_bundle",
     "check_all_products",
     "check_product_config",
+    "dispatch_idempotency_key",
     "dispatch_receipt_key",
     "json_bytes",
     "load_build_manifest",
@@ -76,8 +83,13 @@ __all__ = [
     "put_idempotent",
     "reconcile_dispatch",
     "resolve_cli_cycle",
+    "run_geogrid",
     "run_lock_key",
+    "run_wrf_cycle",
     "sha256_hex",
+    "solver_receipt_key",
+    "synthetic_cycle_prefix",
     "validate_bundle",
     "verify_checkpoint_compatibility",
+    "verify_solver_receipt",
 ]

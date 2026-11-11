@@ -1,4 +1,4 @@
-"""Thin av-wrf CLI entrypoint routing subcommands strictly to runner or verify."""
+"""Thin av-wrf CLI entrypoint exposing only implemented runner subcommands."""
 
 from __future__ import annotations
 
@@ -25,6 +25,8 @@ from av_wrf.runner import (
     publish_cycle_receipt,
     reconcile_dispatch,
     resolve_cli_cycle,
+    run_geogrid,
+    run_wrf_cycle,
 )
 
 CLI_COMMANDS: tuple[tuple[str, str], ...] = (
@@ -32,15 +34,13 @@ CLI_COMMANDS: tuple[tuple[str, str], ...] = (
     ("plan", "Resolve cycle timestamps and persist an immutable run.lock.json."),
     ("geog", "Preflight static DEM/land-use tiles and build geo_em.d01.nc."),
     ("prep", "Write Fortran namelist.wps + namelist.input and forcing_subset.json recipe."),
-    ("solve", "Execute MPI WRF-ARW with synchronized wrfrst checkpoints."),
+    ("solve", "Execute WPS ungrib/metgrid + MPI real/wrf and bind solver_receipt.json."),
     ("post", "Stage wrfout frames into attempt-scoped sharded wrf-zarr-v3 arrays."),
     ("publish", "Verify full RunLock horizon, promote Zarr store, and CAS latest.json."),
     ("reconcile", "Dispatch pending _ready.json webhook idempotently (fail closed)."),
-    ("archive", "Capture rolling as-issued forcing and consumer baselines."),
-    ("score", "Score matured forecast leads on NWP and soaring column proxies."),
 )
 
-_CYCLE_CMDS = {"plan", "prep", "post", "publish", "reconcile"}
+_CYCLE_CMDS = {"plan", "prep", "solve", "post", "publish", "reconcile"}
 
 
 def _add_subcommand_flags(cmd_name: str, cmd: argparse.ArgumentParser) -> None:
@@ -60,11 +60,23 @@ def _add_subcommand_flags(cmd_name: str, cmd: argparse.ArgumentParser) -> None:
             action="store_true",
             help="Permit local host dry-run when solver build-manifest.json is absent",
         )
+    if cmd_name == "geog":
+        cmd.add_argument("--work-dir", default="work/geog", help="Target geogrid directory")
     if cmd_name == "prep":
         cmd.add_argument("--work-dir", default="work/prep", help="Target namelist directory")
+    if cmd_name == "solve":
+        cmd.add_argument("--work-dir", default="work/solve", help="Attempt scratch root")
+        cmd.add_argument("--grib-dir", type=Path, required=True, help="Staged GRIB2 input dir")
+        cmd.add_argument("--geog-file", type=Path, default=None, help="Prebuilt geo_em.d01.nc")
     if cmd_name == "post":
         cmd.add_argument("--wrfout-dir", type=Path, help="Directory of wrfout_d01_* files")
         cmd.add_argument("--synthetic", action="store_true", help="Stage full synthetic horizon")
+    if cmd_name == "publish":
+        cmd.add_argument(
+            "--allow-synthetic-fixture",
+            action="store_true",
+            help="Publish synthetic run into isolated fixtures/synthetic/ namespace",
+        )
     if cmd_name == "reconcile":
         cmd.add_argument("--webhook-url", default="", help="Consumer webhook URL override")
 
@@ -92,11 +104,11 @@ def _run_check(cfg_dir: Path, product_id: str | None, mpi_ranks: int) -> int:
     return 0
 
 
-def _run_plan_or_prep(
+def _run_plan_prep_or_solve(
     args: argparse.Namespace,
     env: RuntimeEnv,
     cfg_dir: Path,
-    store: ObjectStore,
+    stage_store: ObjectStore,
     bundle: LoadedBundle,
     orig_utc: str,
     part: str,
@@ -110,7 +122,7 @@ def _run_plan_or_prep(
         )
         key, lock = plan_product_cycle(
             cfg_dir,
-            store,
+            stage_store,
             product_id=prod_id,
             publish_origin_utc=orig_utc,
             attempt_id=att,
@@ -119,31 +131,51 @@ def _run_plan_or_prep(
             bundle=bundle,
         )
         return {"status": "locked", "lock_key": key, "cycle_partition": lock.cycle_partition}
-    wps_p, wrf_p = prep_cycle_namelists(
+    if args.command == "prep":
+        wps_p, wrf_p = prep_cycle_namelists(
+            cfg_dir,
+            stage_store,
+            product_id=prod_id,
+            cycle_partition=part,
+            attempt_id=att,
+            work_dir=Path(args.work_dir),
+            bundle=bundle,
+        )
+        return {"status": "prepped", "namelist_wps": str(wps_p), "namelist_input": str(wrf_p)}
+    s_rec = run_wrf_cycle(
         cfg_dir,
-        store,
+        stage_store,
         product_id=prod_id,
         cycle_partition=part,
         attempt_id=att,
         work_dir=Path(args.work_dir),
+        grib_dir=Path(args.grib_dir),
+        geog_file=args.geog_file,
+        solver_prefix=Path(env.solver_prefix),
         bundle=bundle,
     )
-    return {"status": "prepped", "namelist_wps": str(wps_p), "namelist_input": str(wrf_p)}
+    return {
+        "status": "solved",
+        "cycle": s_rec.cycle_partition,
+        "wrfout_count": len(s_rec.wrfout_sha256s),
+    }
 
 
 def _dispatch_cycle_cmd(args: argparse.Namespace, env: RuntimeEnv, cfg_dir: Path) -> int:
-    store = open_store(env.store_uri)
-    prod_id = str(args.product)
-    att = str(args.attempt)
+    dst_store = open_store(env.store_uri)
+    stg_store = (
+        dst_store if env.stage_store_uri == env.store_uri else open_store(env.stage_store_uri)
+    )
+    prod_id, att = str(args.product), str(args.attempt)
     bundle = load_bundle(cfg_dir, prod_id)
     orig_utc, part = resolve_cli_cycle(cfg_dir, prod_id, str(args.cycle), bundle=bundle)
-    if args.command in {"plan", "prep"}:
-        out = _run_plan_or_prep(args, env, cfg_dir, store, bundle, orig_utc, part)
+    if args.command in {"plan", "prep", "solve"}:
+        out = _run_plan_prep_or_solve(args, env, cfg_dir, stg_store, bundle, orig_utc, part)
     elif args.command == "post":
         w_dir = Path(args.wrfout_dir) if args.wrfout_dir is not None else None
         prefix, count = post_cycle_from_inputs(
             cfg_dir,
-            store,
+            stg_store,
             product_id=prod_id,
             cycle_partition=part,
             attempt_id=att,
@@ -155,23 +187,31 @@ def _dispatch_cycle_cmd(args: argparse.Namespace, env: RuntimeEnv, cfg_dir: Path
     elif args.command == "publish":
         rec = publish_cycle_receipt(
             cfg_dir,
-            store,
+            dst_store,
             product_id=prod_id,
             cycle_partition=part,
             attempt_id=att,
             bundle=bundle,
+            stage_store=stg_store,
+            allow_synthetic=bool(args.allow_synthetic_fixture),
         )
         out = {
             "status": "published",
             "cycle": rec.cycle_partition,
             "shards": len(rec.shard_sha256s),
+            "forcing_profile_id": rec.forcing_profile_id,
         }
     else:
         rec = load_product_ready_receipt(
-            cfg_dir, store, product_id=prod_id, cycle_partition=part, bundle=bundle
+            cfg_dir, dst_store, product_id=prod_id, cycle_partition=part, bundle=bundle
         )
         target_url = str(args.webhook_url).strip() or env.webhook_url
-        sent = reconcile_dispatch(store, rec, lambda r: post_webhook_json(target_url, r))
+        sent = reconcile_dispatch(
+            dst_store,
+            rec,
+            lambda r: post_webhook_json(target_url, r),
+            destination_id=target_url or "unset",
+        )
         out = {"status": "reconciled", "dispatched_now": sent, "cycle": part}
     print(json.dumps(out))
     return 0
@@ -184,11 +224,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "check":
         prod_opt = str(args.product) if args.product is not None else None
         return _run_check(cfg_dir, prod_opt, env.mpi_ranks)
-    if args.command in _CYCLE_CMDS:
-        return _dispatch_cycle_cmd(args, env, cfg_dir)
-    raise NotImplementedError(
-        f"Subcommand '{args.command}' requires the `solver` Docker target (`geog`/`solve`)"
-    )
+    if args.command == "geog":
+        geo_em, geo_sha = run_geogrid(
+            cfg_dir,
+            product_id=str(args.product),
+            work_dir=Path(args.work_dir),
+            solver_prefix=Path(env.solver_prefix),
+        )
+        print(json.dumps({"status": "geog_ready", "geo_em": str(geo_em), "sha256": geo_sha}))
+        return 0
+    return _dispatch_cycle_cmd(args, env, cfg_dir)
 
 
 if __name__ == "__main__":

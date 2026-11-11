@@ -1,36 +1,29 @@
-"""Strict full-horizon `publish` verifier, ZEP-0002 gate, cheap promoter, and CAS updater."""
+"""Strict full-horizon `publish` promotion, synthetic fixture fence, and recoverable CAS."""
 
 from __future__ import annotations
 
 import json
-import math
+from datetime import UTC, datetime
 from pathlib import Path
 
-from av_wrf.codecs import (
-    build_zarr_v3_store_metadata,
-    decode_shard_f32,
-    expected_shard_keys,
-    verify_shard_index,
-)
 from av_wrf.contracts import (
-    MAX_ADMITTED_CFL,
-    WRF_ZARR_V3_3D_NAMES,
-    WRF_ZARR_V3_FIELD_NAMES,
     WRF_ZARR_V3_FIELDS,
     ZARR_SCHEMA_ID,
     ZARR_SCHEMA_VERSION,
     CycleWindow,
-    DiagnosticsReceipt,
     ReadyReceipt,
     RunLock,
     StagedPostManifest,
+    format_iso_utc,
 )
 from av_wrf.core import (
-    published_grid_shape,
+    is_cycle_live_fresh,
     published_lambert_grid_metadata,
     resolve_cycle_window,
 )
 from av_wrf.runner.bundle import LoadedBundle, load_bundle
+from av_wrf.runner.publish_verify import validate_post_manifest, verify_staged_objects
+from av_wrf.runner.solver import verify_solver_receipt
 from av_wrf.runner.stages import load_run_lock
 from av_wrf.runner.store import (
     ObjectStore,
@@ -40,83 +33,80 @@ from av_wrf.runner.store import (
     published_cycle_prefix,
     put_idempotent,
     sha256_hex,
+    synthetic_cycle_prefix,
 )
 
 MAX_CAS_RETRIES = 8
 
 
-def _verify_staged_field_shard(
-    rel_key: str,
-    payload: bytes,
-    n_leads: int,
-    nj: int,
-    ni: int,
-    b: LoadedBundle,
-    decoded_shapes: set[str],
+def _acquire_promotion_owner(
+    store: ObjectStore, pub_root: str, attempt_id: str
+) -> tuple[str, bool]:
+    owner_key = f"{pub_root}/_promotion_owner.json"
+    next_bytes = json_bytes({"attempt_id": attempt_id})
+    for _ in range(MAX_CAS_RETRIES):
+        cur = store.get_bytes(owner_key)
+        prev_sha = sha256_hex(cur) if cur is not None else None
+        prev_attempt = json.loads(cur.decode("utf-8")).get("attempt_id") if cur else None
+        try:
+            sha = store.compare_and_swap(owner_key, next_bytes, prev_sha)
+            return sha, (prev_attempt is not None and prev_attempt != attempt_id)
+        except RuntimeError:
+            continue
+    raise RuntimeError(f"Failed to acquire promotion ownership on {pub_root}")
+
+
+def _copy_one_staged_item(
+    stage_store: ObjectStore, dst_store: ObjectStore, src_k: str, dst_k: str, sha: str
 ) -> None:
-    field_name = rel_key.split("/", 1)[0]
-    if rel_key.endswith("zarr.json") or field_name not in WRF_ZARR_V3_FIELD_NAMES:
+    if stage_store is dst_store:
+        dst_store.copy_if_absent(src_k, dst_k, sha)
         return
-    if field_name == "terrain_m":
-        outer_t, n_frames, nz, shape_tag = 1, 1, 1, "static_2d"
-    else:
-        t_shard = int(rel_key.split("/")[2])
-        outer_t = min(n_leads, b.output.shard_time_steps)
-        n_frames = min(outer_t, n_leads - t_shard * outer_t)
-        is_3d = field_name in WRF_ZARR_V3_3D_NAMES
-        nz = b.domain.exported_levels_k if is_3d else 1
-        shape_tag = "3d" if is_3d else "2d"
-    verify_shard_index(
-        payload, shard_time_steps=outer_t, n_frames=n_frames, ny=nj, nx=ni, output=b.output
-    )
-    if shape_tag not in decoded_shapes:
-        vals = decode_shard_f32(
-            payload,
-            shard_time_steps=outer_t,
-            n_frames=n_frames,
-            nz=nz,
-            ny=nj,
-            nx=ni,
-            output=b.output,
-        )
-        if any(not math.isfinite(v) for v in vals[: n_frames * nz * nj * ni]):
-            raise ValueError(f"Non-finite value in decoded staged shard {rel_key}")
-        decoded_shapes.add(shape_tag)
+    raw = stage_store.get_bytes(src_k)
+    if raw is None or sha256_hex(raw) != sha:
+        raise ValueError(f"Missing staged object during cross-store copy: {src_k}")
+    put_idempotent(dst_store, dst_k, raw)
 
 
-def _verify_and_promote_attempt(
-    store: ObjectStore,
+def _promote_verified_objects(
+    stage_store: ObjectStore,
+    dst_store: ObjectStore,
     stage_root: str,
     pub_root: str,
     pm: StagedPostManifest,
-    b: LoadedBundle,
+    attempt_id: str,
 ) -> None:
-    diag_key = f"{stage_root}/_diagnostics.json"
-    diag_raw = store.get_bytes(diag_key)
-    if diag_raw is None or sha256_hex(diag_raw) != pm.diagnostics_sha256:
-        raise ValueError("Missing or corrupt staged _diagnostics.json before publish")
-    diag_obj = json.loads(diag_raw.decode("utf-8"))
-    if not isinstance(diag_obj, dict):
-        raise ValueError("Expected JSON object in _diagnostics.json")
-    diag = DiagnosticsReceipt.from_doc(diag_obj)
-    if diag.max_cfl > MAX_ADMITTED_CFL:
-        raise ValueError(f"Refusing publish: max_cfl {diag.max_cfl} > {MAX_ADMITTED_CFL}")
-
-    nj, ni = published_grid_shape(b.domain)
-    n_leads = len(pm.lead_hours)
+    _, had_prior_owner = _acquire_promotion_owner(dst_store, pub_root, attempt_id)
+    if dst_store.get_bytes(f"{pub_root}/_ready.json") is not None:
+        return
     staged_zarr, pub_zarr = f"{stage_root}/{pm.zarr_relpath}", f"{pub_root}/{pm.zarr_relpath}"
-    decoded_shapes: set[str] = set()
-    for rel_key, expected_sha in (*pm.meta_sha256s, *pm.shard_sha256s):
-        src_key = f"{staged_zarr}/{rel_key}"
-        payload = store.get_bytes(src_key)
-        if payload is None or sha256_hex(payload) != expected_sha:
-            raise ValueError(f"Corrupt or missing staged Zarr object: {rel_key}")
-        _verify_staged_field_shard(rel_key, payload, n_leads, nj, ni, b, decoded_shapes)
-        store.copy_if_absent(src_key, f"{pub_zarr}/{rel_key}", expected_sha)
-    store.copy_if_absent(diag_key, f"{pub_root}/_diagnostics.json", pm.diagnostics_sha256)
+    if had_prior_owner:
+        dst_store.delete_prefix(pub_zarr)
+        dst_store.delete_prefix(f"{pub_root}/_diagnostics.json")
+    all_items = [
+        *(
+            (f"{staged_zarr}/{k}", f"{pub_zarr}/{k}", s)
+            for k, s in (*pm.meta_sha256s, *pm.shard_sha256s)
+        ),
+        (f"{stage_root}/_diagnostics.json", f"{pub_root}/_diagnostics.json", pm.diagnostics_sha256),
+    ]
+    for idx, (src_k, dst_k, sha) in enumerate(all_items):
+        try:
+            _copy_one_staged_item(stage_store, dst_store, src_k, dst_k, sha)
+        except FileExistsError:
+            if dst_store.get_bytes(f"{pub_root}/_ready.json") is not None:
+                raise
+            dst_store.delete_prefix(pub_zarr)
+            dst_store.delete_prefix(f"{pub_root}/_diagnostics.json")
+            for r_src, r_dst, r_sha in all_items[: idx + 1]:
+                _copy_one_staged_item(stage_store, dst_store, r_src, r_dst, r_sha)
 
 
-def _advance_latest_pointer_with_retry(store: ObjectStore, receipt: ReadyReceipt) -> None:
+def _advance_latest_pointer_with_retry(
+    store: ObjectStore, receipt: ReadyReceipt, b: LoadedBundle, now_utc_iso: str
+) -> None:
+    if not is_cycle_live_fresh(b.product, b.output, receipt.publish_origin_utc, now_utc_iso):
+        return
     latest_key = f"upstream/{receipt.model_id}/latest.json"
     ready_key = f"{published_cycle_prefix(receipt.model_id, receipt.cycle_partition)}/_ready.json"
     next_payload = json_bytes(
@@ -132,9 +122,10 @@ def _advance_latest_pointer_with_retry(store: ObjectStore, receipt: ReadyReceipt
         expected_sha = sha256_hex(current_raw) if current_raw is not None else None
         if current_raw is not None:
             cur_doc = json.loads(current_raw.decode("utf-8"))
-            if receipt.publish_origin_utc < str(cur_doc["publish_origin_utc"]):
-                return
-            if cur_doc.get("ready_key") == ready_key:
+            if (
+                receipt.publish_origin_utc < str(cur_doc["publish_origin_utc"])
+                or cur_doc.get("ready_key") == ready_key
+            ):
                 return
         try:
             store.compare_and_swap(latest_key, next_payload, expected_sha)
@@ -144,29 +135,17 @@ def _advance_latest_pointer_with_retry(store: ObjectStore, receipt: ReadyReceipt
     raise RuntimeError(f"Failed to advance {latest_key} after {MAX_CAS_RETRIES} CAS attempts")
 
 
-def _validate_post_manifest(
-    raw_doc: object, b: LoadedBundle, window: CycleWindow
-) -> StagedPostManifest:
-    if not isinstance(raw_doc, dict):
-        raise ValueError("Expected JSON object in post_manifest.json")
-    pm = StagedPostManifest.from_doc(raw_doc)
-    if pm.lead_hours != window.lead_hours or pm.valid_times_utc != window.valid_times_utc:
-        raise ValueError(
-            f"Incomplete or mismatched cycle horizon: got {len(pm.lead_hours)} leads, "
-            f"expected {len(window.lead_hours)} ({window.lead_hours})"
-        )
-    expected_meta = set(build_zarr_v3_store_metadata(b.domain, b.output, pm.lead_hours).keys())
-    if {k for k, _ in pm.meta_sha256s} != expected_meta:
-        raise ValueError("Staged Zarr metadata inventory does not match expected store hierarchy")
-    if {k for k, _ in pm.shard_sha256s} != expected_shard_keys(b.output, len(pm.lead_hours)):
-        raise ValueError("Staged Zarr shard inventory is incomplete for configured 22 fields")
-    return pm
-
-
 def _check_existing_published_ready(
-    store: ObjectStore, ready_key: str, stage_root: str, lock: RunLock
+    stage_store: ObjectStore,
+    dst_store: ObjectStore,
+    ready_key: str,
+    stage_root: str,
+    lock: RunLock,
+    b: LoadedBundle,
+    is_synthetic: bool,
+    now_iso: str,
 ) -> ReadyReceipt | None:
-    existing_ready = store.get_bytes(ready_key)
+    existing_ready = dst_store.get_bytes(ready_key)
     if existing_ready is None:
         return None
     existing_doc = json.loads(existing_ready.decode("utf-8"))
@@ -177,9 +156,40 @@ def _check_existing_published_ready(
         raise FileExistsError(
             f"Cycle {lock.cycle_partition} already published by {committed.attempt_id}"
         )
-    _advance_latest_pointer_with_retry(store, committed)
-    store.delete_prefix(stage_root)
+    if not is_synthetic:
+        _advance_latest_pointer_with_retry(dst_store, committed, b, now_iso)
+    stage_store.delete_prefix(stage_root)
     return committed
+
+
+def _build_ready_receipt(
+    lock: RunLock, pm: StagedPostManifest, b: LoadedBundle, window: CycleWindow, is_synth: bool
+) -> ReadyReceipt:
+    grid_meta = {
+        **published_lambert_grid_metadata(b.domain),
+        "demSource": b.domain.dem_source,
+        "landuseSource": b.domain.landuse_source,
+    }
+    return ReadyReceipt(
+        ZARR_SCHEMA_ID,
+        ZARR_SCHEMA_VERSION,
+        lock.model_id,
+        lock.cycle_partition,
+        lock.publish_origin_utc,
+        lock.attempt_id,
+        pm.zarr_relpath,
+        grid_meta,
+        b.domain.exported_levels_k,
+        pm.lead_hours,
+        pm.valid_times_utc,
+        window.window_starts_utc,
+        pm.valid_times_utc,
+        tuple(f.name for f in WRF_ZARR_V3_FIELDS),
+        (*pm.meta_sha256s, *pm.shard_sha256s),
+        lock.config_sha256,
+        "synthetic-fixture" if is_synth else lock.forcing_profile_id,
+        "synthetic-fixture" if is_synth else lock.build_manifest.oci_digest,
+    )
 
 
 def publish_cycle_receipt(
@@ -190,48 +200,56 @@ def publish_cycle_receipt(
     cycle_partition: str,
     attempt_id: str,
     bundle: LoadedBundle | None = None,
+    stage_store: ObjectStore | None = None,
+    allow_synthetic: bool = False,
+    now_utc_iso: str | None = None,
 ) -> ReadyReceipt:
-    """Verify complete RunLock horizon + ZEP-0002, promote store, clean stage, and CAS latest."""
+    """Verify RunLock provenance, ZEP-0002 shards & coords, recoverably promote, and CAS latest."""
+    stg = store if stage_store is None else stage_store
+    now_iso = format_iso_utc(datetime.now(UTC)) if now_utc_iso is None else now_utc_iso
     b = load_bundle(config_root, product_id) if bundle is None else bundle
-    lock = load_run_lock(store, product_id, cycle_partition, attempt_id)
+    lock = load_run_lock(stg, product_id, cycle_partition, attempt_id)
     if lock.config_sha256 != b.config_sha256:
         raise ValueError("Config bundle SHA-256 drifted from frozen RunLock")
     stage_root = attempt_stage_prefix(product_id, cycle_partition, attempt_id)
-    pub_root = published_cycle_prefix(lock.model_id, lock.cycle_partition)
+    pm_raw = stg.get_bytes(post_manifest_key(product_id, cycle_partition, attempt_id))
+    if pm_raw is None:
+        live_r = f"{published_cycle_prefix(lock.model_id, lock.cycle_partition)}/_ready.json"
+        fix_r = f"{synthetic_cycle_prefix(lock.model_id, lock.cycle_partition)}/_ready.json"
+        chk = fix_r if allow_synthetic and store.get_bytes(fix_r) else live_r
+        already = _check_existing_published_ready(
+            stg, store, chk, stage_root, lock, b, chk == fix_r, now_iso
+        )
+        if already is not None:
+            return already
+        raise FileNotFoundError("Missing post_manifest.json; run `av-wrf post` before `publish`")
+
+    window = resolve_cycle_window(b.product, b.output, lock.publish_origin_utc)
+    pm = validate_post_manifest(json.loads(pm_raw.decode("utf-8")), b, window)
+    is_synth = pm.execution_mode == "synthetic"
+    if is_synth and not allow_synthetic:
+        raise ValueError("Refusing to publish synthetic forecast to live upstream store")
+    if not is_synth:
+        verify_solver_receipt(stg, lock, None)
+    pub_root = (
+        synthetic_cycle_prefix(lock.model_id, lock.cycle_partition)
+        if is_synth
+        else published_cycle_prefix(lock.model_id, lock.cycle_partition)
+    )
     ready_key = f"{pub_root}/_ready.json"
-    already = _check_existing_published_ready(store, ready_key, stage_root, lock)
+    already = _check_existing_published_ready(
+        stg, store, ready_key, stage_root, lock, b, is_synth, now_iso
+    )
     if already is not None:
         return already
-
-    pm_raw = store.get_bytes(post_manifest_key(product_id, cycle_partition, attempt_id))
-    if pm_raw is None:
-        raise FileNotFoundError("Missing post_manifest.json; run `av-wrf post` before `publish`")
-    window = resolve_cycle_window(b.product, b.output, lock.publish_origin_utc)
-    pm = _validate_post_manifest(json.loads(pm_raw.decode("utf-8")), b, window)
-    _verify_and_promote_attempt(store, stage_root, pub_root, pm, b)
-    receipt = ReadyReceipt(
-        schema_id=ZARR_SCHEMA_ID,
-        schema_version=ZARR_SCHEMA_VERSION,
-        model_id=lock.model_id,
-        cycle_partition=lock.cycle_partition,
-        publish_origin_utc=lock.publish_origin_utc,
-        attempt_id=lock.attempt_id,
-        zarr_relpath=pm.zarr_relpath,
-        grid=published_lambert_grid_metadata(b.domain),
-        exported_levels_k=b.domain.exported_levels_k,
-        lead_hours=pm.lead_hours,
-        valid_times_utc=pm.valid_times_utc,
-        window_starts_utc=window.window_starts_utc,
-        window_ends_utc=pm.valid_times_utc,
-        field_names=tuple(f.name for f in WRF_ZARR_V3_FIELDS),
-        shard_sha256s=(*pm.meta_sha256s, *pm.shard_sha256s),
-        config_sha256=lock.config_sha256,
-        forcing_profile_id=lock.forcing_profile_id,
-        oci_digest=lock.build_manifest.oci_digest,
-    )
+    verify_staged_objects(stg, stage_root, pm, b, window)
+    _promote_verified_objects(stg, store, stage_root, pub_root, pm, lock.attempt_id)
+    receipt = _build_ready_receipt(lock, pm, b, window, is_synth)
     put_idempotent(store, ready_key, json_bytes(receipt.to_doc()))
-    _advance_latest_pointer_with_retry(store, receipt)
-    store.delete_prefix(stage_root)
+    store.delete_prefix(f"{pub_root}/_promotion_owner.json")
+    if not is_synth:
+        _advance_latest_pointer_with_retry(store, receipt, b, now_iso)
+    stg.delete_prefix(stage_root)
     return receipt
 
 

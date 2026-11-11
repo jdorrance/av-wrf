@@ -9,8 +9,8 @@
 # - Steep-slope stability: `hybrid_opt: 2, etac: 0.2` (verified fold-free up to 5,137 m Ararat),
 #   `diff_opt: 2, km_opt: 4` physical-space 3D deformation diffusion, `epssm: 0.3` acoustic
 #   off-centering, `w_damping: 1`, and 5 km implicit Rayleigh upper sponge (`damp_opt: 3`).
-# - Subgrid orographic drag (`gwd_opt: 0`): disabled at 3 km to avoid double-counting resolved
-#   mountain-wave drag over the Lesser Caucasus; `topo_wind: 1` retains Jimenez ridge-crest drag.
+# - AFWA diagnostics: `afwa_diag_opt: 1` (`AFWA_MSLP`), `afwa_severe_opt: 1` (`WSPD10MAX`), and
+#   `afwa_buoy_opt: 1` (`AFWA_CAPE` + `AFWA_CAPE_MU`, independent of Thompson graupel number).
 # References:
 # - WRF v4.8.0 releases: https://github.com/wrf-model/WRF/releases
 # - WRF v4.8.0 Known Problems: https://github.com/wrf-model/WRF/wiki/WRF-V4.8.0-Known-Problems
@@ -33,7 +33,7 @@ bl_pbl_physics: 1
 sf_sfclay_physics: 1
 topo_wind: 1
 ysu_topdown_pblmix: 0
-shinhong_scu_mixing: 0
+shinhong_scu_mixing: false
 shinhong_nonlocal_flux: false
 cu_physics: 0
 gwd_opt: 0
@@ -59,7 +59,7 @@ interval_seconds: 3600
 nwp_diagnostics: 1
 afwa_diag_opt: 1
 afwa_severe_opt: 1
+afwa_buoy_opt: 1
 history_interval_min: 60
-prec_acc_dt_min: 60
 bucket_mm: 100.0
 bucket_j: 1000000000.0
