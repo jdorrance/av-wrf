@@ -25,9 +25,7 @@ class TestForcing(unittest.TestCase):
     def test_ifs_to_noah_mp_soil_interpolation_and_bounds(self) -> None:
         ifs_depths = (3.5, 17.5, 64.0, 194.5)
         ifs_smois = (0.18, 0.24, 0.30, 0.55)
-        out = interpolate_soil_profile(
-            ifs_depths, ifs_smois, lower_bound=0.05, upper_bound=0.45
-        )
+        out = interpolate_soil_profile(ifs_depths, ifs_smois, lower_bound=0.05, upper_bound=0.45)
         self.assertEqual(len(out), 4)
         self.assertGreater(out[0], 0.18)
         self.assertEqual(out[3], 0.45)  # clamped to porosity ceiling

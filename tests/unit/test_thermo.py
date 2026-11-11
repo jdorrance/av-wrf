@@ -7,15 +7,19 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[2]
 for p in (ROOT, ROOT / "src"):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
 from av_wrf.contracts import (  # noqa: E402
+    CompMass3D,
     GridWindMps,
     MixingRatioKgKg,
     Pascals,
+    Slab3DF32,
     SpecificHumidityKgKg,
     TempK,
     VerticalVelocityMps,
@@ -27,6 +31,7 @@ from av_wrf.core import (  # noqa: E402
     MOIST_THETA_COEFF,
     clamp_spfh_2m_to_liquid_sat,
     geometric_w_to_omega_pas,
+    groom_f32_buf,
     groom_mantissa_f32,
     hypsometric_mslp_pa,
     lambert_convergence_trig,
@@ -36,13 +41,15 @@ from av_wrf.core import (  # noqa: E402
     parameterized_gust_10m_mps,
     potential_to_temp_k,
     rotate_grid_to_earth,
+    verify_t_thm_consistency,
     verify_wrf_alpha_against_lambert,
 )
+from av_wrf.runner import load_bundle  # noqa: E402
 from tests.oracle.reference_cases import (  # noqa: E402
-    ARMENIA_CENTER,
     EXPECTED_TEMP_850HPA_K,
-    NZ_SOUTH_ISLAND_CENTER,
+    NH_MIDLAT_LCC,
     PRESSURE_850HPA_PA,
+    SH_MIDLAT_LCC,
     THETA_PERTURB_10K,
 )
 
@@ -77,8 +84,34 @@ class TestThermo(unittest.TestCase):
         self.assertLess(abs(groom_mantissa_f32(288.13791, keepbits=15) - 288.13791), 0.005)
         self.assertLessEqual(abs(groom_mantissa_f32(101325.3, keepbits=17) - 101325.3), 0.5)
 
+    def test_vectorized_groom_f32_buf_and_exhaustive_t_thm_guard(self) -> None:
+        samples = [0.0, -0.0, 288.13791, -33.333336, 101325.3, -12.8751, 1e-6, float("inf")]
+        arr = np.array(samples, dtype=np.float64)
+        for kb in (15, 17, 23):
+            vec = list(groom_f32_buf(arr, kb))
+            ref = [groom_mantissa_f32(float(np.float32(v)), kb) for v in samples]
+            self.assertEqual(vec, ref)
+
+        prod_id = sorted((ROOT / "config" / "products").glob("*.yaml"))[0].stem
+        sci = load_bundle(ROOT / "config", prod_id).science
+        n = 1000
+        t_dry = CompMass3D(Slab3DF32.from_values(10, 10, 10, [8.0] * n))
+        qv = CompMass3D(Slab3DF32.from_values(10, 10, 10, [0.012] * n))
+        p0 = CompMass3D(Slab3DF32.from_values(10, 10, 10, [0.0] * n))
+        pb = CompMass3D(Slab3DF32.from_values(10, 10, 10, [85_000.0] * n))
+        thm_v = (8.0 + sci.base_temp_k) * (1.0 + MOIST_THETA_COEFF * 0.012) - sci.base_temp_k
+        thm_vals = [thm_v] * n
+        verify_t_thm_consistency(
+            t_dry, CompMass3D(Slab3DF32.from_values(10, 10, 10, thm_vals)), p0, pb, qv, sci
+        )
+        # Single interior cell spike at index 777 (missed by 512-stride) is caught exhaustively
+        thm_vals[777] = 8.0
+        with self.assertRaises(ValueError):
+            verify_t_thm_consistency(
+                t_dry, CompMass3D(Slab3DF32.from_values(10, 10, 10, thm_vals)), p0, pb, qv, sci
+            )
+
     def test_bolton_q2_clamp_shuell_mslp_and_high_altitude_gusts(self) -> None:
-        # 112% RH freezing fog Q2 must clamp strictly <= Bolton liquid saturation after keepbits=15.
         t2_k, psfc = 268.15, 80_000.0
         clamped = groom_mantissa_f32(clamp_spfh_2m_to_liquid_sat(0.0040, t2_k, psfc), 15)
         r = clamped / (1.0 - clamped)
@@ -87,13 +120,11 @@ class TestThermo(unittest.TestCase):
         self.assertLessEqual(e_hpa, es_hpa)
         self.assertGreater(e_hpa, 0.999 * es_hpa)
 
-        # Shuell plateau MSLP prevents extreme summer heat-low depression at 3,000 m.
         unclamped_tv = 305.0 + 0.5 * 0.0065 * 3000.0
         naive_mslp = 70_000.0 * math.exp((9.81 * 3000.0) / (287.0 * unclamped_tv))
         shuell_mslp = hypsometric_mslp_pa(70_000.0, 3000.0, 305.0, 0.008)
         self.assertGreater(shuell_mslp - naive_mslp, 300.0)
 
-        # High-terrain (650 hPa) convective gusts exceed sea-level-density gusts for identical HFX.
         g_sea = parameterized_gust_10m_mps(
             3.0, 0.0, 3.0, 0.2, 350.0, 80.0, 2200.0, 290.0, 0.006, 100_000.0
         )
@@ -103,7 +134,7 @@ class TestThermo(unittest.TestCase):
         self.assertGreater(g_mtn, g_sea + 0.5)
 
     def test_wrf_alpha_matches_consumer_in_nh_and_sh(self) -> None:
-        for lat0, lon0, sp1, sp2 in (ARMENIA_CENTER, NZ_SOUTH_ISLAND_CENTER):
+        for lat0, lon0, sp1, sp2 in (NH_MIDLAT_LCC, SH_MIDLAT_LCC):
             cos_t, sin_t = lambert_convergence_trig(
                 lon0 + 4.0,
                 central_meridian_deg=lon0,
@@ -113,9 +144,7 @@ class TestThermo(unittest.TestCase):
                 radius_m=6_370_000.0,
             )
             verify_wrf_alpha_against_lambert(cos_t, -sin_t, cos_t, sin_t)
-            ue, ve = rotate_grid_to_earth(
-                GridWindMps(7.3), GridWindMps(-4.1), cos_t, -sin_t
-            )
+            ue, ve = rotate_grid_to_earth(GridWindMps(7.3), GridWindMps(-4.1), cos_t, -sin_t)
             self.assertAlmostEqual(float(ue), cos_t * 7.3 + sin_t * (-4.1), places=12)
             self.assertAlmostEqual(float(ve), -sin_t * 7.3 + cos_t * (-4.1), places=12)
             self.assertAlmostEqual(

@@ -10,14 +10,14 @@ python3 scripts/generate_reference.py
 
 Source: [`src/av_wrf/cli/main.py`](../src/av_wrf/cli/main.py).
 
-- `av-wrf check`: Validate product, domain, vertical stretch, science, horizon, and Zarr v3.
+- `av-wrf check`: Validate configured product(s), vertical stretch, namelist, and Zarr v3.
 - `av-wrf plan`: Resolve cycle timestamps and persist an immutable run.lock.json.
 - `av-wrf geog`: Preflight static DEM/land-use tiles and build geo_em.d01.nc.
-- `av-wrf prep`: Fetch fail-closed forcing slabs, interpolate soil, and run real.
+- `av-wrf prep`: Write Fortran namelist.wps + namelist.input and forcing_subset.json recipe.
 - `av-wrf solve`: Execute MPI WRF-ARW with synchronized wrfrst checkpoints.
-- `av-wrf post`: Convert wrfout frames into sharded wrf-zarr-v3 arrays.
-- `av-wrf publish`: Verify cycle completeness, write _ready.json, and CAS latest.json.
-- `av-wrf reconcile`: Dispatch pending _ready.json webhooks idempotently.
+- `av-wrf post`: Stage wrfout frames into attempt-scoped sharded wrf-zarr-v3 arrays.
+- `av-wrf publish`: Verify full RunLock horizon, promote Zarr store, and CAS latest.json.
+- `av-wrf reconcile`: Dispatch pending _ready.json webhook idempotently (fail closed).
 - `av-wrf archive`: Capture rolling as-issued forcing and consumer baselines.
 - `av-wrf score`: Score matured forecast leads on NWP and soaring column proxies.
 
@@ -26,6 +26,7 @@ Source: [`src/av_wrf/cli/main.py`](../src/av_wrf/cli/main.py).
 Source: [`config/products/`](../config/README.md).
 
 - `wrf-armenia-3km`: published grid `180 x 148` (`x0M = -268500.0`, `y0M = -220500.0`), primary `noaa-gfs-0p25-v1` (candidate `ecmwf-ifs-0p1-v1`), `40` leads, `20` BL levels (`0-2 km` AGL), remaining-horizon floor `42 h`, `time_step = 15 s`.
+- `wrf-armenia-pilot-3km`: published grid `84 x 84` (`x0M = -124500.0`, `y0M = -124500.0`), primary `noaa-gfs-0p25-v1` (candidate `ecmwf-ifs-0p1-v1`), `16` leads, `20` BL levels (`0-2 km` AGL), remaining-horizon floor `10 h`, `time_step = 15 s`.
 
 ## Wire Schema `wrf-zarr-v3` (v1, `provisional-phase-1`)
 

@@ -1,8 +1,11 @@
-"""Contract tests verifying full wrf-zarr-v3 schema sync and 30-node Zarr v3 hierarchy."""
+"""Contract tests verifying wrf-zarr-v3 sync, 30-node Zarr v3 metadata, and ZEP-0002 shards."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import math
+import struct
 import sys
 import unittest
 from pathlib import Path
@@ -13,7 +16,17 @@ for p in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(p))
 
 from av_wrf.cli import main as cli_main  # noqa: E402
-from av_wrf.codecs import build_zarr_v3_store_metadata, zarr_shard_relpath  # noqa: E402
+from av_wrf.codecs import (  # noqa: E402
+    build_zarr_v3_store_metadata,
+    crc32c_u32,
+    decode_shard_f32,
+    encode_2d_shard_bytes,
+    encode_3d_shard_bytes,
+    expected_shard_keys,
+    synthetic_thm_from_dry_theta,
+    verify_shard_index,
+    zarr_shard_relpath,
+)
 from av_wrf.contracts import (  # noqa: E402
     CAPE_PARCEL_DEFINITION,
     DEFAULT_INNER_SPATIAL_CHUNK,
@@ -23,18 +36,26 @@ from av_wrf.contracts import (  # noqa: E402
     MOISTURE_SOURCE_OF_TRUTH,
     TEMPERATURE_DEFINITION,
     WRF_SPHERE_RADIUS_M,
+    WRF_ZARR_V3_COORDS,
     WRF_ZARR_V3_FIELDS,
     ZARR_FORMAT_VERSION,
     ZARR_SCHEMA_ID,
     ZARR_SCHEMA_STATUS,
     ZARR_SCHEMA_VERSION,
-    parse_domain_profile,
-    parse_output_profile,
+    CompMass3D,
+    PubMass2D,
+    PubMass3D,
+    Slab2DF32,
+    Slab3DF32,
     zarr_index_codecs,
     zarr_inner_codecs,
 )
-from av_wrf.core import selected_lead_hours  # noqa: E402
-from av_wrf.runner import parse_declarative_yaml  # noqa: E402
+from av_wrf.core import (  # noqa: E402
+    published_grid_shape,
+    selected_lead_hours,
+    verify_t_thm_consistency,
+)
+from av_wrf.runner import load_bundle  # noqa: E402
 
 
 class TestVendorZarrContract(unittest.TestCase):
@@ -55,6 +76,7 @@ class TestVendorZarrContract(unittest.TestCase):
         self.assertEqual(raw["innerSpatialChunk"], list(DEFAULT_INNER_SPATIAL_CHUNK))
         self.assertEqual(raw["innerCodecs"], zarr_inner_codecs())
         self.assertEqual(raw["indexCodecs"], zarr_index_codecs())
+        self.assertEqual(len(WRF_ZARR_V3_COORDS), 7)
 
         vendored_fields = raw["fields"]
         self.assertEqual(len(vendored_fields), len(WRF_ZARR_V3_FIELDS))
@@ -68,31 +90,69 @@ class TestVendorZarrContract(unittest.TestCase):
             self.assertEqual(spec.time_support, expected["timeSupport"])
             self.assertEqual(spec.keepbits, expected["keepbits"])
 
-    def test_complete_zarr_v3_hierarchy_and_dynamic_shard_keys(self) -> None:
-        dom = parse_domain_profile(
-            parse_declarative_yaml(
-                ROOT / "config" / "profiles" / "domains" / "armenia-3km-v1.yaml"
-            )
-        )
-        out = parse_output_profile(
-            parse_declarative_yaml(
-                ROOT / "config" / "profiles" / "outputs" / "wrf-zarr-v3-48h.yaml"
-            )
-        )
-        docs = build_zarr_v3_store_metadata(dom, out, selected_lead_hours(out))
-        # 1 root group + 7 coordinate arrays + 22 data arrays = 30 zarr.json documents
-        self.assertEqual(len(docs), 30)
-        temp_meta = docs["temp_k/zarr.json"]
-        self.assertEqual(temp_meta["node_type"], "array")
-        self.assertEqual(temp_meta["shape"], [40, 40, 148, 180])
-        self.assertEqual(zarr_shard_relpath("temp_k", out, time_index=5), "temp_k/c/5/0/0/0")
-        self.assertEqual(zarr_shard_relpath("terrain_m", out), "terrain_m/c/0/0")
+    def test_zep0002_multitile_partial_shard_and_index_verification(self) -> None:
+        self.assertEqual(crc32c_u32(b"123456789"), 0xE3069283)
 
-    def test_cli_check_validates_armenia_product(self) -> None:
-        rc = cli_main(
-            ["check", "--product", "wrf-armenia-3km", "--config-dir", str(ROOT / "config")]
+        prod_id = sorted((ROOT / "config" / "products").glob("*.yaml"))[0].stem
+        out = dataclasses.replace(
+            load_bundle(ROOT / "config", prod_id).output,
+            inner_chunk_yx=(5, 7),
+            shard_time_steps=3,
         )
-        self.assertEqual(rc, 0)
+        f0 = PubMass2D(Slab2DF32.from_values(10, 14, [float(i) for i in range(140)]))
+        f1 = PubMass2D(Slab2DF32.from_values(10, 14, [float(i) + 500.0 for i in range(140)]))
+        shard2d = encode_2d_shard_bytes([f0, f1], out, shard_time_steps=3)
+        dec2d = decode_shard_f32(
+            shard2d, shard_time_steps=3, n_frames=2, nz=1, ny=10, nx=14, output=out
+        )
+        self.assertEqual(list(dec2d[:140]), list(f0.buf))
+        self.assertEqual(list(dec2d[140:280]), list(f1.buf))
+        self.assertTrue(all(math.isnan(v) for v in dec2d[280:]))
+        # Claiming 3 populated frames when slot 2 holds sentinels must fail index verification
+        with self.assertRaises(ValueError):
+            verify_shard_index(shard2d, shard_time_steps=3, n_frames=3, ny=10, nx=14, output=out)
+
+        v0 = PubMass3D(Slab3DF32.from_values(2, 10, 14, [float(i) * 0.5 for i in range(280)]))
+        v1 = PubMass3D(Slab3DF32.from_values(2, 10, 14, [float(i) * 1.5 for i in range(280)]))
+        shard3d = encode_3d_shard_bytes([v0, v1], out, shard_time_steps=2)
+        dec3d = decode_shard_f32(shard3d, shard_time_steps=2, nz=2, ny=10, nx=14, output=out)
+        self.assertEqual(list(dec3d), [*v0.buf, *v1.buf])
+
+        # Re-CRC'd bad offset in tile 0 must still fail verify_shard_index bounds check
+        idx_len = 8 * 16
+        body = shard3d[: -(idx_len + 4)]
+        bad_idx = bytearray(shard3d[-(idx_len + 4) : -4])
+        struct.pack_into("<QQ", bad_idx, 0, 4, 8)
+        forged = body + bytes(bad_idx) + struct.pack("<I", crc32c_u32(bytes(bad_idx)))
+        with self.assertRaises(ValueError):
+            verify_shard_index(forged, shard_time_steps=2, n_frames=2, ny=10, nx=14, output=out)
+
+    def test_complete_zarr_v3_hierarchy_for_all_configured_products(self) -> None:
+        cfg_dir = ROOT / "config"
+        for p_path in sorted((cfg_dir / "products").glob("*.yaml")):
+            b = load_bundle(cfg_dir, p_path.stem)
+            leads = selected_lead_hours(b.output)
+            docs = build_zarr_v3_store_metadata(b.domain, b.output, leads)
+            self.assertEqual(len(docs), 30)
+            nj, ni = published_grid_shape(b.domain)
+            temp_meta = docs["temp_k/zarr.json"]
+            self.assertEqual(temp_meta["shape"], [len(leads), b.domain.exported_levels_k, nj, ni])
+            self.assertEqual(zarr_shard_relpath("terrain_m", b.output), "terrain_m/c/0/0")
+            self.assertIn("terrain_m/c/0/0", expected_shard_keys(b.output, len(leads)))
+
+    def test_cli_check_and_t_thm_guard(self) -> None:
+        self.assertEqual(cli_main(["check", "--config-dir", str(ROOT / "config")]), 0)
+        prod_id = sorted((ROOT / "config" / "products").glob("*.yaml"))[0].stem
+        sci = load_bundle(ROOT / "config", prod_id).science
+        t_dry = CompMass3D(Slab3DF32.from_values(1, 2, 2, [8.0] * 4))
+        qv = CompMass3D(Slab3DF32.from_values(1, 2, 2, [0.012] * 4))
+        p0 = CompMass3D(Slab3DF32.from_values(1, 2, 2, [0.0] * 4))
+        pb = CompMass3D(Slab3DF32.from_values(1, 2, 2, [85_000.0] * 4))
+        thm_val = synthetic_thm_from_dry_theta(8.0, 0.012, sci.base_temp_k)
+        thm_ok = CompMass3D(Slab3DF32.from_values(1, 2, 2, [thm_val] * 4))
+        verify_t_thm_consistency(t_dry, thm_ok, p0, pb, qv, sci)
+        with self.assertRaises(ValueError):
+            verify_t_thm_consistency(t_dry, t_dry, p0, pb, qv, sci)
 
 
 if __name__ == "__main__":

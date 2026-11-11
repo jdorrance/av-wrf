@@ -1,13 +1,12 @@
-"""Stateful full-frame WRF -> Published-Grid Zarr slab post-processing (`post_frame`).
+"""Vectorized stateful WRF -> Published-Grid Zarr slab post-processing (`post_frame`).
 
 Assumptions & Field Semantics:
 - Trailing statistical windows: `sensible_heat_flux_wm2`, `latent_heat_flux_wm2`, and
-  `precip_mm_hr` represent trailing-window means across `(t_prev, t_curr]` (`1 h` in `f001..f036`,
-  `3 h` in `f039..f048`). Surface heat fluxes allow signed negative nocturnal values; rainfall
-  requires non-negative cumulative deltas.
+  `precip_mm_hr` represent trailing-window means across `(t_prev, t_curr]` (`1 h` in hourly
+  segments, `3 h` in 3-hourly tail segments). Surface heat fluxes allow signed negative nocturnal
+  values; rainfall requires non-negative cumulative deltas.
 - Low-cloud threshold: `p >= 0.8 * PSFC` follows ECMWF terrain-following sigma (`LCC`) so high
-  plateaus (`PSFC < 800 hPa`) retain true low-cloud / fog detection; note YSU (`bl_pbl_physics=1`)
-  without `icloud_bl` can under-diagnose subgrid fair-weather shallow `Cu` in `CLDFRA`.
+  plateaus (`PSFC < 800 hPa`) retain true low-cloud / fog detection.
 - `height_msl_m`: `(PH + PHB) / 9.81` destaggered at exact `eta` midpoints (`0.5*(face_k+face_k+1)`
   per Skamarock et al. 2019 Sec. 3.2.1), matching `terrain_m` (`HGT`) datum at ground.
 """
@@ -15,310 +14,319 @@ Assumptions & Field Semantics:
 from __future__ import annotations
 
 from array import array
-from dataclasses import dataclass
+
+import numpy as np
+import numpy.typing as npt
 
 from av_wrf.contracts import (
+    BL_CEILING_AGL_M,
     AccumBaseline,
     CompMass2D,
-    CompMass3D,
-    CompStagX3D,
-    CompStagY3D,
-    CompStagZ3D,
     DomainProfile,
-    GridWindMps,
-    MixingRatioKgKg,
-    Pascals,
+    NormalizedWrfFrame,
+    PubBucket2D,
     PubMass2D,
     PubMass3D,
+    RawWrfStepInput,
     ScienceProfile,
     Slab2DF32,
     Slab3DF32,
-    SpecificHumidityKgKg,
-    TempK,
-    VerticalVelocityMps,
-    WrfPerturbPotTempK,
 )
 from av_wrf.core.grid import (
+    crop_bucket_2d,
     crop_sponge_2d,
     crop_sponge_3d,
     destagger_x_3d,
     destagger_y_3d,
     destagger_z_3d,
+    published_grid_shape,
 )
 from av_wrf.core.thermo import (
+    CONSUMER_EPSILON,
+    CONSUMER_KELVIN_OFFSET,
+    CP_DRY_J_KG_K,
     G0_MPS2,
-    clamp_spfh_2m_to_liquid_sat,
-    geometric_w_to_omega_pas,
-    groom_mantissa_f32,
-    hypsometric_mslp_pa,
-    max_random_cloud_pct,
-    mixing_ratio_to_spfh,
-    parameterized_gust_10m_mps,
-    potential_to_temp_k,
-    rotate_grid_to_earth,
-    window_rate_from_accum,
+    IFS_GUST_COEFF,
+    KAPPA_DRY,
+    LV_VAPOR_J_KG,
+    P0_PA,
+    R_DRY_J_KG_K,
+    STD_LAPSE_K_PER_M,
+    VIRTUAL_TEMP_COEFF,
+    VON_KARMAN,
+    groom_f32_buf,
 )
 
-
-@dataclass(frozen=True)
-class RawWrfStepInput:
-    """Croppable computational-grid WRF fields for one output timestamp."""
-
-    valid_time_utc: str
-    valid_time_unix_s: int
-    terrain_m: CompMass2D
-    cos_alpha: CompMass2D
-    sin_alpha: CompMass2D
-    psfc_pa: CompMass2D
-    t2_k: CompMass2D
-    q2_kgkg: CompMass2D
-    u10_grid_mps: CompMass2D
-    v10_grid_mps: CompMass2D
-    wspd10max_mps: CompMass2D
-    ustar_mps: CompMass2D
-    pblh_m: CompMass2D
-    afwa_cape_jkg: CompMass2D
-    achfx_j_m2: CompMass2D
-    i_achfx: tuple[int, ...]
-    aclhf_j_m2: CompMass2D
-    i_aclhf: tuple[int, ...]
-    rainc_mm: CompMass2D
-    i_rainc: tuple[int, ...]
-    rainnc_mm: CompMass2D
-    i_rainnc: tuple[int, ...]
-    p_pert_pa: CompMass3D
-    pb_pa: CompMass3D
-    ph_stag_m2s2: CompStagZ3D
-    phb_stag_m2s2: CompStagZ3D
-    theta_pert_k: CompMass3D
-    qvapor_kgkg: CompMass3D
-    cldfra: CompMass3D
-    u_stag_mps: CompStagX3D
-    v_stag_mps: CompStagY3D
-    w_stag_mps: CompStagZ3D
+type _ArrF64 = npt.NDArray[np.float64]
 
 
-@dataclass(frozen=True)
-class NormalizedWrfFrame:
-    """All 22 Published-Grid arrays ready for Zarr v3 shard encoding."""
+def _as_f64(buf: array[float], shape: tuple[int, ...]) -> _ArrF64:
+    return np.frombuffer(buf, dtype=np.float32).reshape(shape).astype(np.float64)
 
-    valid_time_utc: str
-    window_start_unix_s: int
-    window_end_unix_s: int
-    fields_2d: dict[str, PubMass2D]
-    fields_3d: dict[str, PubMass3D]
+
+def _crop2_f64(slab: CompMass2D, trim: int) -> _ArrF64:
+    cropped = crop_sponge_2d(slab, trim)
+    return _as_f64(cropped.buf, (cropped.ny, cropped.nx))
+
+
+def _groom_2d(slab: PubMass2D, keepbits: int) -> PubMass2D:
+    arr = _as_f64(slab.buf, (slab.ny, slab.nx))
+    return PubMass2D(Slab2DF32(ny=slab.ny, nx=slab.nx, buf=groom_f32_buf(arr, keepbits)))
 
 
 def build_accum_baseline(raw: RawWrfStepInput, trim: int) -> AccumBaseline:
-    """Extract cropped Published-Grid cumulative baseline from f000 or a restart frame."""
+    """Crop both float32 accumulators and int32 bucket counters onto Published Grid."""
     return AccumBaseline(
         valid_time_utc=raw.valid_time_utc,
         valid_time_unix_s=raw.valid_time_unix_s,
         achfx_j_m2=crop_sponge_2d(raw.achfx_j_m2, trim),
-        i_achfx=raw.i_achfx,
+        i_achfx=crop_bucket_2d(raw.i_achfx, trim),
         aclhf_j_m2=crop_sponge_2d(raw.aclhf_j_m2, trim),
-        i_aclhf=raw.i_aclhf,
+        i_aclhf=crop_bucket_2d(raw.i_aclhf, trim),
         rainc_mm=crop_sponge_2d(raw.rainc_mm, trim),
-        i_rainc=raw.i_rainc,
+        i_rainc=crop_bucket_2d(raw.i_rainc, trim),
         rainnc_mm=crop_sponge_2d(raw.rainnc_mm, trim),
-        i_rainnc=raw.i_rainnc,
+        i_rainnc=crop_bucket_2d(raw.i_rainnc, trim),
     )
 
 
-def _groom_2d(slab: PubMass2D, keepbits: int) -> PubMass2D:
-    buf = array("f", (groom_mantissa_f32(v, keepbits) for v in slab.buf))
-    return PubMass2D(Slab2DF32(ny=slab.ny, nx=slab.nx, buf=buf))
-
-
 def _compute_cloud_slabs(
-    cld_all: PubMass3D,
-    p_out: array[float],
-    psfc: PubMass2D,
-    k_exp: int,
+    cld_all: PubMass3D, p_groomed: array[float], psfc: PubMass2D, k_exp: int
 ) -> tuple[array[float], array[float]]:
     plane = psfc.ny * psfc.nx
-    cld_tot, cld_low = array("f"), array("f")
-    for idx in range(plane):
-        c_full = [cld_all.buf[k * plane + idx] for k in range(cld_all.nz)]
-        c_low = [
-            cld_all.buf[k * plane + idx]
-            for k in range(k_exp)
-            if p_out[k * plane + idx] >= 0.8 * psfc.buf[idx]
-        ]
-        cld_tot.append(groom_mantissa_f32(max_random_cloud_pct(c_full), 15))
-        cld_low.append(groom_mantissa_f32(max_random_cloud_pct(c_low), 15))
-    return cld_tot, cld_low
+    c = np.clip(_as_f64(cld_all.buf, (cld_all.nz, plane)), 0.0, 1.0)
+    clear = 1.0 - c[0]
+    for k in range(1, c.shape[0]):
+        prev, curr = c[k - 1], c[k]
+        denom = np.where(prev < 0.999999, 1.0 - prev, 1.0)
+        ratio = np.clip((1.0 - np.maximum(prev, curr)) / denom, 0.0, 1.0)
+        clear = np.where(prev < 0.999999, clear * ratio, 0.0)
+    tot_pct = 100.0 * (1.0 - np.clip(clear, 0.0, 1.0))
+
+    p_2d, psfc_1d = _as_f64(p_groomed, (k_exp, plane)), _as_f64(psfc.buf, (plane,))
+    clear_low, prev_low = np.ones(plane, dtype=np.float64), np.zeros(plane, dtype=np.float64)
+    started = np.zeros(plane, dtype=bool)
+    for k in range(k_exp):
+        inc, ck = p_2d[k] >= 0.8 * psfc_1d, c[k]
+        denom = np.where(prev_low < 0.999999, 1.0 - prev_low, 1.0)
+        ratio = np.clip((1.0 - np.maximum(prev_low, ck)) / denom, 0.0, 1.0)
+        step_clear = np.where(prev_low < 0.999999, clear_low * ratio, 0.0)
+        clear_low = np.where(inc, np.where(started, step_clear, 1.0 - ck), clear_low)
+        prev_low, started = np.where(inc, ck, prev_low), started | inc
+    low_pct = 100.0 * (1.0 - np.clip(clear_low, 0.0, 1.0))
+    return groom_f32_buf(tot_pct, 15), groom_f32_buf(low_pct, 15)
 
 
 def _post_3d_slabs(
     raw: RawWrfStepInput,
     domain: DomainProfile,
     science: ScienceProfile,
-) -> tuple[dict[str, PubMass3D], array[float], array[float]]:
-    trim, k_exp = domain.bdy_trim_cells, domain.exported_levels_k
-    ca, sa = crop_sponge_2d(raw.cos_alpha, trim), crop_sponge_2d(raw.sin_alpha, trim)
-    psfc = crop_sponge_2d(raw.psfc_pa, trim)
-    p_pert = crop_sponge_3d(raw.p_pert_pa, trim, k_exp)
-    pb = crop_sponge_3d(raw.pb_pa, trim, k_exp)
-    ph = crop_sponge_3d(destagger_z_3d(raw.ph_stag_m2s2), trim, k_exp)
-    phb = crop_sponge_3d(destagger_z_3d(raw.phb_stag_m2s2), trim, k_exp)
-    th_p = crop_sponge_3d(raw.theta_pert_k, trim, k_exp)
-    qv = crop_sponge_3d(raw.qvapor_kgkg, trim, k_exp)
-    cld_all = crop_sponge_3d(raw.cldfra, trim, raw.cldfra.nz)
-    u_g = crop_sponge_3d(destagger_x_3d(raw.u_stag_mps), trim, k_exp)
-    v_g = crop_sponge_3d(destagger_y_3d(raw.v_stag_mps), trim, k_exp)
-    w_m = crop_sponge_3d(destagger_z_3d(raw.w_stag_mps), trim, k_exp)
+    shared_2d: tuple[PubMass2D, PubMass2D, PubMass2D, PubMass2D],
+) -> tuple[dict[str, PubMass3D], array[float], array[float], tuple[float, float, int, float]]:
+    terr, psfc, ca, sa = shared_2d
+    trim, k_exp, ny, nx = domain.bdy_trim_cells, domain.exported_levels_k, psfc.ny, psfc.nx
+    shp3 = (k_exp, ny, nx)
+    p_pa = _as_f64(crop_sponge_3d(raw.p_pert_pa, trim, k_exp).buf, shp3) + _as_f64(
+        crop_sponge_3d(raw.pb_pa, trim, k_exp).buf, shp3
+    )
+    if bool(np.any(p_pa <= 0.0)):
+        raise ValueError("Non-positive 3D pressure encountered in post_frame")
+    ph_m = _as_f64(crop_sponge_3d(destagger_z_3d(raw.ph_stag_m2s2), trim, k_exp).buf, shp3)
+    phb_m = _as_f64(crop_sponge_3d(destagger_z_3d(raw.phb_stag_m2s2), trim, k_exp).buf, shp3)
+    z_msl = (ph_m + phb_m) / G0_MPS2
+    th_p = _as_f64(crop_sponge_3d(raw.theta_pert_k, trim, k_exp).buf, shp3)
+    tk = (th_p + science.base_temp_k) * np.power(p_pa / P0_PA, KAPPA_DRY)
+    qv = np.maximum(0.0, _as_f64(crop_sponge_3d(raw.qvapor_kgkg, trim, k_exp).buf, shp3))
+    spfh = qv / (1.0 + qv)
+    w_m = _as_f64(crop_sponge_3d(destagger_z_3d(raw.w_stag_mps), trim, k_exp).buf, shp3)
+    omega = -(p_pa / (R_DRY_J_KG_K * tk * (1.0 + VIRTUAL_TEMP_COEFF * spfh))) * G0_MPS2 * w_m
+    u_g = _as_f64(crop_sponge_3d(destagger_x_3d(raw.u_stag_mps), trim, k_exp).buf, shp3)
+    v_g = _as_f64(crop_sponge_3d(destagger_y_3d(raw.v_stag_mps), trim, k_exp).buf, shp3)
+    ca_2d, sa_2d = _as_f64(ca.buf, (ny, nx)), _as_f64(sa.buf, (ny, nx))
+    u_e, v_e = u_g * ca_2d - v_g * sa_2d, u_g * sa_2d + v_g * ca_2d
 
-    ny, nx = psfc.ny, psfc.nx
-    plane = ny * nx
-    p_o, z_o, t_o, q_o = array("f"), array("f"), array("f"), array("f")
-    ue_o, ve_o, om_o = array("f"), array("f"), array("f")
-    for k in range(k_exp):
-        for idx in range(plane):
-            pos = k * plane + idx
-            p_pa = p_pert.buf[pos] + pb.buf[pos]
-            tk = float(potential_to_temp_k(
-                WrfPerturbPotTempK(th_p.buf[pos]), Pascals(p_pa), base_temp_k=science.base_temp_k
-            ))
-            sp = float(mixing_ratio_to_spfh(MixingRatioKgKg(qv.buf[pos])))
-            om = float(geometric_w_to_omega_pas(
-                VerticalVelocityMps(w_m.buf[pos]),
-                Pascals(p_pa),
-                TempK(tk),
-                SpecificHumidityKgKg(sp),
-            ))
-            ue, ve = rotate_grid_to_earth(
-                GridWindMps(u_g.buf[pos]), GridWindMps(v_g.buf[pos]), ca.buf[idx], sa.buf[idx]
-            )
-            p_o.append(groom_mantissa_f32(p_pa, 17))
-            z_o.append(groom_mantissa_f32((ph.buf[pos] + phb.buf[pos]) / G0_MPS2, 17))
-            t_o.append(groom_mantissa_f32(tk, 15))
-            q_o.append(groom_mantissa_f32(sp, 15))
-            ue_o.append(groom_mantissa_f32(float(ue), 15))
-            ve_o.append(groom_mantissa_f32(float(ve), 15))
-            om_o.append(groom_mantissa_f32(om, 15))
+    p_buf, z_buf = groom_f32_buf(p_pa, 17), groom_f32_buf(z_msl, 17)
+    agl = _as_f64(z_buf, shp3) - _as_f64(terr.buf, (ny, nx))
+    dz = np.empty_like(agl)
+    dz[0], dz[1:] = agl[0], agl[1:] - agl[:-1]
+    cfl = (
+        np.abs(u_e) / domain.dx_m + np.abs(v_e) / domain.dy_m + np.abs(w_m) / np.maximum(10.0, dz)
+    ) * float(science.time_step_s)
+    stats = (
+        float(np.min(dz)),
+        float(np.max(dz)),
+        int(np.min(np.sum(agl <= BL_CEILING_AGL_M, axis=0))),
+        round(float(np.max(cfl)), 5),
+    )
 
-    cld_tot, cld_low = _compute_cloud_slabs(cld_all, p_o, psfc, k_exp)
+    def wrap3(b: array[float]) -> PubMass3D:
+        return PubMass3D(Slab3DF32(nz=k_exp, ny=ny, nx=nx, buf=b))
+
     f3d = {
-        "pressure_pa": PubMass3D(Slab3DF32(nz=k_exp, ny=ny, nx=nx, buf=p_o)),
-        "height_msl_m": PubMass3D(Slab3DF32(nz=k_exp, ny=ny, nx=nx, buf=z_o)),
-        "temp_k": PubMass3D(Slab3DF32(nz=k_exp, ny=ny, nx=nx, buf=t_o)),
-        "spfh_kgkg": PubMass3D(Slab3DF32(nz=k_exp, ny=ny, nx=nx, buf=q_o)),
-        "u_earth_mps": PubMass3D(Slab3DF32(nz=k_exp, ny=ny, nx=nx, buf=ue_o)),
-        "v_earth_mps": PubMass3D(Slab3DF32(nz=k_exp, ny=ny, nx=nx, buf=ve_o)),
-        "omega_pas": PubMass3D(Slab3DF32(nz=k_exp, ny=ny, nx=nx, buf=om_o)),
+        "pressure_pa": wrap3(p_buf),
+        "height_msl_m": wrap3(z_buf),
+        "temp_k": wrap3(groom_f32_buf(tk, 15)),
+        "spfh_kgkg": wrap3(groom_f32_buf(spfh, 15)),
+        "u_earth_mps": wrap3(groom_f32_buf(u_e, 15)),
+        "v_earth_mps": wrap3(groom_f32_buf(v_e, 15)),
+        "omega_pas": wrap3(groom_f32_buf(omega, 15)),
     }
-    return f3d, cld_tot, cld_low
+    cld_tot, cld_low = _compute_cloud_slabs(
+        crop_sponge_3d(raw.cldfra, trim, raw.cldfra.nz), p_buf, psfc, k_exp
+    )
+    return f3d, cld_tot, cld_low, stats
 
 
-def _accum_cell_rates(
-    idx: int,
-    prev: AccumBaseline,
-    curr: AccumBaseline,
-    science: ScienceProfile,
-    dt_s: float,
-) -> tuple[float, float, float]:
-    sh = window_rate_from_accum(
-        prev.achfx_j_m2.buf[idx], prev.i_achfx[idx],
-        curr.achfx_j_m2.buf[idx], curr.i_achfx[idx],
-        science.bucket_j, dt_s, allow_negative=True,
+def _surface_accum_rates(
+    prev: AccumBaseline, curr: AccumBaseline, sc: ScienceProfile, dt_s: float
+) -> tuple[_ArrF64, _ArrF64, _ArrF64]:
+    def rate(
+        pv: PubMass2D, pi: PubBucket2D, cv: PubMass2D, ci: PubBucket2D, s: float, neg: bool
+    ) -> _ArrF64:
+        shp = (pv.ny, pv.nx)
+        p_i = np.frombuffer(pi.buf, dtype=np.int32).reshape(shp).astype(np.float64)
+        c_i = np.frombuffer(ci.buf, dtype=np.int32).reshape(shp).astype(np.float64)
+        d = (_as_f64(cv.buf, shp) + c_i * s) - (_as_f64(pv.buf, shp) + p_i * s)
+        if not neg and bool(np.any(d < -1e-6)):
+            raise ValueError(f"Negative cumulative delta ({float(np.min(d))}) across window")
+        return (d / dt_s) if neg else (np.maximum(0.0, d) * (3600.0 / dt_s))
+
+    sh = rate(prev.achfx_j_m2, prev.i_achfx, curr.achfx_j_m2, curr.i_achfx, sc.bucket_j, True)
+    lh = rate(prev.aclhf_j_m2, prev.i_aclhf, curr.aclhf_j_m2, curr.i_aclhf, sc.bucket_j, True)
+    rc = rate(prev.rainc_mm, prev.i_rainc, curr.rainc_mm, curr.i_rainc, sc.bucket_mm, False)
+    rn = rate(prev.rainnc_mm, prev.i_rainnc, curr.rainnc_mm, curr.i_rainnc, sc.bucket_mm, False)
+    return sh, lh, rc + rn
+
+
+def _derive_mslp_and_gust(
+    sfc: tuple[_ArrF64, _ArrF64, _ArrF64, _ArrF64],
+    wind: tuple[_ArrF64, _ArrF64, _ArrF64, _ArrF64],
+    flux_pbl: tuple[_ArrF64, _ArrF64, _ArrF64],
+) -> tuple[_ArrF64, _ArrF64]:
+    psfc, hgt, t2, sp2 = sfc
+    ue, ve, wmax, ust = wind
+    sh, lh, pblh = flux_pbl
+    z_m = np.maximum(0.0, hgt)
+    tv_sfc = t2 * (1.0 + VIRTUAL_TEMP_COEFF * np.maximum(0.0, sp2))
+    tv_0 = np.where(tv_sfc < 255.0, 0.5 * (255.0 + tv_sfc), tv_sfc)
+    tv_sl = tv_0 + STD_LAPSE_K_PER_M * z_m
+    warm_cap, hot_plat = 290.5 - 0.005 * np.square(tv_0 - 290.5), 0.5 * (290.5 + tv_0)
+    tv_sl_out = np.where(
+        (tv_0 <= 290.5) & (tv_sl > 290.5),
+        warm_cap,
+        np.where((tv_0 > 290.5) & (tv_sl > 290.5), hot_plat, tv_sl),
     )
-    lh = window_rate_from_accum(
-        prev.aclhf_j_m2.buf[idx], prev.i_aclhf[idx],
-        curr.aclhf_j_m2.buf[idx], curr.i_aclhf[idx],
-        science.bucket_j, dt_s, allow_negative=True,
+    tv_0_out = np.where((tv_0 > 290.5) & (tv_sl > 290.5), hot_plat, tv_0)
+    tv_m = np.maximum(180.0, 0.5 * (tv_0_out + tv_sl_out))
+    mslp = psfc * np.exp((G0_MPS2 * z_m) / (R_DRY_J_KG_K * tv_m))
+
+    q2, tk = np.maximum(0.0, sp2), np.maximum(200.0, t2)
+    tv0 = tk * (1.0 + VIRTUAL_TEMP_COEFF * q2)
+    rho = np.maximum(10_000.0, psfc) / (R_DRY_J_KG_K * tv0)
+    vflux = (1.0 + VIRTUAL_TEMP_COEFF * q2) * (sh / (rho * CP_DRY_J_KG_K)) + (
+        VIRTUAL_TEMP_COEFF * tk * (lh / (rho * LV_VAPOR_J_KG))
     )
-    rc = window_rate_from_accum(
-        prev.rainc_mm.buf[idx], prev.i_rainc[idx],
-        curr.rainc_mm.buf[idx], curr.i_rainc[idx],
-        science.bucket_mm, dt_s, per_hour=True,
+    wstar3 = (G0_MPS2 * np.maximum(0.0, pblh) / tv0) * np.maximum(0.0, vflux)
+    eddy = IFS_GUST_COEFF * np.cbrt(
+        np.power(np.maximum(0.0, ust), 3.0) + (0.5 * VON_KARMAN / 12.0) * wstar3
     )
-    rnc = window_rate_from_accum(
-        prev.rainnc_mm.buf[idx], prev.i_rainnc[idx],
-        curr.rainnc_mm.buf[idx], curr.i_rainnc[idx],
-        science.bucket_mm, dt_s, per_hour=True,
-    )
-    return sh, lh, rc + rnc
+    return mslp, np.maximum(wmax, np.hypot(ue, ve) + eddy)
 
 
 def _post_surface_slabs(
     prev: AccumBaseline,
-    curr_base: AccumBaseline,
+    curr: AccumBaseline,
     raw: RawWrfStepInput,
     trim: int,
-    science: ScienceProfile,
+    sc: ScienceProfile,
     dt_s: float,
+    shared_2d: tuple[PubMass2D, PubMass2D, PubMass2D, PubMass2D],
     cld_tot: array[float],
     cld_low: array[float],
 ) -> dict[str, PubMass2D]:
-    hgt = _groom_2d(crop_sponge_2d(raw.terrain_m, trim), 17)
-    psfc = _groom_2d(crop_sponge_2d(raw.psfc_pa, trim), 17)
-    t2 = _groom_2d(crop_sponge_2d(raw.t2_k, trim), 15)
-    ca, sa = crop_sponge_2d(raw.cos_alpha, trim), crop_sponge_2d(raw.sin_alpha, trim)
-    q2 = crop_sponge_2d(raw.q2_kgkg, trim)
-    u10g, v10g = crop_sponge_2d(raw.u10_grid_mps, trim), crop_sponge_2d(raw.v10_grid_mps, trim)
-    wmax, ust = crop_sponge_2d(raw.wspd10max_mps, trim), crop_sponge_2d(raw.ustar_mps, trim)
-    pblh, cape = crop_sponge_2d(raw.pblh_m, trim), crop_sponge_2d(raw.afwa_cape_jkg, trim)
+    hgt, psfc, ca, sa = shared_2d
     ny, nx = hgt.ny, hgt.nx
+    shp2 = (ny, nx)
+    t2_s = _groom_2d(crop_sponge_2d(raw.t2_k, trim), 15)
+    t2, psfc_f, hgt_f = _as_f64(t2_s.buf, shp2), _as_f64(psfc.buf, shp2), _as_f64(hgt.buf, shp2)
+    q2_raw = np.maximum(0.0, _crop2_f64(raw.q2_kgkg, trim))
+    sp2_raw = q2_raw / (1.0 + q2_raw)
+    es_pa = 611.2 * np.exp((17.67 * (t2 - CONSUMER_KELVIN_OFFSET)) / np.maximum(1.0, t2 - 29.65))
+    safe_p = psfc_f > es_pa * 1.01
+    r_sat = np.where(safe_p, CONSUMER_EPSILON * es_pa / np.maximum(1.0, psfc_f - es_pa), sp2_raw)
+    sp2 = np.where(safe_p, np.minimum(sp2_raw, (r_sat / (1.0 + r_sat)) * (1.0 - 2.0**-14)), sp2_raw)
 
-    q2_s, shf, lhf, prcp = array("f"), array("f"), array("f"), array("f")
-    mslp, u10e, v10e, gust = array("f"), array("f"), array("f"), array("f")
-    for idx in range(ny * nx):
-        raw_sp2 = float(mixing_ratio_to_spfh(MixingRatioKgKg(q2.buf[idx])))
-        sp2 = clamp_spfh_2m_to_liquid_sat(raw_sp2, t2.buf[idx], psfc.buf[idx])
-        sh, lh, pr = _accum_cell_rates(idx, prev, curr_base, science, dt_s)
-        ue, ve = rotate_grid_to_earth(
-            GridWindMps(u10g.buf[idx]), GridWindMps(v10g.buf[idx]), ca.buf[idx], sa.buf[idx]
-        )
-        q2_s.append(groom_mantissa_f32(sp2, 15))
-        shf.append(groom_mantissa_f32(sh, 15))
-        lhf.append(groom_mantissa_f32(lh, 15))
-        prcp.append(groom_mantissa_f32(pr, 15))
-        mslp.append(groom_mantissa_f32(
-            hypsometric_mslp_pa(psfc.buf[idx], hgt.buf[idx], t2.buf[idx], sp2), 17
-        ))
-        u10e.append(groom_mantissa_f32(float(ue), 15))
-        v10e.append(groom_mantissa_f32(float(ve), 15))
-        gust.append(groom_mantissa_f32(parameterized_gust_10m_mps(
-            float(ue), float(ve), wmax.buf[idx], ust.buf[idx],
-            sh, lh, pblh.buf[idx], t2.buf[idx], sp2, psfc.buf[idx],
-        ), 15))
+    sh, lh, pr = _surface_accum_rates(prev, curr, sc, dt_s)
+    u10g, v10g = _crop2_f64(raw.u10_grid_mps, trim), _crop2_f64(raw.v10_grid_mps, trim)
+    ca_f, sa_f = _as_f64(ca.buf, shp2), _as_f64(sa.buf, shp2)
+    ue, ve = u10g * ca_f - v10g * sa_f, u10g * sa_f + v10g * ca_f
+    pblh_s = crop_sponge_2d(raw.pblh_m, trim)
+    mslp, gust = _derive_mslp_and_gust(
+        (psfc_f, hgt_f, t2, sp2),
+        (ue, ve, _crop2_f64(raw.wspd10max_mps, trim), _crop2_f64(raw.ustar_mps, trim)),
+        (sh, lh, _as_f64(pblh_s.buf, shp2)),
+    )
 
-    def wrap(buf: array[float]) -> PubMass2D:
-        return PubMass2D(Slab2DF32(ny=ny, nx=nx, buf=buf))
+    def wrap2(b: array[float]) -> PubMass2D:
+        return PubMass2D(Slab2DF32(ny=ny, nx=nx, buf=b))
 
     return {
-        "terrain_m": hgt, "surface_pressure_pa": psfc,
-        "temp_2m_k": t2, "spfh_2m_kgkg": wrap(q2_s),
-        "sensible_heat_flux_wm2": wrap(shf), "latent_heat_flux_wm2": wrap(lhf),
-        "precip_mm_hr": wrap(prcp), "mslp_pa": wrap(mslp),
-        "u_10m_earth_mps": wrap(u10e), "v_10m_earth_mps": wrap(v10e),
-        "gust_10m_mps": wrap(gust), "pbl_height_m": _groom_2d(pblh, 15),
-        "cape_jkg": _groom_2d(cape, 15),
-        "cloud_total_pct": wrap(cld_tot), "cloud_low_pct": wrap(cld_low),
+        "terrain_m": hgt,
+        "surface_pressure_pa": psfc,
+        "temp_2m_k": t2_s,
+        "spfh_2m_kgkg": wrap2(groom_f32_buf(sp2, 15)),
+        "sensible_heat_flux_wm2": wrap2(groom_f32_buf(sh, 15)),
+        "latent_heat_flux_wm2": wrap2(groom_f32_buf(lh, 15)),
+        "precip_mm_hr": wrap2(groom_f32_buf(pr, 15)),
+        "mslp_pa": wrap2(groom_f32_buf(mslp, 17)),
+        "u_10m_earth_mps": wrap2(groom_f32_buf(ue, 15)),
+        "v_10m_earth_mps": wrap2(groom_f32_buf(ve, 15)),
+        "gust_10m_mps": wrap2(groom_f32_buf(gust, 15)),
+        "pbl_height_m": _groom_2d(pblh_s, 15),
+        "cape_jkg": _groom_2d(crop_sponge_2d(raw.afwa_cape_jkg, trim), 15),
+        "cloud_total_pct": wrap2(cld_tot),
+        "cloud_low_pct": wrap2(cld_low),
     }
 
 
 def post_frame(
-    prev: AccumBaseline,
-    raw: RawWrfStepInput,
-    domain: DomainProfile,
-    science: ScienceProfile,
+    prev: AccumBaseline, raw: RawWrfStepInput, domain: DomainProfile, science: ScienceProfile
 ) -> tuple[NormalizedWrfFrame, AccumBaseline]:
     """Transform one raw WRF step + predecessor baseline into all 22 Published-Grid arrays."""
     dt_s = float(raw.valid_time_unix_s - prev.valid_time_unix_s)
     if dt_s <= 0.0:
         raise ValueError("raw.valid_time_unix_s must strictly exceed prev.valid_time_unix_s")
-    fields_3d, cld_tot, cld_low = _post_3d_slabs(raw, domain, science)
-    next_base = build_accum_baseline(raw, domain.bdy_trim_cells)
+    nj, ni = published_grid_shape(domain)
+    trim = domain.bdy_trim_cells
+    shared_2d = (
+        _groom_2d(crop_sponge_2d(raw.terrain_m, trim), 17),
+        _groom_2d(crop_sponge_2d(raw.psfc_pa, trim), 17),
+        crop_sponge_2d(raw.cos_alpha, trim),
+        crop_sponge_2d(raw.sin_alpha, trim),
+    )
+    if (shared_2d[0].ny, shared_2d[0].nx) != (nj, ni):
+        raise ValueError("Cropped Published Grid shape mismatch")
+    fields_3d, cld_tot, cld_low, (min_dz, max_dz, min_bl, max_cfl) = _post_3d_slabs(
+        raw, domain, science, shared_2d
+    )
+    next_base = build_accum_baseline(raw, trim)
     fields_2d = _post_surface_slabs(
-        prev, next_base, raw, domain.bdy_trim_cells, science, dt_s, cld_tot, cld_low
+        prev, next_base, raw, trim, science, dt_s, shared_2d, cld_tot, cld_low
     )
-    frame = NormalizedWrfFrame(
-        valid_time_utc=raw.valid_time_utc,
-        window_start_unix_s=prev.valid_time_unix_s,
-        window_end_unix_s=raw.valid_time_unix_s,
-        fields_2d=fields_2d,
-        fields_3d=fields_3d,
+    return (
+        NormalizedWrfFrame(
+            valid_time_utc=raw.valid_time_utc,
+            window_start_unix_s=prev.valid_time_unix_s,
+            window_end_unix_s=raw.valid_time_unix_s,
+            fields_2d=fields_2d,
+            fields_3d=fields_3d,
+            min_dz_m=min_dz,
+            max_dz_m=max_dz,
+            min_bl_levels_2km=min_bl,
+            max_cfl=max_cfl,
+        ),
+        next_base,
     )
-    return frame, next_base
+
+
+__all__ = ["NormalizedWrfFrame", "RawWrfStepInput", "build_accum_baseline", "post_frame"]

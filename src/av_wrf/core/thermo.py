@@ -1,4 +1,4 @@
-"""Pure scalar and column meteorological formulas, wind rotation, and bit-grooming.
+"""Pure scalar and vectorized meteorological formulas, THM consistency, and bit-grooming.
 
 Assumptions & Producer-Consumer Constant Split:
 1. Exact WRF inversion constants (`WRF/share/module_model_constants.F`): `r_d = 287.0`,
@@ -32,14 +32,20 @@ from __future__ import annotations
 
 import math
 import struct
+from array import array
 from collections.abc import Sequence
 
+import numpy as np
+import numpy.typing as npt
+
 from av_wrf.contracts import (
+    CompMass3D,
     EarthWindMps,
     GridWindMps,
     MixingRatioKgKg,
     OmegaPaS,
     Pascals,
+    ScienceProfile,
     SpecificHumidityKgKg,
     TempK,
     VerticalVelocityMps,
@@ -91,6 +97,39 @@ def moist_thm_to_temp_k(
     )
 
 
+def verify_t_thm_consistency(
+    t_dry: CompMass3D,
+    thm: CompMass3D,
+    p_pert: CompMass3D,
+    pb: CompMass3D,
+    qv: CompMass3D,
+    science: ScienceProfile,
+) -> None:
+    """Verify wrfout dry `T` and moist `THM` invert to identical sensible T across all cells."""
+    td_v = np.frombuffer(t_dry.buf, dtype=np.float32).astype(np.float64)
+    thm_v = np.frombuffer(thm.buf, dtype=np.float32).astype(np.float64)
+    p_pa = np.frombuffer(p_pert.buf, dtype=np.float32).astype(np.float64) + np.frombuffer(
+        pb.buf, dtype=np.float32
+    ).astype(np.float64)
+    if bool(np.any(p_pa <= 0.0)):
+        raise ValueError("Non-positive pressure in wrfout T/THM consistency check")
+    exner = np.power(p_pa / P0_PA, KAPPA_DRY)
+    tk_dry = (td_v + science.base_temp_k) * exner
+    if science.use_theta_m == 1:
+        qv_pos = np.maximum(0.0, np.frombuffer(qv.buf, dtype=np.float32).astype(np.float64))
+        theta_m_dry = (thm_v + science.base_temp_k) / (1.0 + MOIST_THETA_COEFF * qv_pos)
+    else:
+        theta_m_dry = thm_v + science.base_temp_k
+    tk_moist = theta_m_dry * exner
+    diff = np.abs(tk_dry - tk_moist)
+    worst = int(np.argmax(diff))
+    if float(diff[worst]) > 0.05:
+        raise ValueError(
+            f"wrfout T vs THM mismatch ({tk_dry[worst]:.3f} vs {tk_moist[worst]:.3f} K) "
+            f"at index {worst}"
+        )
+
+
 def mixing_ratio_to_spfh(qvapor_kgkg: MixingRatioKgKg) -> SpecificHumidityKgKg:
     """Convert water vapor mixing ratio r >= 0 to specific humidity q = r / (1 + r)."""
     r = max(0.0, float(qvapor_kgkg))
@@ -102,18 +141,13 @@ def clamp_spfh_2m_to_liquid_sat(
     t2_k: float,
     psfc_pa: float,
 ) -> float:
-    """Cap diagnostic 2 m specific humidity at consumer Bolton (1980) liquid saturation.
-
-    Prevents WRF surface-layer `Q2 > 1.05 * q_sat(T2)` in freezing/radiative fog from tripping
-    the consumer saturation guard (`windy-av-layer/packages/soaring/src/column.ts`).
-    """
+    """Cap diagnostic 2 m specific humidity at consumer Bolton (1980) liquid saturation."""
     q = max(0.0, spfh_2m_kgkg)
     tc = t2_k - CONSUMER_KELVIN_OFFSET
     es_pa = 611.2 * math.exp((17.67 * tc) / max(1.0, tc + 243.5))
     if psfc_pa <= es_pa * 1.01:
         return q
     r_sat = CONSUMER_EPSILON * es_pa / (psfc_pa - es_pa)
-    # Leave 1 float32 keepbits=15 quantum (2^-15) headroom so mantissa rounding stays <= q_sat.
     q_sat_safe = (r_sat / (1.0 + r_sat)) * (1.0 - 2.0**-14)
     return min(q, q_sat_safe)
 
@@ -159,12 +193,7 @@ def parameterized_gust_10m_mps(
     spfh_2m: float = 0.0,
     psfc_pa: float = P0_PA,
 ) -> float:
-    """Combine resolved WSPD10MAX with Panofsky (1977) / ECMWF IFS surface-density gusts.
-
-    Uses actual surface moist density `rho_sfc = psfc / (Rd * Tv0)` and Deardorff (1970)
-    virtual buoyancy flux (`H` + `LE`, matching consumer `column.ts` and Dr. Jack RASP `vhf`).
-    Exner `(p0/psfc)^kappa` cancels identically between `w'theta_v'` and `theta_v0`.
-    """
+    """Combine resolved WSPD10MAX with Panofsky (1977) / ECMWF IFS surface-density gusts."""
     mean_10m = math.hypot(u10_mps, v10_mps)
     q2 = max(0.0, spfh_2m)
     tk = max(200.0, t2_k)
@@ -175,9 +204,9 @@ def parameterized_gust_10m_mps(
     ) + VIRTUAL_TEMP_COEFF * tk * (latent_flux_wm2 / (rho_sfc * LV_VAPOR_J_KG))
     wstar_cubed = (G0_MPS2 * max(0.0, pblh_m) / tv0) * max(0.0, virt_temp_flux)
     ustar_cubed = max(0.0, ustar_mps) ** 3
-    turb_eddy = IFS_GUST_COEFF * ((ustar_cubed + (0.5 * VON_KARMAN / 12.0) * wstar_cubed) ** (
-        1.0 / 3.0
-    ))
+    turb_eddy = IFS_GUST_COEFF * math.pow(
+        ustar_cubed + (0.5 * VON_KARMAN / 12.0) * wstar_cubed, 1.0 / 3.0
+    )
     return max(wspd10max_mps, mean_10m + turb_eddy)
 
 
@@ -265,3 +294,23 @@ def groom_mantissa_f32(value: float, keepbits: int) -> float:
     rounded = (bits + half - 1 + lsb) & ~((1 << drop) - 1)
     (groomed,) = struct.unpack("<f", struct.pack("<I", rounded))
     return float(groomed)
+
+
+def groom_f32_buf(values: npt.NDArray[np.float64], keepbits: int) -> array[float]:
+    """Batch round-to-nearest-even IEEE-754 float32 bit-grooming matching `groom_mantissa_f32`."""
+    if not (1 <= keepbits <= 23):
+        raise ValueError("keepbits must be in 1..23 for float32")
+    f32 = np.ascontiguousarray(values, dtype=np.float32).ravel()
+    drop = 23 - keepbits
+    if drop > 0:
+        bits = f32.view(np.uint32).copy()
+        exp = (bits >> np.uint32(23)) & np.uint32(0xFF)
+        active = (exp != np.uint32(0xFF)) & ((bits & np.uint32(0x7FFFFFFF)) != np.uint32(0))
+        half = np.uint32(1 << (drop - 1))
+        lsb = (bits >> np.uint32(drop)) & np.uint32(1)
+        mask = np.uint32(0xFFFFFFFF ^ ((1 << drop) - 1))
+        rounded = (bits + half - np.uint32(1) + lsb) & mask
+        f32 = np.where(active, rounded, bits).astype(np.uint32, copy=False).view(np.float32)
+    out = array("f")
+    out.frombytes(np.ascontiguousarray(f32, dtype=np.float32).tobytes())
+    return out

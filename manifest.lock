@@ -2,7 +2,7 @@
   "files": {
     "docker/patches/README.md": "dad62726c3ee3793bbc7504b2773660ad461aec94032bad8d35bd9c4e5c1afe1",
     "tests/oracle/__init__.py": "203d5b5e998c0d173545b648682fb05d2f3d60712ca22cf0f5b3f98570356062",
-    "tests/oracle/reference_cases.py": "7f56ee0aa6c3e9e6c8949988720c051d97f23447898c98f3bef218e88dd08b51",
+    "tests/oracle/reference_cases.py": "d278bfb3b1bc8bcec0323b39ee0248d6ceea51bddf567dca2f301f1e57e3f6bf",
     "vendor/producer-contract/README.md": "939e08a8070987bd29ee3764998b0e877adcd9a1368cfa3c754ac1ef1e4f24c6",
     "vendor/producer-contract/wrf-zarr-v3.schema.json": "533e584c30524c90ab5c2c8cc6becf81ad308dd1ca042e44cc6983d97e507afd"
   },

@@ -1,33 +1,64 @@
-exclude = ["build", "dist", ".venv", "vendor", "output", "runs", "work", "scratch"]
-source_roots = ["src"]
+exclude = [
+    ".venv",
+    "build",
+    "dist",
+    "output",
+    "runs",
+    "scratch",
+    "vendor",
+    "work",
+]
+source_roots = [
+    "src",
+]
 exact = true
+
+[[modules]]
+path = "av_wrf.cli"
+depends_on = [
+    "av_wrf.runner",
+]
+
+[[modules]]
+path = "av_wrf.codecs"
+depends_on = [
+    "av_wrf.contracts",
+    "av_wrf.core",
+]
 
 [[modules]]
 path = "av_wrf.contracts"
 depends_on = []
-strict = true
 
 [[modules]]
 path = "av_wrf.core"
-depends_on = ["av_wrf.contracts"]
-strict = true
-
-[[modules]]
-path = "av_wrf.codecs"
-depends_on = ["av_wrf.contracts", "av_wrf.core"]
-strict = true
+depends_on = [
+    "av_wrf.contracts",
+]
 
 [[modules]]
 path = "av_wrf.runner"
-depends_on = ["av_wrf.contracts", "av_wrf.core", "av_wrf.codecs"]
-strict = true
+depends_on = [
+    "av_wrf.codecs",
+    "av_wrf.contracts",
+    "av_wrf.core",
+]
 
 [[modules]]
 path = "av_wrf.verify"
-depends_on = ["av_wrf.contracts", "av_wrf.core", "av_wrf.codecs"]
-strict = true
+depends_on = [
+    "av_wrf.core",
+]
 
-[[modules]]
-path = "av_wrf.cli"
-depends_on = ["av_wrf.contracts", "av_wrf.runner", "av_wrf.verify"]
-strict = true
+[[interfaces]]
+expose = [
+    "[A-Za-z][A-Za-z0-9_]*",
+]
+from = [
+    "av_wrf.contracts",
+    "av_wrf.core",
+    "av_wrf.codecs",
+    "av_wrf.runner",
+    "av_wrf.verify",
+    "av_wrf.cli",
+]

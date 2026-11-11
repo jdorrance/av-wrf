@@ -18,14 +18,15 @@ move fewer bytes, allocate fewer arrays, and burn fewer core-hours.
     sync via `scripts/sync_contract.py --from-consumer`).
   - [zarr_schema.py](src/av_wrf/contracts/zarr_schema.py) mirrors the 22-array
     template in Python.
-  - [config/](config/README.md) owns declarative product, domain, source,
-    science, and output profiles.
+  - [config/](config/README.md) is the sole owner of region, product, domain,
+    source, science, and output profiles; never hardcode region or product IDs
+    in `src/`, `scripts/`, `tests/`, `docker/`, or Markdown docs.
   - `scripts/generate_reference.py` generates [docs/reference.md](docs/reference.md).
 - Respect the strict producer boundary. `av-wrf` produces native model-level
-  `forecast.zarr`, `_ready.json`, and `_diagnostics.json` (`wrf-armenia-3km` is
-  the active Phase 1 scope; extensions follow [plan.md](docs/plan.md)). Soaring
-  parcel physics, subgrid DEM columns, `samples.bin`, `profiles.bin`, and
-  `.pmtiles` belong exclusively to `windy-av-layer`.
+  `forecast.zarr`, `_ready.json`, and `_diagnostics.json` (extensions follow
+  [plan.md](docs/plan.md)). Soaring parcel physics, subgrid DEM columns,
+  `samples.bin`, `profiles.bin`, and `.pmtiles` belong exclusively to
+  `windy-av-layer`.
 - Obey the 5-layer one-way import DAG (`L0 contracts <- L1 core <- L2 codecs <-
   {L3a runner | L3b verify} <- L4 cli`):
   - `contracts` and `core` are pure deterministic functions: zero file I/O,

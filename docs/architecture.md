@@ -1,19 +1,21 @@
 # Architecture
 
-`av-wrf` resolves a declarative regional product into an immutable `RunLock`,
-runs `WPS` and `WRF-ARW` inside a pinned Linux container, streams hourly native
-model-level shards into a **Zarr v3** store (`forecast.zarr`), writes
-`_ready.json` and `_diagnostics.json`, advances `latest.json` via compare-and-swap,
-and dispatches a build trigger to `windy-av-layer`.
+`av-wrf` resolves a declarative product in `config/` into an immutable
+`RunLock`, writes Fortran namelists plus a regional forcing cutout recipe during
+`prep`, runs `WPS` and `WRF-ARW` inside a pinned Linux container, stages
+`Times`-indexed native model-level shards under an attempt prefix, verifies the
+complete `RunLock` horizon before promoting `forecast.zarr`, `_diagnostics.json`,
+and `_ready.json`, advances `latest.json` via compare-and-swap, and dispatches a
+consumer webhook.
 
 ```mermaid
 flowchart LR
   cfg["config/ YAML"] --> plan["plan -> run.lock.json"]
-  plan --> geog["geog -> geo_em.d01.nc"]
-  geog --> prep["prep -> wrfinput / wrfbdy"]
-  prep --> solve["solve -> wrfout + _checkpoint.json"]
-  solve --> post["post_frame -> forecast.zarr shards"]
-  post --> pub["publish -> _ready.json + latest.json CAS"]
+  plan --> prep["prep -> namelists + forcing_subset.json"]
+  prep --> geog["geog -> geo_em.d01.nc"]
+  geog --> solve["solve -> met_em + wrfinput + wrfout"]
+  solve --> post["post -> attempt staged/forecast.zarr"]
+  post --> pub["publish -> verify horizon + _ready.json + CAS"]
   pub --> av["windy-av-layer ModelLevelFrame"]
 ```
 
@@ -24,12 +26,12 @@ Imports flow strictly top-down (`L4 -> L3 -> L2 -> L1 -> L0`), enforced by
 
 ```mermaid
 flowchart TB
-  cli["L4: av_wrf.cli<br/>CLI flags & sole os.environ reader"] --> runner["L3a: av_wrf.runner<br/>stores, mirrors, mpirun, dispatch"]
+  cli["L4: av_wrf.cli<br/>CLI flags & sole os.environ reader"] --> runner["L3a: av_wrf.runner<br/>stores, stages, post, publish, solver, dispatch"]
   cli --> verify["L3b: av_wrf.verify<br/>archiver, obs, scorecards"]
-  runner --> codecs["L2: av_wrf.codecs<br/>local NetCDF4 & Zarr v3 shards"]
+  runner --> codecs["L2: av_wrf.codecs<br/>wrf_nc, zarr_shard, zarr_v3"]
   verify --> codecs
-  codecs --> core["L1: av_wrf.core<br/>grid, schedule, vertical, namelist, forcing, post, metrics"]
-  core --> contracts["L0: av_wrf.contracts<br/>frozen schemas, RunLock, NewTypes"]
+  codecs --> core["L1: av_wrf.core<br/>grid, thermo, schedule, vertical, namelist, forcing, post, metrics"]
+  core --> contracts["L0: av_wrf.contracts<br/>frozen schemas, RunLock, slabs, NewTypes"]
 ```
 
 ## Codemap
@@ -37,31 +39,35 @@ flowchart TB
 - [`src/av_wrf/contracts/`](../src/av_wrf/contracts/README.md): `ProductSpec`,
   `DomainProfile`, `ScienceProfile`, `ForcingProfile`, `OutputProfile`,
   `CycleWindow`, `RunLock`, `ReadyReceipt`, `DiagnosticsReceipt`,
-  `WRF_ZARR_V3_FIELDS`, and nominal unit/stagger types (`TempK`, `EarthWindMps`,
-  `OmegaPaS`, `CompMass3D`, `PubMass3D`).
-- [`src/av_wrf/core/`](../src/av_wrf/core/README.md): seven peer-isolated modules
-  (`grid.py`, `schedule.py`, `vertical.py`, `namelist.py`, `forcing.py`,
-  `post.py`, `metrics.py`). Peers may depend on `contracts` and `core.grid` only.
-- [`src/av_wrf/codecs/`](../src/av_wrf/codecs/README.md): `wrf_nc.py` reads typed
-  `RawWrfFrame` buffers from `wrfout`; `zarr_v3.py` emits root `zarr.json`
-  (`LambertConformalGrid` `x0M`/`y0M`) and `sharding_indexed` shard paths.
+  `WRF_ZARR_V3_FIELDS`, `Slab2DF32`/`Slab2DI32`/`Slab3DF32`, and nominal types.
+- [`src/av_wrf/core/`](../src/av_wrf/core/README.md): pure deterministic modules
+  (`grid.py`, `thermo.py`, `schedule.py`, `vertical.py`, `namelist.py`,
+  `forcing.py`, `post.py`, `metrics.py`). Peers depend only on `contracts`,
+  `core.grid`, and `core.thermo`.
+- [`src/av_wrf/codecs/`](../src/av_wrf/codecs/README.md): `wrf_nc.py` indexes
+  `wrfout` by `Times` and validates shapes plus `T`/`THM` agreement;
+  `zarr_shard.py` encodes multi-step ZEP-0002 `zstd`+`crc32c` shards;
+  `zarr_v3.py` builds 30-node `wrf-zarr-v3` metadata.
 - [`src/av_wrf/runner/`](../src/av_wrf/runner/README.md): `store.py`
-  (`ObjectStore`, `LocalFileStore`, `open_store`), `mirrors.py` (fail-closed
-  forcing bundles), `solver.py` (container digest & `_checkpoint.json`),
-  `stages.py` (`check_product_config`, `plan_product_cycle`), and `dispatch.py`.
+  (`ObjectStore`, `LocalFileStore`, `put_idempotent`), `stages.py` (`check`,
+  `plan`, `prep`), `post.py` (attempt staging & weighted diagnostics),
+  `publish.py` (full-horizon admission & CAS promotion), `solver.py`,
+  `mirrors.py`, and `dispatch.py` (fail-closed webhook).
 - [`src/av_wrf/verify/`](../src/av_wrf/verify/README.md): `archiver.py`,
   `observations.py`, and `scorecard.py` for mature-lead evaluation.
 - [`src/av_wrf/cli/`](../src/av_wrf/cli/README.md): `env.py` (`RuntimeEnv`) and
-  `main.py` (`av-wrf check`, `av-wrf plan`, and Phase 2 solver subcommands).
+  `main.py` (`av-wrf` subcommands).
 
 ## Boundary invariants and deliberate absences
 
+- **Region-free code & Dockerfile.** Regions, coordinates, terrain checkpoints,
+  and product IDs exist exclusively in `config/`, enforced by `check_repo.py`.
 - **Zero consumer science in `av-wrf`.** Parcel thermodynamics, subgrid DEM
   refinement, `samples.bin`, `profiles.bin`, and `.pmtiles` never appear in
   `src/av_wrf/`.
 - **Hermetic `contracts` and `core`.** Both layers forbid file I/O, network
   clients, subprocesses, `netCDF4`, `zarr`, `os`, `sys`, `importlib`, `random`,
-  and wall-clock calls (`datetime.now`, `time.time`).
+  and wall-clock calls.
 - **Single environment reader.** Only `src/av_wrf/cli/env.py` reads `os.environ`.
 - **Mutual isolation at `L3`.** `runner` never imports `verify`; `verify` never
   executes WRF, writes `latest.json`, or dispatches webhooks.
@@ -80,8 +86,5 @@ flowchart TB
 - [WRF Namelist Variables (`auto_levels_opt = 2`)](https://www2.mmm.ucar.edu/wrf/users/wrf_users_guide/build/html/namelist_variables.html) &
   [WRF Users' Guide Ch. 5](https://www2.mmm.ucar.edu/wrf/users/docs/user_guide_v4/v4.4/users_guide_chap5.html)
 - [WRF `SINALPHA`/`COSALPHA` Earth Wind Rotation](https://github.com/NCAR/wrf-python/issues/142)
-- [ECMWF IFS Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data),
-  [NOAA GFS Open Data](https://registry.opendata.aws/noaa-gfs-bdp-pds/), &
-  [Copernicus DEM `DGED 2023_1`](https://dataspace.copernicus.eu/explore-data/data-collections/copernicus-contributing-missions/collections-description/COP-DEM)
 - [Zarr v3 Sharding & Codecs](https://zarr.readthedocs.io/en/stable/api/zarr/codecs/) &
   [GeoZarr](https://github.com/zarr-developers/geozarr-spec)

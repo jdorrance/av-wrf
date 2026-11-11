@@ -14,6 +14,8 @@ Assumptions & Grid Geometry Alignment:
 References:
 - WPS spherical Lambert:
   https://github.com/wrf-model/WPS/blob/master/geogrid/src/module_map_utils.F
+- WPS domain sizing guidance (>= 100x100):
+  https://www2.mmm.ucar.edu/wrf/site/documentation/namelist.wps_best_practices.html
 - WRF v4 Technical Note (Sec. 2.3 & 3.2):
   https://www2.mmm.ucar.edu/wrf/users/docs/technote/v4_technote.pdf
 - Consumer LambertConformalGrid: windy-av-layer/packages/contracts/src/geometry.ts
@@ -24,18 +26,43 @@ from __future__ import annotations
 import math
 from array import array
 
+import numpy as np
+import numpy.typing as npt
+
 from av_wrf.contracts import (
+    CompBucket2D,
     CompMass2D,
     CompMass3D,
     CompStagX3D,
     CompStagY3D,
     CompStagZ3D,
     DomainProfile,
+    PubBucket2D,
     PubMass2D,
     PubMass3D,
     Slab2DF32,
+    Slab2DI32,
     Slab3DF32,
 )
+
+MIN_DOMAIN_MASS_CELLS = 100
+
+
+def _to_f32_array(arr: npt.NDArray[np.float32]) -> array[float]:
+    out = array("f")
+    out.frombytes(np.ascontiguousarray(arr, dtype=np.float32).tobytes())
+    return out
+
+
+def validate_domain_profile(domain: DomainProfile) -> None:
+    """Enforce project real-domain sizing policy (>= 100x100 computational mass cells)."""
+    comp_nj, comp_ni = domain.e_sn - 1, domain.e_we - 1
+    if comp_ni < MIN_DOMAIN_MASS_CELLS or comp_nj < MIN_DOMAIN_MASS_CELLS:
+        raise ValueError(
+            f"Domain policy requires >= {MIN_DOMAIN_MASS_CELLS}x{MIN_DOMAIN_MASS_CELLS} "
+            f"mass cells (e_we >= {MIN_DOMAIN_MASS_CELLS + 1}, got {domain.e_we}x{domain.e_sn})"
+        )
+    published_grid_shape(domain)
 
 
 def _wrap_lon_rad(delta_rad: float) -> float:
@@ -102,7 +129,7 @@ def lambert_xy_m_to_latlon(
     dy = rho0 - y_m
     rho = sign_n * math.hypot(x_m, dy)
     theta = math.atan2(sign_n * x_m, sign_n * dy)
-    lat_rad = 2.0 * math.atan((radius_m * f_const / rho) ** (1.0 / n)) - 0.5 * math.pi
+    lat_rad = 2.0 * math.atan(math.pow(radius_m * f_const / rho, 1.0 / n)) - 0.5 * math.pi
     lon_rad = _wrap_lon_rad(math.radians(central_meridian_deg) + theta / n)
     return math.degrees(lat_rad), math.degrees(lon_rad)
 
@@ -117,9 +144,7 @@ def lambert_convergence_trig(
     radius_m: float,
 ) -> tuple[float, float]:
     """Return (cos(theta), sin(theta)) for theta = n*(lon - stand_lon)."""
-    n, _, _ = _cone_constants(
-        std_parallel_1_deg, std_parallel_2_deg, origin_lat_deg, radius_m
-    )
+    n, _, _ = _cone_constants(std_parallel_1_deg, std_parallel_2_deg, origin_lat_deg, radius_m)
     theta = n * _wrap_lon_rad(math.radians(lon_deg - central_meridian_deg))
     return math.cos(theta), math.sin(theta)
 
@@ -139,14 +164,13 @@ def lambert_map_scale(
         std_parallel_1_deg, std_parallel_2_deg, origin_lat_deg, radius_m
     )
     phi = math.radians(lat_deg)
-    rho = radius_m * f_const / (math.tan(0.25 * math.pi + 0.5 * phi) ** n)
+    rho = radius_m * f_const / math.pow(math.tan(0.25 * math.pi + 0.5 * phi), n)
     return abs(n * rho) / (radius_m * math.cos(phi))
 
 
 def published_grid_shape(domain: DomainProfile) -> tuple[int, int]:
     """Return (nj, ni) mass-point dimensions after cropping bdy_trim_cells on each edge."""
-    comp_nj = domain.e_sn - 1
-    comp_ni = domain.e_we - 1
+    comp_nj, comp_ni = domain.e_sn - 1, domain.e_we - 1
     trim = 2 * domain.bdy_trim_cells
     if domain.bdy_trim_cells < 1 or comp_nj <= trim or comp_ni <= trim:
         raise ValueError("Published grid dimensions must remain positive after sponge trim")
@@ -156,8 +180,7 @@ def published_grid_shape(domain: DomainProfile) -> tuple[int, int]:
 def published_grid_origin_xy_m(domain: DomainProfile) -> tuple[float, float]:
     """Return (x0M, y0M) of Published Grid cell (j=0, i=0) relative to projection origin."""
     published_grid_shape(domain)
-    comp_nj = domain.e_sn - 1
-    comp_ni = domain.e_we - 1
+    comp_nj, comp_ni = domain.e_sn - 1, domain.e_we - 1
     cx_m, cy_m = latlon_to_lambert_xy_m(
         domain.center_lat_deg,
         domain.center_lon_deg,
@@ -214,20 +237,44 @@ def published_lambert_grid_metadata(
     }
 
 
+def computational_latlon_bounds(
+    domain: DomainProfile, *, halo_deg: float = 1.0, snap_deg: float = 0.25
+) -> tuple[float, float, float, float]:
+    """Return snapped (west, south, east, north) forcing cutout bounds for domain."""
+    half_x = 0.5 * max(1, domain.e_we - 1) * domain.dx_m
+    half_y = 0.5 * max(1, domain.e_sn - 1) * domain.dy_m
+    pts = [(sx * half_x, sy * half_y) for sx in (-1.0, 0.0, 1.0) for sy in (-1.0, 0.0, 1.0)]
+    lats: list[float] = []
+    lons: list[float] = []
+    for x_m, y_m in pts:
+        lat, lon = lambert_xy_m_to_latlon(
+            x_m,
+            y_m,
+            origin_lat_deg=domain.center_lat_deg,
+            central_meridian_deg=domain.central_meridian_deg,
+            std_parallel_1_deg=domain.std_parallel_1_deg,
+            std_parallel_2_deg=domain.std_parallel_2_deg,
+            radius_m=domain.earth_radius_m,
+        )
+        lats.append(lat)
+        lons.append(lon)
+    w = math.floor((min(lons) - halo_deg) / snap_deg) * snap_deg
+    s = math.floor((min(lats) - halo_deg) / snap_deg) * snap_deg
+    e = math.ceil((max(lons) + halo_deg) / snap_deg) * snap_deg
+    n = math.ceil((max(lats) + halo_deg) / snap_deg) * snap_deg
+    return (round(w, 4), round(s, 4), round(e, 4), round(n, 4))
+
+
 def destagger_x_3d(stag_u: CompStagX3D) -> CompMass3D:
     """Destagger (nz, ny, nx+1) Arakawa-C U faces onto (nz, ny, nx) mass points."""
     nz, ny, nx1 = stag_u.nz, stag_u.ny, stag_u.nx
     if nx1 < 2:
         raise ValueError("Staggered X axis requires >= 2 columns")
-    nx = nx1 - 1
-    out = array("f")
-    src = stag_u.buf
-    for k in range(nz):
-        for j in range(ny):
-            row_off = (k * ny + j) * nx1
-            for i in range(nx):
-                out.append(0.5 * (src[row_off + i] + src[row_off + i + 1]))
-    return CompMass3D(Slab3DF32(nz=nz, ny=ny, nx=nx, buf=out))
+    arr = np.frombuffer(stag_u.buf, dtype=np.float32).reshape(nz, ny, nx1)
+    mid = (0.5 * (arr[:, :, :-1].astype(np.float64) + arr[:, :, 1:].astype(np.float64))).astype(
+        np.float32
+    )
+    return CompMass3D(Slab3DF32(nz=nz, ny=ny, nx=nx1 - 1, buf=_to_f32_array(mid)))
 
 
 def destagger_y_3d(stag_v: CompStagY3D) -> CompMass3D:
@@ -235,17 +282,11 @@ def destagger_y_3d(stag_v: CompStagY3D) -> CompMass3D:
     nz, ny1, nx = stag_v.nz, stag_v.ny, stag_v.nx
     if ny1 < 2:
         raise ValueError("Staggered Y axis requires >= 2 rows")
-    ny = ny1 - 1
-    out = array("f")
-    src = stag_v.buf
-    for k in range(nz):
-        plane_off = k * ny1 * nx
-        for j in range(ny):
-            r0 = plane_off + j * nx
-            r1 = r0 + nx
-            for i in range(nx):
-                out.append(0.5 * (src[r0 + i] + src[r1 + i]))
-    return CompMass3D(Slab3DF32(nz=nz, ny=ny, nx=nx, buf=out))
+    arr = np.frombuffer(stag_v.buf, dtype=np.float32).reshape(nz, ny1, nx)
+    mid = (0.5 * (arr[:, :-1, :].astype(np.float64) + arr[:, 1:, :].astype(np.float64))).astype(
+        np.float32
+    )
+    return CompMass3D(Slab3DF32(nz=nz, ny=ny1 - 1, nx=nx, buf=_to_f32_array(mid)))
 
 
 def destagger_z_3d(stag_z: CompStagZ3D) -> CompMass3D:
@@ -253,30 +294,33 @@ def destagger_z_3d(stag_z: CompStagZ3D) -> CompMass3D:
     nz1, ny, nx = stag_z.nz, stag_z.ny, stag_z.nx
     if nz1 < 2:
         raise ValueError("Staggered Z axis requires >= 2 levels")
-    nz = nz1 - 1
-    plane = ny * nx
-    out = array("f")
-    src = stag_z.buf
-    for k in range(nz):
-        p0 = k * plane
-        p1 = p0 + plane
-        for idx in range(plane):
-            out.append(0.5 * (src[p0 + idx] + src[p1 + idx]))
-    return CompMass3D(Slab3DF32(nz=nz, ny=ny, nx=nx, buf=out))
+    arr = np.frombuffer(stag_z.buf, dtype=np.float32).reshape(nz1, ny, nx)
+    mid = (0.5 * (arr[:-1, :, :].astype(np.float64) + arr[1:, :, :].astype(np.float64))).astype(
+        np.float32
+    )
+    return CompMass3D(Slab3DF32(nz=nz1 - 1, ny=ny, nx=nx, buf=_to_f32_array(mid)))
 
 
 def crop_sponge_2d(slab: CompMass2D, trim: int) -> PubMass2D:
-    """Crop lateral relaxation cells on all four edges of a contiguous 2D mass slab."""
+    """Crop lateral relaxation cells on all four edges of a contiguous 2D float32 mass slab."""
     if trim < 1 or slab.ny <= 2 * trim or slab.nx <= 2 * trim:
         raise ValueError("Invalid sponge trim for 2D computational slab")
-    pub_ny = slab.ny - 2 * trim
-    pub_nx = slab.nx - 2 * trim
-    out = array("f")
-    src = slab.buf
-    for j in range(trim, slab.ny - trim):
-        start = j * slab.nx + trim
-        out.extend(src[start : start + pub_nx])
-    return PubMass2D(Slab2DF32(ny=pub_ny, nx=pub_nx, buf=out))
+    arr = np.frombuffer(slab.buf, dtype=np.float32).reshape(slab.ny, slab.nx)
+    cropped = arr[trim : slab.ny - trim, trim : slab.nx - trim]
+    return PubMass2D(
+        Slab2DF32(ny=slab.ny - 2 * trim, nx=slab.nx - 2 * trim, buf=_to_f32_array(cropped))
+    )
+
+
+def crop_bucket_2d(slab: CompBucket2D, trim: int) -> PubBucket2D:
+    """Crop lateral relaxation cells on all four edges of a 2D int32 bucket counter slab."""
+    if trim < 1 or slab.ny <= 2 * trim or slab.nx <= 2 * trim:
+        raise ValueError("Invalid sponge trim for 2D computational int32 bucket slab")
+    arr = np.frombuffer(slab.buf, dtype=np.int32).reshape(slab.ny, slab.nx)
+    cropped = arr[trim : slab.ny - trim, trim : slab.nx - trim]
+    out = array("i")
+    out.frombytes(np.ascontiguousarray(cropped, dtype=np.int32).tobytes())
+    return PubBucket2D(Slab2DI32(ny=slab.ny - 2 * trim, nx=slab.nx - 2 * trim, buf=out))
 
 
 def crop_sponge_3d(volume: CompMass3D, trim: int, exported_k: int) -> PubMass3D:
@@ -285,13 +329,13 @@ def crop_sponge_3d(volume: CompMass3D, trim: int, exported_k: int) -> PubMass3D:
         raise ValueError("Volume has fewer vertical levels than exported_k")
     if trim < 1 or volume.ny <= 2 * trim or volume.nx <= 2 * trim:
         raise ValueError("Invalid sponge trim for 3D computational volume")
-    pub_ny = volume.ny - 2 * trim
-    pub_nx = volume.nx - 2 * trim
-    out = array("f")
-    src = volume.buf
-    for k in range(exported_k):
-        plane_off = k * volume.ny * volume.nx
-        for j in range(trim, volume.ny - trim):
-            start = plane_off + j * volume.nx + trim
-            out.extend(src[start : start + pub_nx])
-    return PubMass3D(Slab3DF32(nz=exported_k, ny=pub_ny, nx=pub_nx, buf=out))
+    arr = np.frombuffer(volume.buf, dtype=np.float32).reshape(volume.nz, volume.ny, volume.nx)
+    cropped = arr[:exported_k, trim : volume.ny - trim, trim : volume.nx - trim]
+    return PubMass3D(
+        Slab3DF32(
+            nz=exported_k,
+            ny=volume.ny - 2 * trim,
+            nx=volume.nx - 2 * trim,
+            buf=_to_f32_array(cropped),
+        )
+    )

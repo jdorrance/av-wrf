@@ -25,10 +25,10 @@ their respective sides of the Zarr v3 contract:
 
 - **Why `(PH + PHB) / 9.81` must not use `9.80665`:** WRF initializes base-state
   geopotential at the surface face as $\text{PHB}(k_w = 0) = 9.81 \cdot \text{HGT}$.
-  Dividing by `9.80665` over Mount Aragats (`4,090 m`) would introduce a `+1.40 m`
+  Dividing by `9.80665` over a `4,100 m` massif would introduce a `+1.40 m`
   ground-datum offset relative to `terrain_m` (`HGT`), distorting near-surface
   `heightM - terrainM` AGL differences in `windy-av-layer`.
-- **Vertical geoid datum (`EGM2008`):** Both `av-wrf` (`Copernicus DEM DGED 2023_1 GLO-30`)
+- **Vertical geoid datum (`EGM2008`):** Both `GMTED2010` / `Copernicus DEM DGED 2023_1 GLO-30`
   and `windy-av-layer` (`Copernicus GLO-90`) express orthometric elevations on
   `EGM2008` with zero vertical-datum transformation required across the boundary.
 
@@ -40,7 +40,9 @@ their respective sides of the Zarr v3 contract:
    $\theta - T_0$ ($T_0 = \text{base\_temp} = 300\text{ K}$), while `THM` stores
    $\theta_m - T_0 = \theta(1 + (R_v/R_d)q_v) - T_0$ ([WRF Users' Guide Ch. 5](https://www2.mmm.ucar.edu/wrf/users/docs/user_guide_v4/v4.4/users_guide_chap5.html),
    [WRF Forum #5569](https://forum.mmm.ucar.edu/threads/accessing-variables-on-head_grid.5569/)).
-   Both invert to sensible air temperature $T_{\text{air}} = \theta (p / p_0)^{2/7}$.
+   `codecs/wrf_nc.py` cross-checks `potential_to_temp_k(T)` against
+   `moist_thm_to_temp_k(THM, QVAPOR)` on every ingested `wrfout` slice so any
+   moist/dry confusion fails closed immediately.
 2. **Specific humidity & omission of `rhPercent`:** WRF `QVAPOR` and `Q2` are
    water-vapor mixing ratios $r$ (`kg/kg dry air`), converted via $q = r / (1 + r)$.
    Model-level `rhPercent` is intentionally omitted because `windy-av-layer`
@@ -68,17 +70,17 @@ their respective sides of the Zarr v3 contract:
    where $B(\eta)$ is the cubic satisfying $B(1) = 1$, $B'(1) = 1$, $B(\eta_c) = 0$,
    and $B'(\eta_c) = 0$. Because $\max B'(\eta) \approx 1.681 > 1$ at $\eta \approx 0.69$
    for $\eta_c = 0.2$, lower-to-mid-tropospheric layers **compress** over high peaks
-   (`20` BL levels in `0–2 km` AGL at `800 m` Ararat valley; `24+` levels over
-   `4,090 m` Mount Aragats and `5,137 m` Mount Ararat) and would fold ($\partial p_d / \partial \eta \le 0$)
-   if $\eta_c \gtrsim 0.32$ over `5 km` peaks. `av-wrf check` verifies monotonic
-   $\Delta p_d > 0$ across `800 m`, `4,090 m`, and `5,137 m` before running WRF.
-2. **Summer thermal-expansion headroom (`max_dz_m = 850 m` vs. `1,000 m`):**
+   (`20` BL levels in `0–2 km` AGL at `800 m` basins; `24+` levels over `4–5 km`
+   summits) and would fold ($\partial p_d / \partial \eta \le 0$) if $\eta_c \gtrsim 0.32$
+   over `5 km` peaks. `av-wrf check` verifies monotonic $\Delta p_d > 0$ across
+   every elevation listed in `DomainProfile.terrain_elevations_m`.
+2. **Summer thermal-expansion headroom (`max_dz_m <= 900 m` vs. `1,000 m`):**
    `windy-av-layer` (`packages/soaring/src/column.ts:159`) rejects an **entire
    column as `unavailable`** if any adjacent level gap exceeds `maximumProfileGapM = 1,000 m`.
    Because extreme summer heatwaves ($T \approx 1.08 \, T_{\text{ref}}$) thermally
    expand hydrostatic layer thicknesses above WRF's `290 K` reference profile,
-   `vertical.py` enforces `max_dz_m <= 900 m` (`850 m` in `armenia-3km-v1.yaml`),
-   preserving $> 15\%$ thermal margin below `1,000 m`.
+   `vertical.py` enforces `max_dz_m <= 900 m` (`850 m` in shipped domain profiles),
+   and `runner/post.py` verifies actual exported `height_msl_m - terrain_m` gaps.
 3. **First mass midpoint vs. consumer `minimumLevelAglM = 20 m`:** With
    `dzbot_m = 34 m` ($\ge 25\text{ m}$ coupled surface-layer stability floor per
    [WRF Forum #8325](https://forum.mmm.ucar.edu/threads/increase-eta-level-and-decrease-dzbot.8325/)),
@@ -100,9 +102,7 @@ their respective sides of the Zarr v3 contract:
    hydrostatic $\omega = -\rho_m g w$ (omitting $\partial p'/\partial t + \mathbf{v}_h \cdot \nabla_z p'$)
    because `windy-av-layer` (`geometricWFromOmegaMps`) inverts `omegaPaS` back to
    geometric $w$ hydrostatically for wave/windgram display; adding horizontal
-   pressure advection would corrupt mountain-wave $w$ on inversion. Note consumer
-   inversion uses dry $T$ rather than $T_v$, introducing a benign $< 0.7\%$ scale
-   factor at summer humidities.
+   pressure advection would corrupt mountain-wave $w$ on inversion.
 3. **10 m wind gusts over high terrain (`parameterized_gust_10m_mps`):** WRF
    `WSPD10MAX` (`nwp_diagnostics = 1`) tracks the maximum **3 km grid-cell mean**
    10 m wind across solver steps (plus AFWA heavy-rain blending only above `50 mm/h`),
@@ -113,25 +113,19 @@ their respective sides of the Zarr v3 contract:
    increment $\Delta V_{\text{turb}} = 7.71 (u_*^3 + \frac{0.5 \kappa}{12} w_*^3)^{1/3}$
    with **actual high-terrain surface density** $\rho_{\text{sfc}} = p_{\text{sfc}} / (R_d T_{v0})$
    and moist virtual buoyancy flux (`H` + `LE`, matching `windy-av-layer` `column.ts`
-   and Dr. Jack Glendening's RASP `vhf`; avoiding sea-level $\rho c_p = 1200$ which
-   underestimates surface buoyancy by `22–35%` at `2–4 km` elevation). ECMWF's
-   baric downdraft shear term $\max(0, U_{850} - U_{950})$ ([Bechtold & Bidlot 2009](https://www.ecmwf.int/en/elibrary/80227-parametrization-convective-gusts))
-   is intentionally omitted because `850` and `950 hPa` lie underground across the
-   Armenian plateau while 3 km WRF resolves cold-pool outflows in `WSPD10MAX`.
+   and Dr. Jack Glendening's RASP `vhf`). ECMWF's baric downdraft shear term
+   $\max(0, U_{850} - U_{950})$ ([Bechtold & Bidlot 2009](https://www.ecmwf.int/en/elibrary/80227-parametrization-convective-gusts))
+   is intentionally omitted because `850` and `950 hPa` lie underground across
+   elevated plateaus while 3 km WRF resolves cold-pool outflows in `WSPD10MAX`.
 4. **Plateau MSLP (`hypsometric_mslp_pa`):** Uses the WMO / WRF Shuell reduction
    ([CORDEX-WRF GMD 2019](https://gmd.copernicus.org/articles/12/1029/2019/)
    `psl_diag = 1`), clamping extrapolated sea-level virtual temperatures at
    `290.5 K` on hot summer plateaus and damping `< 255 K` winter basin inversions.
-   `windy-av-layer` uses `mslpPa` strictly for the `mslp-hpa` map layer, never in
-   thermal or terrain-column physics.
 5. **Cloud overlap & low-cloud $\sigma \ge 0.8$ (`core/post.py`):** Applies
    Geleyn & Hollingsworth / [Hogan & Illingworth (2000)](https://journals.ametsoc.org/view/journals/atsc/72/8/jas-d-14-0278.1.xml)
    maximum-random overlap to 3D `CLDFRA`. `cloud_low_pct` filters `p >= 0.8 * PSFC`
    (ECMWF terrain-following $\sigma \ge 0.8$) rather than ICON's fixed `800 hPa`
-   threshold, which lies underground above `1,950 m` MSL. *Known Phase 1 caveat:*
-   YSU (`bl_pbl_physics = 1`) lacks MYNN's subgrid shallow-cumulus `CLDFRA`
-   coupling (`icloud_bl = 1`), so optically thin fair-weather `Cu` can report
-   `cloud_low_pct = 0%` even when consumer `views.ts` flags `SUPPORT_CUMULUS`.
+   threshold, which lies underground above `1,950 m` MSL.
 6. **CAPE provenance:** `cape_jkg` exports `AFWA_CAPE` (`phys/module_diag_afwa.F`),
    defined as undiluted virtual-temperature `MUCAPE` from the most-unstable parcel
    in the lowest `~300 hPa` AGL (declared in `wrf-zarr-v3.schema.json`).
@@ -142,20 +136,19 @@ their respective sides of the Zarr v3 contract:
   (`sf_sfclay_physics = 1`) diagnoses `T2` along the Monin–Obukhov similarity
   profile between hot skin `TSK` and `temp_k[0]`, naturally supplying `1–2.5 K`
   superadiabatic excess on sunny afternoons so `windy-av-layer` uses
-  `parcelSurfaceDeltaTC = 0 K`. Changing `sf_sfclay_physics` alters `T2` directly.
+  `parcelSurfaceDeltaTC = 0 K`.
 - **Topographic radiation (`slope_rad = 1`, `topo_shading = 1`) vs. RASP `sfcsun`:**
   3 km slope aspect and `25 km` cast shadows enter Noah-MP's surface energy budget
   directly (`radt = 3 min`); `windy-av-layer` interpolates donor heat fluxes without
   re-scaling by DEM slope aspect, preventing double-counting.
-- **Trailing flux windows & Armenia (`UTC+4`) 3-hourly tail (`f039..f048`):**
-  Trailing 1 h mean fluxes (`f001..f036`) damp transient cloud-shadow noise
-  compared to RASP's instantaneous `HFX`. For a `00Z` cycle in Armenia (`UTC+4`),
-  `f036` is `16:00 AMT` on Day 2, so late-afternoon glass-off (`16:00–19:00 AMT`)
-  falls in the first 3-hourly window (`f039`), which averages fluxes over `3 h`
-  and smooths late-day decay; extending `hourly_cutoff_h` to `40` is a pure YAML
-  knob if Day-2 evening precision warrants +4 shards.
-- **Cold-start land state, snow, & Lake Sevan (`1,900 m` MSL):** Phase 1 initializes
-  Noah-MP (`5, 25, 70, 150 cm`) from `18Z` GFS (`6 h` spin-up). Coarse GFS snow
-  depth (`SNOD`) and skin temperature over high-altitude Lake Sevan (`~1,270 km²`)
-  can bias spring snow-breeze lines and lake-breeze convergence until `IMS 1 km`
-  snow and `OSTIA` lake temperatures are benchmarked in Phase 5.
+- **Trailing flux windows & 3-hourly tail (`f039..f048`):** Trailing 1 h mean
+  fluxes (`f001..f036`) damp transient cloud-shadow noise compared to RASP's
+  instantaneous `HFX`. For a `00Z` cycle in a `UTC+4` timezone, `f036` is `16:00`
+  local on Day 2, so late-afternoon glass-off (`16:00–19:00` local) falls in the
+  first 3-hourly window (`f039`); `hourly_through_hour` is a pure output-profile
+  YAML knob when finer Day-2 evening cadence is needed.
+- **Cold-start land state, snow, & high-altitude inland lakes:** Phase 1
+  initializes Noah-MP (`5, 25, 70, 150 cm`) from `18Z` GFS (`6 h` spin-up).
+  Coarse GFS snow depth (`SNOD`) and skin temperature over high-altitude lakes
+  can bias spring snow-breeze and lake-breeze convergence until `IMS 1 km` snow
+  and `OSTIA` lake temperatures are benchmarked in Phase 5.

@@ -1,4 +1,4 @@
-"""Complete Zarr v3 store hierarchy, sharding_indexed array metadata, and shard paths.
+"""Complete Zarr v3 store hierarchy, sharding_indexed array metadata, and shard inventory.
 
 References:
 - Zarr v3 core & ZEP-0002 sharding: https://zarr.dev/zeps/accepted/ZEP0002.html
@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import math
 
+from av_wrf.codecs.zarr_shard import divisor_chunk
 from av_wrf.contracts import (
+    CAPE_PARCEL_DEFINITION,
+    LOW_CLOUD_DEFINITION,
     MOISTURE_SOURCE_OF_TRUTH,
     TEMPERATURE_DEFINITION,
+    WRF_ZARR_V3_COORDS,
     WRF_ZARR_V3_FIELD_NAMES,
     WRF_ZARR_V3_FIELDS,
     ZARR_FORMAT_VERSION,
@@ -19,8 +23,7 @@ from av_wrf.contracts import (
     ZARR_SCHEMA_VERSION,
     DomainProfile,
     OutputProfile,
-    PubMass2D,
-    PubMass3D,
+    ZarrCoordSpec,
     ZarrFieldSpec,
     zarr_index_codecs,
     zarr_inner_codecs,
@@ -30,15 +33,6 @@ from av_wrf.core import (
     published_grid_shape,
     published_lambert_grid_metadata,
 )
-
-
-def _divisor_chunk(full_len: int, target: int) -> int:
-    """Pick largest chunk size <= min(full_len, target) that evenly divides full_len."""
-    cap = min(full_len, max(1, target))
-    for candidate in range(cap, 0, -1):
-        if full_len % candidate == 0:
-            return candidate
-    return 1
 
 
 def zarr_shard_relpath(
@@ -65,25 +59,31 @@ def zarr_shard_relpath(
     return f"{field_name}/c/{t_shard}/0/{y_shard}/{x_shard}"
 
 
-def _coord_array_meta(
-    name: str,
-    dim_name: str,
-    length: int,
-    dtype: str,
-    fill_value: int | float,
-    units: str,
-) -> dict[str, object]:
+def expected_shard_keys(output: OutputProfile, n_leads: int) -> set[str]:
+    """Return complete canonical set of coord + 22-field shard keys for `n_leads`."""
+    expected: set[str] = {f"{c.name}/c/0" for c in WRF_ZARR_V3_COORDS}
+    expected.add(zarr_shard_relpath("terrain_m", output))
+    step = output.shard_time_steps
+    for spec in WRF_ZARR_V3_FIELDS:
+        if spec.name == "terrain_m":
+            continue
+        for t_idx in range(0, n_leads, step):
+            expected.add(zarr_shard_relpath(spec.name, output, time_index=t_idx))
+    return expected
+
+
+def _coord_array_meta(spec: ZarrCoordSpec, length: int) -> dict[str, object]:
     return {
         "zarr_format": ZARR_FORMAT_VERSION,
         "node_type": "array",
         "shape": [length],
-        "data_type": dtype,
+        "data_type": spec.data_type,
         "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [length]}},
         "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
-        "fill_value": fill_value,
+        "fill_value": spec.fill_value,
         "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
-        "dimension_names": [dim_name],
-        "attributes": {"variable": name, "units": units},
+        "dimension_names": [spec.dim],
+        "attributes": {"variable": spec.name, "units": spec.units},
     }
 
 
@@ -95,21 +95,15 @@ def _field_array_meta(
     ni: int,
     output: OutputProfile,
 ) -> dict[str, object]:
-    iy = _divisor_chunk(nj, output.inner_chunk_yx[0])
-    ix = _divisor_chunk(ni, output.inner_chunk_yx[1])
+    iy = divisor_chunk(nj, output.inner_chunk_yx[0])
+    ix = divisor_chunk(ni, output.inner_chunk_yx[1])
     t_shard = min(t_len, output.shard_time_steps)
     if spec.dims == ("y", "x"):
-        shape = [nj, ni]
-        outer = [nj, ni]
-        inner = [iy, ix]
+        shape, outer, inner = [nj, ni], [nj, ni], [iy, ix]
     elif len(spec.dims) == 3:
-        shape = [t_len, nj, ni]
-        outer = [t_shard, nj, ni]
-        inner = [1, iy, ix]
+        shape, outer, inner = [t_len, nj, ni], [t_shard, nj, ni], [1, iy, ix]
     else:
-        shape = [t_len, k_len, nj, ni]
-        outer = [t_shard, k_len, nj, ni]
-        inner = [1, k_len, iy, ix]
+        shape, outer, inner = [t_len, k_len, nj, ni], [t_shard, k_len, nj, ni], [1, k_len, iy, ix]
     return {
         "zarr_format": ZARR_FORMAT_VERSION,
         "node_type": "array",
@@ -151,6 +145,7 @@ def build_zarr_v3_store_metadata(
     if t_len < 1 or math.isnan(domain.dx_m):
         raise ValueError("lead_hours must be non-empty")
 
+    dim_lengths = {"time": t_len, "level": k_len, "y": nj, "x": ni}
     docs: dict[str, dict[str, object]] = {
         "zarr.json": {
             "zarr_format": ZARR_FORMAT_VERSION,
@@ -162,41 +157,16 @@ def build_zarr_v3_store_metadata(
                 "vertical_coordinate": "model-levels",
                 "moisture_source_of_truth": MOISTURE_SOURCE_OF_TRUTH,
                 "temperature_definition": TEMPERATURE_DEFINITION,
+                "cape_parcel_definition": CAPE_PARCEL_DEFINITION,
+                "low_cloud_definition": LOW_CLOUD_DEFINITION,
                 "lead_hours": list(lead_hours),
                 "crs_wkt": published_crs_wkt(domain),
                 "grid": published_lambert_grid_metadata(domain),
             },
-        },
-        "time/zarr.json": _coord_array_meta("time", "time", t_len, "int32", -1, "hours"),
-        "valid_time_unix_s/zarr.json": _coord_array_meta(
-            "valid_time_unix_s", "time", t_len, "int64", -1, "s"
-        ),
-        "window_start_unix_s/zarr.json": _coord_array_meta(
-            "window_start_unix_s", "time", t_len, "int64", -1, "s"
-        ),
-        "window_end_unix_s/zarr.json": _coord_array_meta(
-            "window_end_unix_s", "time", t_len, "int64", -1, "s"
-        ),
-        "level/zarr.json": _coord_array_meta("level", "level", k_len, "int32", -1, "index"),
-        "y/zarr.json": _coord_array_meta("y", "y", nj, "float64", 0.0, "m"),
-        "x/zarr.json": _coord_array_meta("x", "x", ni, "float64", 0.0, "m"),
+        }
     }
+    for c_spec in WRF_ZARR_V3_COORDS:
+        docs[f"{c_spec.name}/zarr.json"] = _coord_array_meta(c_spec, dim_lengths[c_spec.dim])
     for spec in WRF_ZARR_V3_FIELDS:
-        docs[f"{spec.name}/zarr.json"] = _field_array_meta(
-            spec, t_len, k_len, nj, ni, output
-        )
+        docs[f"{spec.name}/zarr.json"] = _field_array_meta(spec, t_len, k_len, nj, ni, output)
     return docs
-
-
-def verify_published_2d_shape(slab: PubMass2D, domain: DomainProfile) -> None:
-    """Verify 2D array matches Published Grid (nj, ni)."""
-    nj, ni = published_grid_shape(domain)
-    if (slab.ny, slab.nx) != (nj, ni):
-        raise ValueError(f"2D slab shape ({slab.ny}, {slab.nx}) != ({nj}, {ni})")
-
-
-def verify_published_3d_shape(volume: PubMass3D, domain: DomainProfile) -> None:
-    """Verify 3D array matches Published Grid (exported_levels_k, nj, ni)."""
-    nj, ni = published_grid_shape(domain)
-    if (volume.nz, volume.ny, volume.nx) != (domain.exported_levels_k, nj, ni):
-        raise ValueError("3D volume shape does not match Published Grid (K, nj, ni)")

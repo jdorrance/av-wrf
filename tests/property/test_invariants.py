@@ -35,7 +35,8 @@ def _assert_spfh_bounded(r: float) -> None:
 class TestPropertyInvariants(unittest.TestCase):
     def test_rotation_moisture_and_lambert_invariants(self) -> None:
         try:
-            from hypothesis import given, strategies as st  # noqa: PLC0415
+            from hypothesis import given
+            from hypothesis import strategies as st
         except ImportError:
             for deg in range(-180, 181, 15):
                 _assert_rotation_norm(-14.2, 7.8, math.radians(float(deg)))

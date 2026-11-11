@@ -14,6 +14,6 @@ from av_wrf.core import (
 ```
 
 - **Allowed imports:** `av_wrf.contracts` and Python math/datetime/struct stdlib
-  (`core.*` peers may import `core.grid` only).
+  (`core.*` peers may import `core.grid`, `core.thermo`, and `core.vertical`).
 - **Forbidden:** file/network I/O, `os`, `sys`, `subprocess`, `netCDF4`, `zarr`,
   `random`, and wall-clock calls (`datetime.now`, `time.time`).

@@ -25,22 +25,39 @@ from av_wrf.contracts import (  # noqa: E402
     ZARR_SCHEMA_VERSION,
 )
 from av_wrf.runner import check_product_config  # noqa: E402
+from scripts.check_repo import IGNORED_NAMES  # noqa: E402
 
 LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 FENCE_RE = re.compile(r"```[\s\S]*?```")
-DECLARED_MARKDOWN: frozenset[str] = frozenset({
-    "AGENTS.md", "README.md", "docs/architecture.md", "docs/plan.md", "docs/reference.md",
-    "docs/science.md", "config/README.md", "docker/README.md", "docker/patches/README.md",
-    "vendor/producer-contract/README.md", "src/av_wrf/contracts/README.md",
-    "src/av_wrf/core/README.md", "src/av_wrf/codecs/README.md",
-    "src/av_wrf/runner/README.md", "src/av_wrf/verify/README.md",
-    "src/av_wrf/cli/README.md",
-})
+DECLARED_MARKDOWN: frozenset[str] = frozenset(
+    {
+        "AGENTS.md",
+        "README.md",
+        "docs/architecture.md",
+        "docs/plan.md",
+        "docs/reference.md",
+        "docs/science.md",
+        "config/README.md",
+        "docker/README.md",
+        "docker/patches/README.md",
+        "vendor/producer-contract/README.md",
+        "src/av_wrf/contracts/README.md",
+        "src/av_wrf/core/README.md",
+        "src/av_wrf/codecs/README.md",
+        "src/av_wrf/runner/README.md",
+        "src/av_wrf/verify/README.md",
+        "src/av_wrf/cli/README.md",
+    }
+)
 
 
 def _render_products_section(repo: Path) -> list[str]:
     out = [
-        "", "## Configured Products", "", "Source: [`config/products/`](../config/README.md).", ""
+        "",
+        "## Configured Products",
+        "",
+        "Source: [`config/products/`](../config/README.md).",
+        "",
     ]
     for yaml_path in sorted((repo / "config" / "products").glob("*.yaml")):
         info = check_product_config(repo / "config", yaml_path.stem)
@@ -76,20 +93,22 @@ def render_reference_markdown(repo: Path) -> str:
     ]
     src_link = "[`zarr_schema.py`](../src/av_wrf/contracts/zarr_schema.py)"
     ven_link = "[`wrf-zarr-v3.schema.json`](../vendor/producer-contract/wrf-zarr-v3.schema.json)"
-    lines.extend([
-        "",
-        f"## Wire Schema `{ZARR_SCHEMA_ID}` (v{ZARR_SCHEMA_VERSION}, `{ZARR_SCHEMA_STATUS}`)",
-        "",
-        f"Source: {src_link} and {ven_link}.",
-        "",
-        f"- Spherical radius: `{WRF_SPHERE_RADIUS_M}` m; exported levels ceiling: "
-        f"`{MAX_EXPORTED_LEVELS}`; moisture source of truth: `{MOISTURE_SOURCE_OF_TRUTH}`; "
-        f"default inner chunk: `{list(DEFAULT_INNER_SPATIAL_CHUNK)}`; zstd level: "
-        f"`{DEFAULT_ZSTD_LEVEL}`.",
-        "",
-        "| Field | Dimensions | Units | `ModelLevelFrame` Target | Time Support | `keepbits` |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- |",
-    ])
+    lines.extend(
+        [
+            "",
+            f"## Wire Schema `{ZARR_SCHEMA_ID}` (v{ZARR_SCHEMA_VERSION}, `{ZARR_SCHEMA_STATUS}`)",
+            "",
+            f"Source: {src_link} and {ven_link}.",
+            "",
+            f"- Spherical radius: `{WRF_SPHERE_RADIUS_M}` m; exported levels ceiling: "
+            f"`{MAX_EXPORTED_LEVELS}`; moisture source of truth: `{MOISTURE_SOURCE_OF_TRUTH}`; "
+            f"default inner chunk: `{list(DEFAULT_INNER_SPATIAL_CHUNK)}`; zstd level: "
+            f"`{DEFAULT_ZSTD_LEVEL}`.",
+            "",
+            "| Field | Dimensions | Units | `ModelLevelFrame` Target | Time Support | `keepbits` |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- |",
+        ]
+    )
     for f in WRF_ZARR_V3_FIELDS:
         dims = ", ".join(f.dims)
         lines.append(
@@ -111,10 +130,9 @@ def check_markdown_files(repo: Path) -> list[str]:
             "docs/reference.md is stale. FIX: Run `python3 scripts/generate_reference.py`."
         )
 
-    ignored = {".git", ".venv", "build", "dist", "__pycache__", "output", "runs", "work"}
     found_md: set[str] = set()
     for md in sorted(repo.rglob("*.md")):
-        if any(p in ignored for p in md.parts):
+        if any(p in IGNORED_NAMES for p in md.parts):
             continue
         rel = md.relative_to(repo).as_posix()
         found_md.add(rel)

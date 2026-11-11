@@ -1,170 +1,38 @@
-"""Strict YAML profile loader and pipeline stage coordinators (`check` and `plan`)."""
+"""Pipeline stage coordinators (`check`, `plan`, `load_run_lock`, and `prep`)."""
 
 from __future__ import annotations
 
-import dataclasses
-import hashlib
 import json
-from dataclasses import dataclass
 from pathlib import Path
 
 from av_wrf.codecs import build_zarr_v3_store_metadata
 from av_wrf.contracts import (
     BuildManifest,
-    DomainProfile,
-    ForcingProfile,
-    OutputProfile,
     ProductCheckSummary,
-    ProductSpec,
     RunLock,
-    ScienceProfile,
-    parse_domain_profile,
-    parse_forcing_profile,
-    parse_output_profile,
-    parse_product_spec,
-    parse_science_profile,
+    parse_iso_utc,
 )
 from av_wrf.core import (
+    compile_wps_namelist_sections,
     compile_wrf_namelist_sections,
-    estimate_auto_levels_agl_m,
+    compile_wrf_run_namelist,
+    computational_latlon_bounds,
+    parse_cycle_arg,
     published_grid_origin_xy_m,
     published_grid_shape,
+    render_fortran_namelist,
     resolve_cycle_window,
-    selected_lead_hours,
-    validate_horizon_policy,
-    validate_vertical_column,
     verify_run_lock_timestamps,
 )
-from av_wrf.runner.store import ObjectStore
-
-ARARAT_VALLEY_M = 800.0
-MOUNT_ARAGATS_PEAK_M = 4_090.0
-MOUNT_ARARAT_PEAK_M = 5_137.0
-
-
-@dataclass(frozen=True)
-class LoadedBundle:
-    product: ProductSpec
-    domain: DomainProfile
-    science: ScienceProfile
-    primary_source: ForcingProfile
-    candidate_source: ForcingProfile
-    output: OutputProfile
-    config_sha256: str
-
-
-def _coerce_scalar(token: str) -> str | int | float | bool:
-    if (token.startswith('"') and token.endswith('"')) or (
-        token.startswith("'") and token.endswith("'")
-    ):
-        return token[1:-1]
-    if token == "true":
-        return True
-    if token == "false":
-        return False
-    try:
-        return int(token)
-    except ValueError:
-        pass
-    try:
-        return float(token)
-    except ValueError:
-        return token
-
-
-def _guard_yaml_line(path: Path, raw_line: str) -> str:
-    if "\t" in raw_line:
-        raise ValueError(f"{path}: tabs are forbidden in declarative YAML")
-    line = raw_line.split("#", 1)[0].rstrip()
-    if "${" in line or "{{" in line:
-        raise ValueError(f"{path}: templating/env interpolation is forbidden: {raw_line}")
-    return line
-
-
-def parse_declarative_yaml(path: Path) -> dict[str, object]:
-    """Parse flat YAML while rejecting duplicate keys, templating, tabs, and anchors."""
-    data: dict[str, object] = {}
-    active_list_key: str | None = None
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = _guard_yaml_line(path, raw_line)
-        if not line.strip():
-            continue
-        stripped = line.lstrip()
-        if stripped.startswith(("&", "*")):
-            raise ValueError(f"{path}: YAML anchors/aliases are forbidden")
-        if stripped.startswith("- "):
-            if active_list_key is None:
-                raise ValueError(f"{path}: orphan list item: {raw_line}")
-            items = data[active_list_key]
-            if not isinstance(items, list):
-                raise ValueError(f"{path}: invalid list target: {active_list_key}")
-            items.append(_coerce_scalar(stripped[2:].strip()))
-            continue
-        active_list_key = None
-        key, sep, rest = line.partition(":")
-        if not sep:
-            raise ValueError(f"{path}: invalid mapping line: {raw_line}")
-        k, v = key.strip(), rest.strip()
-        if k in data:
-            raise ValueError(f"{path}: duplicate YAML key '{k}'")
-        if not v:
-            data[k] = []
-            active_list_key = k
-        elif v.startswith("[") and v.endswith("]"):
-            inner = v[1:-1].strip()
-            data[k] = (
-                [_coerce_scalar(part.strip()) for part in inner.split(",")] if inner else []
-            )
-        else:
-            data[k] = _coerce_scalar(v)
-    return data
-
-
-def _load_bundle(config_root: Path, product_id: str) -> LoadedBundle:
-    p_path = config_root / "products" / f"{product_id}.yaml"
-    product = parse_product_spec(parse_declarative_yaml(p_path))
-    d_path = config_root / "profiles" / "domains" / f"{product.domain_profile}.yaml"
-    s_path = config_root / "profiles" / "science" / f"{product.science_profile}.yaml"
-    src1_path = config_root / "profiles" / "sources" / f"{product.primary_source_profile}.yaml"
-    src2_path = (
-        config_root / "profiles" / "sources" / f"{product.candidate_source_profile}.yaml"
-    )
-    o_path = config_root / "profiles" / "outputs" / f"{product.output_profile}.yaml"
-
-    hasher = hashlib.sha256()
-    for path in (p_path, d_path, s_path, src1_path, src2_path, o_path):
-        hasher.update(path.read_bytes())
-
-    return LoadedBundle(
-        product=product,
-        domain=parse_domain_profile(parse_declarative_yaml(d_path)),
-        science=parse_science_profile(parse_declarative_yaml(s_path)),
-        primary_source=parse_forcing_profile(parse_declarative_yaml(src1_path)),
-        candidate_source=parse_forcing_profile(parse_declarative_yaml(src2_path)),
-        output=parse_output_profile(parse_declarative_yaml(o_path)),
-        config_sha256=hasher.hexdigest(),
-    )
-
-
-def _validate_bundle(b: LoadedBundle) -> tuple[int, int, tuple[int, ...]]:
-    remaining_floor = validate_horizon_policy(b.product, b.primary_source, b.output)
-    if not b.candidate_source.fail_closed:
-        raise ValueError("Candidate ForcingProfile must enforce fail_closed=True")
-    bl_counts = [
-        validate_vertical_column(
-            estimate_auto_levels_agl_m(b.domain, elev_m, etac=b.science.etac), b.domain
-        )
-        for elev_m in (ARARAT_VALLEY_M, MOUNT_ARAGATS_PEAK_M, MOUNT_ARARAT_PEAK_M)
-    ]
-    leads = selected_lead_hours(b.output)
-    return remaining_floor, min(bl_counts), leads
+from av_wrf.runner.bundle import LoadedBundle, load_bundle, validate_bundle
+from av_wrf.runner.store import ObjectStore, json_bytes, run_lock_key
 
 
 def check_product_config(config_root: Path, product_id: str) -> ProductCheckSummary:
     """Load, cross-reference, and validate a product, vertical stretch, and Zarr v3 store."""
-    b = _load_bundle(config_root, product_id)
-    remaining_floor, bl_levels, leads = _validate_bundle(b)
-    namelist = compile_wrf_namelist_sections(b.domain, b.science)
+    b = load_bundle(config_root, product_id)
+    remaining_floor, bl_levels, leads = validate_bundle(b)
+    namelist = compile_wrf_namelist_sections(b.domain, b.science, b.primary_source)
     store_docs = build_zarr_v3_store_metadata(b.domain, b.output, leads)
     root_fmt = store_docs["zarr.json"]["zarr_format"]
     x0_m, y0_m = published_grid_origin_xy_m(b.domain)
@@ -183,6 +51,26 @@ def check_product_config(config_root: Path, product_id: str) -> ProductCheckSumm
     )
 
 
+def check_all_products(config_root: Path) -> tuple[ProductCheckSummary, ...]:
+    """Discover and validate all configured product YAMLs under config_root/products."""
+    product_files = sorted((config_root / "products").glob("*.yaml"))
+    if not product_files:
+        raise FileNotFoundError(f"No product YAML files found under {config_root / 'products'}")
+    return tuple(check_product_config(config_root, p.stem) for p in product_files)
+
+
+def resolve_cli_cycle(
+    config_root: Path,
+    product_id: str,
+    raw_cycle: str,
+    *,
+    bundle: LoadedBundle | None = None,
+) -> tuple[str, str]:
+    """Resolve raw CLI --cycle string into (publish_origin_utc, cycle_partition)."""
+    b = load_bundle(config_root, product_id) if bundle is None else bundle
+    return parse_cycle_arg(raw_cycle, b.product)
+
+
 def plan_product_cycle(
     config_root: Path,
     store: ObjectStore,
@@ -193,13 +81,14 @@ def plan_product_cycle(
     mpi_ranks: int,
     build_manifest: BuildManifest,
     geog_bundle_sha256: str = "pending-geog-preflight",
+    bundle: LoadedBundle | None = None,
 ) -> tuple[str, RunLock]:
     """Resolve a cycle into an immutable RunLock and persist run.lock.json exclusively."""
     if not attempt_id.strip():
         raise ValueError("attempt_id must be non-empty")
-    b = _load_bundle(config_root, product_id)
-    _validate_bundle(b)
-    compile_wrf_namelist_sections(b.domain, b.science)
+    b = load_bundle(config_root, product_id) if bundle is None else bundle
+    validate_bundle(b)
+    compile_wrf_namelist_sections(b.domain, b.science, b.primary_source)
     window = resolve_cycle_window(b.product, b.output, publish_origin_utc)
     lock = RunLock(
         product_id=b.product.product_id,
@@ -221,12 +110,71 @@ def plan_product_cycle(
         mpi_ranks=mpi_ranks,
     )
     verify_run_lock_timestamps(lock)
-    key = (
-        f"runs/{lock.product_id}/{lock.cycle_partition}"
-        f"/attempts/{lock.attempt_id}/run.lock.json"
-    )
-    payload = (json.dumps(dataclasses.asdict(lock), indent=2, sort_keys=True) + "\n").encode(
-        "utf-8"
-    )
-    store.put_if_absent(key, payload)
+    key = run_lock_key(lock.product_id, lock.cycle_partition, lock.attempt_id)
+    store.put_if_absent(key, json_bytes(lock.to_doc()))
     return key, lock
+
+
+def load_run_lock(
+    store: ObjectStore, product_id: str, cycle_partition: str, attempt_id: str
+) -> RunLock:
+    """Read and deserialize an immutable RunLock from ObjectStore."""
+    raw_bytes = store.get_bytes(run_lock_key(product_id, cycle_partition, attempt_id))
+    if raw_bytes is None:
+        raise FileNotFoundError(
+            f"Missing run.lock.json for {product_id} {cycle_partition} ({attempt_id})"
+        )
+    doc = json.loads(raw_bytes.decode("utf-8"))
+    if not isinstance(doc, dict):
+        raise ValueError("Expected JSON object in run.lock.json")
+    lock = RunLock.from_doc(doc)
+    verify_run_lock_timestamps(lock)
+    return lock
+
+
+def prep_cycle_namelists(
+    config_root: Path,
+    store: ObjectStore,
+    *,
+    product_id: str,
+    cycle_partition: str,
+    attempt_id: str,
+    work_dir: Path,
+    bundle: LoadedBundle | None = None,
+    lock: RunLock | None = None,
+) -> tuple[Path, Path]:
+    """Verify RunLock and write namelist.wps, namelist.input, and forcing_subset.json."""
+    b = load_bundle(config_root, product_id) if bundle is None else bundle
+    lk = load_run_lock(store, product_id, cycle_partition, attempt_id) if lock is None else lock
+    if lk.config_sha256 != b.config_sha256:
+        raise ValueError("Config bundle SHA-256 drifted from frozen RunLock")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    wps_path, wrf_path = work_dir / "namelist.wps", work_dir / "namelist.input"
+    wps_path.write_text(
+        render_fortran_namelist(compile_wps_namelist_sections(b.domain, b.science, lk)),
+        encoding="utf-8",
+    )
+    wrf_path.write_text(
+        render_fortran_namelist(
+            compile_wrf_run_namelist(b.domain, b.science, lk, b.primary_source)
+        ),
+        encoding="utf-8",
+    )
+    bbox = list(computational_latlon_bounds(b.domain, snap_deg=b.primary_source.grid_spacing_deg))
+    step_h = max(1, b.science.interval_seconds // 3600)
+    init_offset_h = int(
+        (parse_iso_utc(lk.wrf_init_utc) - parse_iso_utc(lk.forcing_cycle_utc)).total_seconds()
+        // 3600
+    )
+    end_fhr = (
+        (init_offset_h + lk.spinup_hours + max(lk.lead_hours) + step_h - 1) // step_h
+    ) * step_h
+    start_fhr = (init_offset_h // step_h) * step_h
+    subset = {
+        "forcing_profile_id": lk.forcing_profile_id,
+        "forcing_cycle_utc": lk.forcing_cycle_utc,
+        "bbox_wsen_deg": bbox,
+        "forecast_hours": list(range(start_fhr, end_fhr + 1, step_h)),
+    }
+    (work_dir / "forcing_subset.json").write_bytes(json_bytes(subset))
+    return wps_path, wrf_path

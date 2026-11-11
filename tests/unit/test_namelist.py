@@ -1,4 +1,4 @@
-"""Unit tests for av_wrf.core.namelist verifying exhaustive ScienceProfile emission."""
+"""Unit tests for av_wrf.core.namelist verifying ScienceProfile, metgrid levels, and guards."""
 
 from __future__ import annotations
 
@@ -13,15 +13,18 @@ for p in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(p))
 
 from av_wrf.contracts import (  # noqa: E402
+    BuildManifest,
+    RunLock,
     ScienceProfile,
-    parse_domain_profile,
-    parse_science_profile,
 )
 from av_wrf.core import (  # noqa: E402
     NON_NAMELIST_METADATA_FIELDS,
+    compile_wps_namelist_sections,
     compile_wrf_namelist_sections,
+    compile_wrf_run_namelist,
+    render_fortran_namelist,
 )
-from av_wrf.runner import parse_declarative_yaml  # noqa: E402
+from av_wrf.runner import load_bundle  # noqa: E402
 
 PROFILE_TO_NAMELIST_KEY: dict[str, tuple[str, str]] = {
     "interval_seconds": ("time_control", "interval_seconds"),
@@ -72,25 +75,26 @@ PROFILE_TO_NAMELIST_KEY: dict[str, tuple[str, str]] = {
 
 
 class TestNamelist(unittest.TestCase):
-    def test_exhaustive_science_profile_mapping_and_wrf_48_guards(self) -> None:
-        dom = parse_domain_profile(
-            parse_declarative_yaml(
-                ROOT / "config" / "profiles" / "domains" / "armenia-3km-v1.yaml"
-            )
-        )
-        sci = parse_science_profile(
-            parse_declarative_yaml(
-                ROOT / "config" / "profiles" / "science" / "convection-permitting-3km-v1.yaml"
-            )
-        )
+    def test_exhaustive_science_profile_real_exe_fields_and_wrf_48_guards(self) -> None:
+        prod_id = sorted((ROOT / "config" / "products").glob("*.yaml"))[0].stem
+        bundle = load_bundle(ROOT / "config", prod_id)
+        dom, sci, src = bundle.domain, bundle.science, bundle.primary_source
+
         all_fields = {f.name for f in dataclasses.fields(ScienceProfile)}
         self.assertEqual(
             all_fields - NON_NAMELIST_METADATA_FIELDS,
             set(PROFILE_TO_NAMELIST_KEY.keys()),
         )
-        compiled = compile_wrf_namelist_sections(dom, sci)
+        compiled = compile_wrf_namelist_sections(dom, sci, src)
         for attr, (sec, key) in PROFILE_TO_NAMELIST_KEY.items():
             self.assertEqual(compiled[sec][key], getattr(sci, attr))
+        self.assertEqual(compiled["time_control"]["frames_per_outfile"], 1)
+        self.assertEqual(compiled["domains"]["max_dom"], 1)
+        self.assertEqual(compiled["domains"]["parent_id"], 0)
+        self.assertEqual(compiled["domains"]["num_metgrid_levels"], src.pressure_level_count)
+        self.assertEqual(
+            compiled["domains"]["num_metgrid_soil_levels"], len(src.soil_layer_centers_cm)
+        )
 
         for bad in (
             dataclasses.replace(sci, opt_runsrf=5),
@@ -101,7 +105,40 @@ class TestNamelist(unittest.TestCase):
             dataclasses.replace(sci, base_temp_k=100.0),
         ):
             with self.assertRaises(ValueError):
-                compile_wrf_namelist_sections(dom, bad)
+                compile_wrf_namelist_sections(dom, bad, src)
+
+        # 100 staggered columns = 99 mass columns (< 100 mass-cell domain floor)
+        with self.assertRaises(ValueError):
+            compile_wrf_namelist_sections(dataclasses.replace(dom, e_we=100), sci, src)
+
+        lock = RunLock(
+            product_id="wrf-synth-3km",
+            model_id="wrf-synth-3km",
+            cycle_partition="20261112/00",
+            attempt_id="att-01",
+            forcing_cycle_utc="2026-11-11T18:00:00Z",
+            wrf_init_utc="2026-11-11T18:00:00Z",
+            publish_origin_utc="2026-11-12T00:00:00Z",
+            spinup_hours=6,
+            lead_hours=(1, 2, 48),
+            forcing_profile_id=src.profile_id,
+            domain_profile_id=dom.profile_id,
+            science_profile_id=sci.profile_id,
+            output_profile_id=bundle.output.profile_id,
+            config_sha256="abc",
+            geog_bundle_sha256="def",
+            build_manifest=BuildManifest("sha256:1", "w", "p", (), "gf", "mpi"),
+            mpi_ranks=4,
+        )
+        wps_txt = render_fortran_namelist(compile_wps_namelist_sections(dom, sci, lock))
+        wrf_txt = render_fortran_namelist(compile_wrf_run_namelist(dom, sci, lock, src))
+        self.assertIn("geog_data_path = '/opt/av-wrf/geog',", wps_txt)
+        self.assertIn("map_proj = 'lambert',", wps_txt)
+        self.assertIn("run_hours = 54,", wrf_txt)
+        self.assertIn("history_begin_h = 6,", wrf_txt)
+        self.assertIn("frames_per_outfile = 1,", wrf_txt)
+        self.assertIn(f"num_metgrid_levels = {src.pressure_level_count},", wrf_txt)
+        self.assertIn("gwd_if_nonhyd = .false.,", wrf_txt)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Unit tests for av_wrf.core.post stateful post_frame across f000, restart, and 3h tail."""
+"""Unit tests for av_wrf.core.post stateful post_frame and full-domain column/CFL gates."""
 
 from __future__ import annotations
 
@@ -13,23 +13,24 @@ for p in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(p))
 
 from av_wrf.contracts import (  # noqa: E402
+    WRF_ZARR_V3_FIELD_NAMES,
+    CompBucket2D,
     CompMass2D,
     CompMass3D,
     CompStagX3D,
     CompStagY3D,
     CompStagZ3D,
     Slab2DF32,
+    Slab2DI32,
     Slab3DF32,
-    WRF_ZARR_V3_FIELD_NAMES,
-    parse_domain_profile,
-    parse_science_profile,
 )
 from av_wrf.core import (  # noqa: E402
     RawWrfStepInput,
     build_accum_baseline,
     post_frame,
+    validate_frame_columns,
 )
-from av_wrf.runner import parse_declarative_yaml  # noqa: E402
+from av_wrf.runner import load_bundle  # noqa: E402
 
 
 def _synthetic_step(
@@ -43,20 +44,22 @@ def _synthetic_step(
     i_achfx: int,
     rainnc: float,
     i_rainnc: int,
+    dz_face_m: float = 150.0,
 ) -> RawWrfStepInput:
     n2 = ny * nx
 
     def c2(val: float) -> CompMass2D:
         return CompMass2D(Slab2DF32.from_values(ny, nx, [val] * n2))
 
+    def ci(val: int) -> CompBucket2D:
+        return CompBucket2D(Slab2DI32.from_values(ny, nx, [val] * n2))
+
     def c3(val: float) -> CompMass3D:
         return CompMass3D(Slab3DF32.from_values(nz, ny, nx, [val] * (nz * n2)))
 
-    def sz(val: float) -> CompStagZ3D:
-        vals = [val * (k + 1) for k in range(nz + 1) for _ in range(n2)]
-        return CompStagZ3D(Slab3DF32.from_values(nz + 1, ny, nx, vals))
-
-    pub_cells = (ny - 2) * (nx - 2)
+    ph_vals = [0.0] * ((nz + 1) * n2)
+    phb_vals = [(1200.0 + dz_face_m * k) * 9.81 for k in range(nz + 1) for _ in range(n2)]
+    w_vals = [0.2 * (k + 1) for k in range(nz + 1) for _ in range(n2)]
     u_buf = [8.0] * (nz * ny * (nx + 1))
     v_buf = [2.0] * (nz * (ny + 1) * nx)
     return RawWrfStepInput(
@@ -75,45 +78,40 @@ def _synthetic_step(
         pblh_m=c2(1800.0),
         afwa_cape_jkg=c2(420.0),
         achfx_j_m2=c2(achfx),
-        i_achfx=(i_achfx,) * pub_cells,
+        i_achfx=ci(i_achfx),
         aclhf_j_m2=c2(achfx * 0.5),
-        i_aclhf=(0,) * pub_cells,
+        i_aclhf=ci(0),
         rainc_mm=c2(0.0),
-        i_rainc=(0,) * pub_cells,
+        i_rainc=ci(0),
         rainnc_mm=c2(rainnc),
-        i_rainnc=(i_rainnc,) * pub_cells,
+        i_rainnc=ci(i_rainnc),
         p_pert_pa=c3(500.0),
         pb_pa=c3(80_000.0),
-        ph_stag_m2s2=sz(100.0),
-        phb_stag_m2s2=sz(2000.0),
+        ph_stag_m2s2=CompStagZ3D(Slab3DF32.from_values(nz + 1, ny, nx, ph_vals)),
+        phb_stag_m2s2=CompStagZ3D(Slab3DF32.from_values(nz + 1, ny, nx, phb_vals)),
         theta_pert_k=c3(12.0),
         qvapor_kgkg=c3(0.006),
         cldfra=c3(0.25),
         u_stag_mps=CompStagX3D(Slab3DF32.from_values(nz, ny, nx + 1, u_buf)),
         v_stag_mps=CompStagY3D(Slab3DF32.from_values(nz, ny + 1, nx, v_buf)),
-        w_stag_mps=sz(0.2),
+        w_stag_mps=CompStagZ3D(Slab3DF32.from_values(nz + 1, ny, nx, w_vals)),
     )
 
 
 class TestPostFrame(unittest.TestCase):
-    def test_post_frame_f000_baseline_restart_and_1h_to_3h_tail(self) -> None:
+    def test_post_frame_f000_baseline_restart_3h_tail_and_column_gate(self) -> None:
+        prod_id = sorted((ROOT / "config" / "products").glob("*.yaml"))[0].stem
+        bundle = load_bundle(ROOT / "config", prod_id)
         dom = dataclasses.replace(
-            parse_domain_profile(
-                parse_declarative_yaml(
-                    ROOT / "config" / "profiles" / "domains" / "armenia-3km-v1.yaml"
-                )
-            ),
+            bundle.domain,
             e_we=6,
             e_sn=5,
             bdy_trim_cells=1,
             e_vert=5,
             exported_levels_k=3,
+            min_bl_levels_2km_agl=3,
         )
-        sci = parse_science_profile(
-            parse_declarative_yaml(
-                ROOT / "config" / "profiles" / "science" / "convection-permitting-3km-v1.yaml"
-            )
-        )
+        sci = bundle.science
         f000 = _synthetic_step(
             1_000_000,
             "2026-11-12T00:00:00Z",
@@ -126,6 +124,7 @@ class TestPostFrame(unittest.TestCase):
             i_rainnc=0,
         )
         base0 = build_accum_baseline(f000, trim=1)
+        self.assertEqual((base0.i_achfx.ny, base0.i_achfx.nx), (2, 3))
 
         f001 = _synthetic_step(
             1_003_600,
@@ -139,8 +138,9 @@ class TestPostFrame(unittest.TestCase):
             i_rainnc=1,
         )
         out1, base1 = post_frame(base0, f001, dom, sci)
-        exported = set(out1.fields_2d) | set(out1.fields_3d)
-        self.assertEqual(exported, set(WRF_ZARR_V3_FIELD_NAMES))
+        self.assertEqual(set(out1.fields_2d) | set(out1.fields_3d), set(WRF_ZARR_V3_FIELD_NAMES))
+        self.assertGreater(validate_frame_columns(out1, dom), 0.0)
+        self.assertEqual(out1.min_bl_levels_2km, 3)
         self.assertAlmostEqual(
             out1.fields_2d["sensible_heat_flux_wm2"].at(0, 0), 20_000.0, delta=2.0
         )
@@ -160,10 +160,20 @@ class TestPostFrame(unittest.TestCase):
         )
         out4, _ = post_frame(base1, f004, dom, sci)
         self.assertEqual(out4.window_end_unix_s - out4.window_start_unix_s, 10_800)
-        self.assertAlmostEqual(
-            out4.fields_2d["sensible_heat_flux_wm2"].at(0, 0), -33.33, delta=0.5
-        )
+        self.assertAlmostEqual(out4.fields_2d["sensible_heat_flux_wm2"].at(0, 0), -33.33, delta=0.5)
         self.assertAlmostEqual(out4.fields_2d["precip_mm_hr"].at(0, 0), 3.0, places=2)
+
+        # Single interior cell spike (> 1000 m midpoint gap) caught without stride sampling
+        bad_phb = list(f001.phb_stag_m2s2.buf)
+        interior_cell = 2 * 5 + 3  # j=2, i=3 inside cropped Published Grid
+        bad_phb[2 * 20 + interior_cell] += 2_200.0 * 9.81
+        bad_phb[3 * 20 + interior_cell] += 2_200.0 * 9.81
+        bad_step = dataclasses.replace(
+            f001, phb_stag_m2s2=CompStagZ3D(Slab3DF32.from_values(5, 4, 5, bad_phb))
+        )
+        bad_frame, _ = post_frame(base0, bad_step, dom, sci)
+        with self.assertRaises(ValueError):
+            validate_frame_columns(bad_frame, dom)
 
 
 if __name__ == "__main__":

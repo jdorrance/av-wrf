@@ -1,0 +1,13 @@
+# Single-day daylight Zarr v3 output profile (01Z..16Z = 05:00..20:00 Asia/Yerevan).
+# `inner_chunk_yx: [42, 42]` tiles the `84 x 84` published `armenia-pilot-3km-v1` grid into
+# an exact `2 x 2` chunk grid with zero boundary padding.
+# References:
+# - Zarr v3 sharding_indexed (ZEP-0002): https://zarr.dev/zeps/accepted/ZEP0002.html
+profile_id: wrf-zarr-v3-16h
+schema_id: wrf-zarr-v3
+map_end_hour: 16
+hourly_through_hour: 16
+tail_step_hours: 1
+shard_time_steps: 1
+inner_chunk_yx: [42, 42]
+zstd_level: 3

@@ -43,9 +43,7 @@ def write_manifest_lock(repo_root: Path) -> Path:
         "locked_prefixes": list(LOCKED_PREFIXES),
         "files": compute_locked_digests(repo_root),
     }
-    lock_path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    lock_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return lock_path
 
 

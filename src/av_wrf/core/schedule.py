@@ -1,4 +1,4 @@
-"""Pure lead-hour selection, cron arrival buffer, remaining-horizon, and cycle-window math.
+"""Pure lead-hour selection, UTC/partition parsing, remaining-horizon, and cycle-window math.
 
 References:
 - Consumer horizon & lead rules: windy-av-layer/packages/contracts/src/products.ts
@@ -7,9 +7,17 @@ References:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
-from av_wrf.contracts import CycleWindow, ForcingProfile, OutputProfile, ProductSpec, RunLock
+from av_wrf.contracts import (
+    CycleWindow,
+    ForcingProfile,
+    OutputProfile,
+    ProductSpec,
+    RunLock,
+    format_iso_utc,
+    parse_iso_utc,
+)
 
 MIN_SPINUP_HOURS = 6
 MIN_CRON_ARRIVAL_BUFFER_HOURS = 0.25
@@ -81,15 +89,37 @@ def validate_horizon_policy(
     return remaining_floor
 
 
-def _parse_iso_utc(iso_str: str) -> datetime:
-    cleaned = iso_str.strip()
-    if cleaned.endswith("Z"):
-        cleaned = cleaned[:-1] + "+00:00"
-    return datetime.fromisoformat(cleaned).astimezone(timezone.utc)
-
-
-def _format_iso_utc(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def parse_cycle_arg(raw_cycle: str, product: ProductSpec) -> tuple[str, str]:
+    """Normalize a strict ISO UTC timestamp or YYYYMMDD/HH partition into (iso_utc, partition)."""
+    token = raw_cycle.strip()
+    if "/" in token and "T" not in token:
+        date_part, sep, hour_part = token.partition("/")
+        if not (
+            sep == "/"
+            and len(date_part) == 8
+            and date_part.isdigit()
+            and len(hour_part) == 2
+            and hour_part.isdigit()
+        ):
+            raise ValueError(f"Invalid cycle partition '{raw_cycle}'; expected YYYYMMDD/HH")
+        dt = datetime(
+            int(date_part[:4]),
+            int(date_part[4:6]),
+            int(date_part[6:8]),
+            int(hour_part),
+            0,
+            0,
+            tzinfo=UTC,
+        )
+    else:
+        dt = parse_iso_utc(token)
+        if dt.minute != 0 or dt.second != 0 or dt.microsecond != 0:
+            raise ValueError("Cycle origin must align to an exact UTC hour")
+    if dt.hour != product.publish_origin_hour_utc:
+        raise ValueError(
+            f"Origin hour {dt.hour:02d}Z != configured {product.publish_origin_hour_utc:02d}Z"
+        )
+    return format_iso_utc(dt), dt.strftime("%Y%m%d/%H")
 
 
 def resolve_cycle_window(
@@ -98,13 +128,9 @@ def resolve_cycle_window(
     publish_origin_iso_utc: str,
 ) -> CycleWindow:
     """Resolve forcing, WRF spin-up init, publish origin, and trailing windows in UTC."""
-    origin_dt = _parse_iso_utc(publish_origin_iso_utc)
-    if origin_dt.minute != 0 or origin_dt.second != 0:
-        raise ValueError("publish_origin_iso_utc must align to an exact UTC hour")
-    cfg_h = product.publish_origin_hour_utc
-    if origin_dt.hour != cfg_h:
-        raise ValueError(f"Origin hour {origin_dt.hour:02d}Z != configured {cfg_h:02d}Z")
-    origin_gap_h = (cfg_h - product.forcing_cycle_hour_utc) % 24
+    origin_iso, partition = parse_cycle_arg(publish_origin_iso_utc, product)
+    origin_dt = parse_iso_utc(origin_iso)
+    origin_gap_h = (origin_dt.hour - product.forcing_cycle_hour_utc) % 24
     forcing_dt = origin_dt - timedelta(hours=origin_gap_h)
     wrf_init_dt = origin_dt - timedelta(hours=product.spinup_hours)
     leads = selected_lead_hours(output)
@@ -112,14 +138,14 @@ def resolve_cycle_window(
     window_starts: list[str] = []
     prev_h = 0
     for h in leads:
-        valid_times.append(_format_iso_utc(origin_dt + timedelta(hours=h)))
-        window_starts.append(_format_iso_utc(origin_dt + timedelta(hours=prev_h)))
+        valid_times.append(format_iso_utc(origin_dt + timedelta(hours=h)))
+        window_starts.append(format_iso_utc(origin_dt + timedelta(hours=prev_h)))
         prev_h = h
     return CycleWindow(
-        forcing_cycle_utc=_format_iso_utc(forcing_dt),
-        wrf_init_utc=_format_iso_utc(wrf_init_dt),
-        publish_origin_utc=_format_iso_utc(origin_dt),
-        cycle_partition=origin_dt.strftime("%Y%m%d/%H"),
+        forcing_cycle_utc=format_iso_utc(forcing_dt),
+        wrf_init_utc=format_iso_utc(wrf_init_dt),
+        publish_origin_utc=origin_iso,
+        cycle_partition=partition,
         lead_hours=leads,
         valid_times_utc=tuple(valid_times),
         window_starts_utc=tuple(window_starts),
@@ -128,9 +154,9 @@ def resolve_cycle_window(
 
 def verify_run_lock_timestamps(lock: RunLock) -> None:
     """Enforce wrf_init + spinup == publish_origin and forcing_cycle <= wrf_init."""
-    forcing_dt = _parse_iso_utc(lock.forcing_cycle_utc)
-    init_dt = _parse_iso_utc(lock.wrf_init_utc)
-    origin_dt = _parse_iso_utc(lock.publish_origin_utc)
+    forcing_dt = parse_iso_utc(lock.forcing_cycle_utc)
+    init_dt = parse_iso_utc(lock.wrf_init_utc)
+    origin_dt = parse_iso_utc(lock.publish_origin_utc)
     if init_dt < forcing_dt:
         raise ValueError("wrf_init_utc precedes forcing_cycle_utc")
     if init_dt + timedelta(hours=lock.spinup_hours) != origin_dt:

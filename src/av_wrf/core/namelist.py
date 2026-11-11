@@ -1,4 +1,4 @@
-"""Pure WRF v4.8 / WPS v4.7 namelist validation and exhaustive compilation.
+"""Pure WRF v4.8 / WPS v4.7 namelist validation, compilation, and Fortran rendering.
 
 Assumptions & Solver Physics Guardrails:
 1. Map-projected RK3 CFL constraint (`Skamarock et al. 2019 NCAR/TN-556+STR Sec. 3.3.4`):
@@ -24,9 +24,19 @@ References:
 from __future__ import annotations
 
 import math
+from datetime import timedelta
 
-from av_wrf.contracts import DomainProfile, ScienceProfile
-from av_wrf.core.grid import lambert_map_scale
+from av_wrf.contracts import (
+    DomainProfile,
+    ForcingProfile,
+    RunLock,
+    ScienceProfile,
+    parse_iso_utc,
+)
+from av_wrf.core.grid import lambert_map_scale, validate_domain_profile
+
+NamelistScalar = int | float | str | bool
+NamelistSections = dict[str, dict[str, NamelistScalar]]
 
 NON_NAMELIST_METADATA_FIELDS: frozenset[str] = frozenset(
     {"profile_id", "wrf_version", "wps_version"}
@@ -55,7 +65,8 @@ def _max_domain_map_scale(domain: DomainProfile) -> float:
 
 
 def validate_science_profile(science: ScienceProfile, domain: DomainProfile) -> None:
-    """Enforce WRF v4.8 physics, base_temp, accumulator, physical CFL, and sponge invariants."""
+    """Enforce domain sizing policy and WRF v4.8 physics, CFL, and sponge invariants."""
+    validate_domain_profile(domain)
     if science.sf_surface_physics == 4 and science.opt_runsrf == 5:
         raise ValueError("WRF v4.8 Noah-MP forbids opt_runsrf=5 due to runtime/restart bug")
     if science.gwd_opt == 1 and science.gwd_if_nonhyd:
@@ -87,28 +98,42 @@ def _physics_and_dynamics_sections(
 ) -> dict[str, dict[str, int | float | bool]]:
     return {
         "physics": {
-            "mp_physics": science.mp_physics, "cu_physics": science.cu_physics,
-            "ra_lw_physics": science.ra_lw_physics, "ra_sw_physics": science.ra_sw_physics,
-            "radt": science.radt_min, "slope_rad": science.slope_rad,
-            "topo_shading": science.topo_shading, "shadlen": science.shadlen_m,
+            "mp_physics": science.mp_physics,
+            "cu_physics": science.cu_physics,
+            "ra_lw_physics": science.ra_lw_physics,
+            "ra_sw_physics": science.ra_sw_physics,
+            "radt": science.radt_min,
+            "slope_rad": science.slope_rad,
+            "topo_shading": science.topo_shading,
+            "shadlen": science.shadlen_m,
             "sf_sfclay_physics": science.sf_sfclay_physics,
             "sf_surface_physics": science.sf_surface_physics,
-            "bl_pbl_physics": science.bl_pbl_physics, "topo_wind": science.topo_wind,
+            "bl_pbl_physics": science.bl_pbl_physics,
+            "topo_wind": science.topo_wind,
             "ysu_topdown_pblmix": science.ysu_topdown_pblmix,
             "shinhong_scu_mixing": science.shinhong_scu_mixing,
             "shinhong_nonlocal_flux": science.shinhong_nonlocal_flux,
             "nwp_diagnostics": science.nwp_diagnostics,
-            "bucket_mm": science.bucket_mm, "bucket_J": science.bucket_j,
+            "bucket_mm": science.bucket_mm,
+            "bucket_J": science.bucket_j,
         },
         "noah_mp": {"opt_runsrf": science.opt_runsrf, "opt_runsub": science.opt_runsub},
         "dynamics": {
-            "use_theta_m": science.use_theta_m, "base_temp": science.base_temp_k,
-            "hybrid_opt": science.hybrid_opt, "etac": science.etac,
-            "diff_opt": science.diff_opt, "km_opt": science.km_opt,
-            "diff_6th_opt": science.diff_6th_opt, "diff_6th_factor": science.diff_6th_factor,
-            "epssm": science.epssm, "w_damping": science.w_damping,
-            "damp_opt": science.damp_opt, "zdamp": science.zdamp_m, "dampcoef": science.dampcoef,
-            "gwd_opt": science.gwd_opt, "gwd_if_nonhyd": science.gwd_if_nonhyd,
+            "use_theta_m": science.use_theta_m,
+            "base_temp": science.base_temp_k,
+            "hybrid_opt": science.hybrid_opt,
+            "etac": science.etac,
+            "diff_opt": science.diff_opt,
+            "km_opt": science.km_opt,
+            "diff_6th_opt": science.diff_6th_opt,
+            "diff_6th_factor": science.diff_6th_factor,
+            "epssm": science.epssm,
+            "w_damping": science.w_damping,
+            "damp_opt": science.damp_opt,
+            "zdamp": science.zdamp_m,
+            "dampcoef": science.dampcoef,
+            "gwd_opt": science.gwd_opt,
+            "gwd_if_nonhyd": science.gwd_if_nonhyd,
         },
         "afwa": {
             "afwa_diag_opt": science.afwa_diag_opt,
@@ -120,21 +145,43 @@ def _physics_and_dynamics_sections(
 def compile_wrf_namelist_sections(
     domain: DomainProfile,
     science: ScienceProfile,
+    forcing: ForcingProfile,
 ) -> dict[str, dict[str, int | float | bool]]:
-    """Compile validated domain and science profiles into exact WRF namelist sections."""
+    """Compile validated domain, science, and forcing profiles into WRF namelist sections."""
     validate_science_profile(science, domain)
-    sections: dict[str, dict[str, int | float | bool]] = {
+    metgrid_levels = forcing.pressure_level_count
+    soil_levels = len(forcing.soil_layer_centers_cm)
+    return {
         "time_control": {
             "interval_seconds": science.interval_seconds,
             "history_interval": science.history_interval_min,
+            "frames_per_outfile": 1,
             "prec_acc_dt": science.prec_acc_dt_min,
         },
         "domains": {
-            "time_step": science.time_step_s, "e_we": domain.e_we, "e_sn": domain.e_sn,
-            "e_vert": domain.e_vert, "dx": domain.dx_m, "dy": domain.dy_m,
-            "p_top_requested": domain.p_top_pa, "auto_levels_opt": domain.auto_levels_opt,
-            "dzbot": domain.dzbot_m, "dzstretch_s": domain.dzstretch_s,
-            "dzstretch_u": domain.dzstretch_u, "max_dz": domain.max_dz_m,
+            "time_step": science.time_step_s,
+            "max_dom": 1,
+            "e_we": domain.e_we,
+            "e_sn": domain.e_sn,
+            "e_vert": domain.e_vert,
+            "num_metgrid_levels": metgrid_levels,
+            "num_metgrid_soil_levels": soil_levels,
+            "dx": domain.dx_m,
+            "dy": domain.dy_m,
+            "grid_id": 1,
+            "parent_id": 0,
+            "i_parent_start": 1,
+            "j_parent_start": 1,
+            "parent_grid_ratio": 1,
+            "parent_time_step_ratio": 1,
+            "feedback": 0,
+            "smooth_option": 0,
+            "p_top_requested": domain.p_top_pa,
+            "auto_levels_opt": domain.auto_levels_opt,
+            "dzbot": domain.dzbot_m,
+            "dzstretch_s": domain.dzstretch_s,
+            "dzstretch_u": domain.dzstretch_u,
+            "max_dz": domain.max_dz_m,
         },
         **_physics_and_dynamics_sections(science),
         "bdy_control": {
@@ -143,4 +190,110 @@ def compile_wrf_namelist_sections(
             "relax_zone": science.relax_zone,
         },
     }
-    return sections
+
+
+def compile_wps_namelist_sections(
+    domain: DomainProfile,
+    science: ScienceProfile,
+    lock: RunLock,
+) -> NamelistSections:
+    """Compile WPS v4.7 namelist.wps sections bounded to RunLock integration window."""
+    start_dt = parse_iso_utc(lock.wrf_init_utc)
+    total_hours = lock.spinup_hours + max(lock.lead_hours)
+    end_dt = start_dt + timedelta(hours=total_hours)
+    fmt = "%Y-%m-%d_%H:%M:%S"
+    geog_res = (
+        domain.dem_source
+        if domain.dem_source == domain.landuse_source
+        else f"{domain.dem_source}+{domain.landuse_source}"
+    )
+    return {
+        "share": {
+            "wrf_core": "ARW",
+            "max_dom": 1,
+            "start_date": start_dt.strftime(fmt),
+            "end_date": end_dt.strftime(fmt),
+            "interval_seconds": science.interval_seconds,
+            "io_form_geogrid": 2,
+        },
+        "geogrid": {
+            "parent_id": 1,
+            "parent_grid_ratio": 1,
+            "i_parent_start": 1,
+            "j_parent_start": 1,
+            "e_we": domain.e_we,
+            "e_sn": domain.e_sn,
+            "geog_data_res": geog_res,
+            "geog_data_path": domain.geog_data_path,
+            "dx": domain.dx_m,
+            "dy": domain.dy_m,
+            "map_proj": "lambert",
+            "ref_lat": domain.center_lat_deg,
+            "ref_lon": domain.center_lon_deg,
+            "truelat1": domain.std_parallel_1_deg,
+            "truelat2": domain.std_parallel_2_deg,
+            "stand_lon": domain.central_meridian_deg,
+        },
+        "ungrib": {"out_format": "WPS", "prefix": "FILE"},
+        "metgrid": {"fg_name": "FILE", "io_form_metgrid": 2},
+    }
+
+
+def compile_wrf_run_namelist(
+    domain: DomainProfile,
+    science: ScienceProfile,
+    lock: RunLock,
+    forcing: ForcingProfile,
+) -> NamelistSections:
+    """Attach RunLock UTC calendar and history_begin_h onto WRF namelist.input sections."""
+    base = compile_wrf_namelist_sections(domain, science, forcing)
+    start_dt = parse_iso_utc(lock.wrf_init_utc)
+    total_hours = lock.spinup_hours + max(lock.lead_hours)
+    end_dt = start_dt + timedelta(hours=total_hours)
+    tc: dict[str, NamelistScalar] = {
+        "run_days": 0,
+        "run_hours": total_hours,
+        "run_minutes": 0,
+        "run_seconds": 0,
+        "start_year": start_dt.year,
+        "start_month": start_dt.month,
+        "start_day": start_dt.day,
+        "start_hour": start_dt.hour,
+        "end_year": end_dt.year,
+        "end_month": end_dt.month,
+        "end_day": end_dt.day,
+        "end_hour": end_dt.hour,
+        "history_begin_h": lock.spinup_hours,
+        "io_form_history": 2,
+        "io_form_restart": 2,
+        "io_form_input": 2,
+        "io_form_boundary": 2,
+        **base["time_control"],
+    }
+    out: NamelistSections = {"time_control": tc}
+    for sec_name, sec_vals in base.items():
+        if sec_name != "time_control":
+            out[sec_name] = dict(sec_vals)
+    out["bdy_control"]["specified"] = True
+    return out
+
+
+def _format_fortran_literal(val: NamelistScalar) -> str:
+    if isinstance(val, bool):
+        return ".true." if val else ".false."
+    if isinstance(val, str):
+        escaped = val.replace("'", "''")
+        return f"'{escaped}'"
+    return str(val)
+
+
+def render_fortran_namelist(sections: NamelistSections) -> str:
+    """Render namelist dictionary sections into canonical Fortran `&section ... /` text."""
+    lines: list[str] = []
+    for sec_name, mapping in sections.items():
+        lines.append(f"&{sec_name}")
+        for key, val in mapping.items():
+            lines.append(f" {key} = {_format_fortran_literal(val)},")
+        lines.append(" /")
+        lines.append("")
+    return "\n".join(lines)

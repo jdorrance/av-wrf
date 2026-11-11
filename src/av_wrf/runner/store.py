@@ -1,31 +1,83 @@
-"""ObjectStore protocol and flock-serialized atomic local storage implementation."""
+"""ObjectStore protocol, key builders, idempotent writes, hardlink copy, and flock CAS."""
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
+import json
+import os
+import shutil
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlparse
 
 
-def _sha256_hex(payload: bytes) -> str:
+def sha256_hex(payload: bytes) -> str:
+    """Return lowercase SHA-256 hex digest of payload."""
     return hashlib.sha256(payload).hexdigest()
 
 
+def json_bytes(obj: object) -> bytes:
+    """Serialize obj as deterministic sorted-key UTF-8 JSON bytes with trailing newline."""
+    return (json.dumps(obj, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def run_lock_key(product_id: str, cycle_partition: str, attempt_id: str) -> str:
+    """Return canonical ObjectStore key for an attempt's RunLock."""
+    return f"runs/{product_id}/{cycle_partition}/attempts/{attempt_id}/run.lock.json"
+
+
+def post_manifest_key(product_id: str, cycle_partition: str, attempt_id: str) -> str:
+    """Return canonical ObjectStore key for an attempt's staged post manifest."""
+    return f"runs/{product_id}/{cycle_partition}/attempts/{attempt_id}/post_manifest.json"
+
+
+def attempt_stage_prefix(product_id: str, cycle_partition: str, attempt_id: str) -> str:
+    """Return attempt-scoped staging prefix isolated from live upstream cycles."""
+    return f"runs/{product_id}/{cycle_partition}/attempts/{attempt_id}/staged"
+
+
+def published_cycle_prefix(model_id: str, cycle_partition: str) -> str:
+    """Return canonical upstream published cycle prefix."""
+    return f"upstream/{model_id}/{cycle_partition}"
+
+
 class ObjectStore(Protocol):
-    """Minimal immutable-put and compare-and-swap object storage boundary."""
+    """Minimal immutable-put, store-native copy, cleanup, and CAS object storage boundary."""
 
     def get_bytes(self, key: str) -> bytes | None: ...
     def put_if_absent(self, key: str, payload: bytes) -> str: ...
-    def compare_and_swap(
-        self, key: str, payload: bytes, expected_sha256: str | None
-    ) -> str: ...
+    def copy_if_absent(self, src_key: str, dst_key: str, expected_sha256: str) -> str: ...
+    def delete_prefix(self, prefix: str) -> None: ...
+    def compare_and_swap(self, key: str, payload: bytes, expected_sha256: str | None) -> str: ...
+
+
+def put_idempotent(
+    store: ObjectStore,
+    key: str,
+    payload: bytes,
+    *,
+    equiv: Callable[[bytes, bytes], bool] | None = None,
+) -> str:
+    """Write payload if absent; succeed on retry iff existing matches SHA-256 or equiv()."""
+    digest = sha256_hex(payload)
+    try:
+        return store.put_if_absent(key, payload)
+    except FileExistsError:
+        existing = store.get_bytes(key)
+        if existing is not None:
+            if sha256_hex(existing) == digest:
+                return digest
+            if equiv is not None and equiv(existing, payload):
+                return sha256_hex(existing)
+        raise
 
 
 class LocalFileStore:
-    """Filesystem ObjectStore enforcing exclusive puts and flock-serialized CAS."""
+    """Filesystem ObjectStore enforcing exclusive puts, hardlink promotion, and flock CAS."""
 
     def __init__(self, root_dir: Path) -> None:
         self._root = root_dir.resolve()
@@ -52,11 +104,41 @@ class LocalFileStore:
                 handle.write(payload)
         except FileExistsError as exc:
             raise FileExistsError(f"Immutable object already exists: {key}") from exc
-        return _sha256_hex(payload)
+        return sha256_hex(payload)
 
-    def compare_and_swap(
-        self, key: str, payload: bytes, expected_sha256: str | None
-    ) -> str:
+    def copy_if_absent(self, src_key: str, dst_key: str, expected_sha256: str) -> str:
+        src = self._resolve(src_key)
+        dst = self._resolve(dst_key)
+        if dst.is_file():
+            if sha256_hex(dst.read_bytes()) == expected_sha256:
+                return expected_sha256
+            raise FileExistsError(f"Immutable destination differs from expected SHA-256: {dst_key}")
+        if not src.is_file():
+            raise FileNotFoundError(f"Missing staged source object: {src_key}")
+        if sha256_hex(src.read_bytes()) != expected_sha256:
+            raise ValueError(f"Staged source SHA-256 mismatch on {src_key}")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(src, dst)
+        except FileExistsError:
+            if sha256_hex(dst.read_bytes()) != expected_sha256:
+                raise
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            tmp = dst.parent / f".{dst.name}.{uuid.uuid4().hex}.tmp"
+            shutil.copy2(src, tmp)
+            tmp.replace(dst)
+        return expected_sha256
+
+    def delete_prefix(self, prefix: str) -> None:
+        target = self._resolve(prefix)
+        if target.is_dir():
+            shutil.rmtree(target)
+        elif target.is_file():
+            target.unlink()
+
+    def compare_and_swap(self, key: str, payload: bytes, expected_sha256: str | None) -> str:
         path = self._resolve(key)
         path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = path.parent / f".{path.name}.cas.lock"
@@ -64,7 +146,7 @@ class LocalFileStore:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
             try:
                 current = path.read_bytes() if path.is_file() else None
-                actual = _sha256_hex(current) if current is not None else None
+                actual = sha256_hex(current) if current is not None else None
                 if actual != expected_sha256:
                     raise RuntimeError(
                         f"CAS conflict on {key}: expected {expected_sha256}, found {actual}"
@@ -74,7 +156,7 @@ class LocalFileStore:
                 tmp.replace(path)
             finally:
                 fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-        return _sha256_hex(payload)
+        return sha256_hex(payload)
 
 
 def open_store(store_uri: str) -> ObjectStore:

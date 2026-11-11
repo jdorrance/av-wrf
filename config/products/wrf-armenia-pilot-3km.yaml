@@ -1,0 +1,19 @@
+# Fast local-build Central Armenia 3 km pilot product (~8.4x less solver compute than 48h full).
+# Integrates 6 h nocturnal spin-up (18Z->00Z) + 16 h daylight window (01Z..16Z = 05:00..20:00 AMT)
+# on a 101x101x51 grid using the identical frozen `convection-permitting-3km-v1` physics suite.
+product_id: wrf-armenia-pilot-3km
+model_id: wrf-armenia-pilot-3km
+label: WRF Armenia Pilot 3 km
+region_tz: Asia/Yerevan
+domain_profile: armenia-pilot-3km-v1
+science_profile: convection-permitting-3km-v1
+primary_source_profile: noaa-gfs-0p25-v1
+candidate_source_profile: ecmwf-ifs-0p1-v1
+output_profile: wrf-zarr-v3-16h
+spinup_hours: 6
+forcing_cycle_hour_utc: 18
+publish_origin_hour_utc: 0
+local_deadline_hhmm: "08:30"
+min_horizon_hours: 10
+max_cycle_age_hours: 6
+schedule_cron_utc: "15 23 * * *"

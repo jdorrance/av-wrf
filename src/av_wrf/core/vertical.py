@@ -1,4 +1,4 @@
-"""Vertical auto_levels_opt=2 + hybrid_opt=2 column estimation and high-terrain BL checks.
+"""Vertical auto_levels_opt=2 + hybrid_opt=2 column estimation, BL, gap, and CFL gates.
 
 Assumptions & High-Mountain Coordinate Math (Skamarock et al. 2019 NCAR/TN-556+STR):
 1. `real.exe` (`auto_levels_opt=2`) stretches full levels `znw` (`eta in [1, 0]`) in dry
@@ -8,13 +8,14 @@ Assumptions & High-Mountain Coordinate Math (Skamarock et al. 2019 NCAR/TN-556+S
 2. Over elevated terrain (`terrain_m > 0`), `hybrid_opt = 2` (`etac`, Eqs. 2.2-2.6 & 5.3-5.4)
    evaluates `p_d(eta) = B(eta)*(p_s - p_t) + [eta - B(eta)]*(p0 - p_t) + p_t` with cubic
    `B(eta)` (`B(1)=1, B'(1)=1, B(etac)=0, B'(etac)=0`). Because `B'(eta)` peaks above `1.0`
-   at mid-levels (`1.68` for `etac=0.2`), layers compress over mountains (`4,090 m` Aragats,
-   `5,137 m` Ararat) and can fold (`dp_d <= 0`) if `etac` is set too high; this module checks
-   `dp_d > 0` before any solver run.
+   at mid-levels (`1.68` for `etac=0.2`), layers compress over `4-5 km` massifs and can fold
+   (`dp_d <= 0`) if `etac` is set too high; this module checks `dp_d > 0` before any solver run.
 3. Consumer profile-gap ceiling: `windy-av-layer` (`column.ts:159`) marks an entire column
-   `unavailable` if ANY adjacent exported level gap exceeds `maximumProfileGapM = 1,000 m`.
-   Because summer heatwaves expand hydrostatic thickness by ~6-8% relative to the `290 K`
-   reference state, `MAX_SAFE_REFERENCE_DZ_M = 900.0` enforces >= 10% thermal headroom.
+   `unavailable` if ANY adjacent exported level gap exceeds `maximumProfileGapM = 1,000 m`
+   (`CONSUMER_MAX_PROFILE_GAP_M`). Because summer heatwaves expand hydrostatic thickness by
+   ~6-8% relative to the `290 K` reference state, `MAX_SAFE_REFERENCE_DZ_M = 900.0` enforces
+   >= 10% thermal headroom at config-check time, while `validate_frame_columns` checks actual
+   exported columns against `CONSUMER_MAX_PROFILE_GAP_M` and `MAX_ADMITTED_CFL` on every cell.
 4. Consumer near-ground screening: `column.ts` retains `k=0` (`~15-17 m` AGL), whereas
    `native.ts` skips levels `<= minimumLevelAglM = 20 m` and starts at `k=1` (`~45-52 m` AGL).
 
@@ -32,7 +33,14 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 
-from av_wrf.contracts import MAX_EXPORTED_LEVELS, DomainProfile
+from av_wrf.contracts import (
+    BL_CEILING_AGL_M,
+    CONSUMER_MAX_PROFILE_GAP_M,
+    MAX_ADMITTED_CFL,
+    MAX_EXPORTED_LEVELS,
+    DomainProfile,
+    NormalizedWrfFrame,
+)
 from av_wrf.core.thermo import G0_MPS2, P0_PA, R_DRY_J_KG_K
 
 MIN_STABLE_DZBOT_M = 25.0
@@ -81,7 +89,6 @@ def _reference_eta_faces(domain: DomainProfile) -> list[float]:
         raise ValueError(
             "Vertical e_vert / stretching fails to reach p_top_pa without exceeding max_dz_m"
         )
-    # Fit upper-level steps smoothly to land eta=0 at p_top_pa while preserving dzbot near ground.
     excess = total_lnp - target_lnp
     upper_start = min(domain.exported_levels_k, n_mass - 1)
     upper_sum = sum(dlnp_steps[upper_start:])
@@ -119,9 +126,7 @@ def estimate_auto_levels_agl_m(
         raise ValueError("e_vert - 1 must be >= exported_levels_k")
 
     phi_sfc = G0_MPS2 * max(0.0, terrain_m)
-    radicand = ((REF_T0_K / REF_LAPSE_A_K) ** 2) - (
-        2.0 * phi_sfc / (REF_LAPSE_A_K * R_DRY_J_KG_K)
-    )
+    radicand = ((REF_T0_K / REF_LAPSE_A_K) ** 2) - (2.0 * phi_sfc / (REF_LAPSE_A_K * R_DRY_J_KG_K))
     if radicand <= 0.0:
         raise ValueError("terrain_m exceeds dry reference atmosphere ceiling")
     ps_ref = P0_PA * math.exp(-(REF_T0_K / REF_LAPSE_A_K) + math.sqrt(radicand))
@@ -132,9 +137,11 @@ def estimate_auto_levels_agl_m(
     pt = domain.p_top_pa
     z_face = 0.0
     midpoints: list[float] = []
-    p_bot = _hybrid_b(etas[0], etac) * (ps_ref - pt) + (etas[0] - _hybrid_b(etas[0], etac)) * (
-        P0_PA - pt
-    ) + pt
+    p_bot = (
+        _hybrid_b(etas[0], etac) * (ps_ref - pt)
+        + (etas[0] - _hybrid_b(etas[0], etac)) * (P0_PA - pt)
+        + pt
+    )
     for k in range(len(etas) - 1):
         b_top = _hybrid_b(etas[k + 1], etac)
         p_top_k = b_top * (ps_ref - pt) + (etas[k + 1] - b_top) * (P0_PA - pt) + pt
@@ -151,11 +158,7 @@ def estimate_auto_levels_agl_m(
     return tuple(midpoints)
 
 
-def validate_vertical_column(
-    midpoints_agl_m: Sequence[float],
-    domain: DomainProfile,
-) -> int:
-    """Verify monotonic levels, dzbot, thermal-headroom max_dz, and BL count; return BL count."""
+def _check_column_bounds(midpoints_agl_m: Sequence[float], domain: DomainProfile) -> None:
     if domain.dzbot_m < MIN_STABLE_DZBOT_M:
         raise ValueError(f"dzbot_m ({domain.dzbot_m}) must be >= {MIN_STABLE_DZBOT_M} m")
     if domain.max_dz_m > MAX_SAFE_REFERENCE_DZ_M:
@@ -170,16 +173,21 @@ def validate_vertical_column(
     if midpoints_agl_m[0] <= 0.0 or midpoints_agl_m[0] > domain.max_dz_m:
         raise ValueError("Lowest mass level midpoint must lie in (0, max_dz_m] AGL")
 
-    bl_count = 1 if midpoints_agl_m[0] <= 2000.0 else 0
+
+def validate_vertical_column(
+    midpoints_agl_m: Sequence[float],
+    domain: DomainProfile,
+) -> int:
+    """Verify monotonic levels, dzbot, thermal-headroom max_dz, and BL count; return BL count."""
+    _check_column_bounds(midpoints_agl_m, domain)
+    bl_count = 1 if midpoints_agl_m[0] <= BL_CEILING_AGL_M else 0
     for idx in range(1, domain.exported_levels_k):
         dz = midpoints_agl_m[idx] - midpoints_agl_m[idx - 1]
         if dz <= 0.0:
             raise ValueError(f"Non-monotonic vertical levels at index {idx}")
         if dz > domain.max_dz_m + 1e-6:
-            raise ValueError(
-                f"Vertical gap {dz:.1f} m at level {idx} exceeds {domain.max_dz_m} m"
-            )
-        if midpoints_agl_m[idx] <= 2000.0:
+            raise ValueError(f"Vertical gap {dz:.1f} m at level {idx} exceeds {domain.max_dz_m} m")
+        if midpoints_agl_m[idx] <= BL_CEILING_AGL_M:
             bl_count += 1
 
     if bl_count < domain.min_bl_levels_2km_agl:
@@ -188,3 +196,45 @@ def validate_vertical_column(
             f"requires >= {domain.min_bl_levels_2km_agl}"
         )
     return bl_count
+
+
+def local_cfl_3d(
+    u_mps: float,
+    v_mps: float,
+    w_mps: float,
+    dz_m: float,
+    dx_m: float,
+    dy_m: float,
+    dt_s: float,
+) -> float:
+    """Compute 3D advective Courant number for one exported mass cell."""
+    return (abs(u_mps) / dx_m + abs(v_mps) / dy_m + abs(w_mps) / max(10.0, dz_m)) * dt_s
+
+
+def validate_frame_columns(frame: NormalizedWrfFrame, domain: DomainProfile) -> float:
+    """Verify full-domain exported AGL gaps, 0-2 km BL counts, and CFL ceiling."""
+    if frame.min_dz_m <= 0.0 or frame.max_dz_m > CONSUMER_MAX_PROFILE_GAP_M:
+        raise ValueError(
+            f"Exported column gap [{frame.min_dz_m:.1f}, {frame.max_dz_m:.1f}] m "
+            f"violates (0, {CONSUMER_MAX_PROFILE_GAP_M}] m"
+        )
+    if frame.min_bl_levels_2km < domain.min_bl_levels_2km_agl:
+        raise ValueError(
+            f"Exported BL count {frame.min_bl_levels_2km} < {domain.min_bl_levels_2km_agl}"
+        )
+    if frame.max_cfl > MAX_ADMITTED_CFL:
+        raise ValueError(f"Exported frame max_cfl {frame.max_cfl:.4f} > {MAX_ADMITTED_CFL}")
+    return round(frame.max_cfl, 5)
+
+
+__all__ = [
+    "BL_CEILING_AGL_M",
+    "CONSUMER_MAX_PROFILE_GAP_M",
+    "MAX_ADMITTED_CFL",
+    "MAX_SAFE_REFERENCE_DZ_M",
+    "MIN_STABLE_DZBOT_M",
+    "estimate_auto_levels_agl_m",
+    "local_cfl_3d",
+    "validate_frame_columns",
+    "validate_vertical_column",
+]

@@ -1,13 +1,29 @@
 # Container Build (`docker/`)
 
-Builds the runnable `av-wrf` Python producer container (`av-wrf check`, `av-wrf plan`).
-Phase 2 adds the upstream `WRF v4.8.0` + `WPS v4.7.0` CMake solver stage and
-`/opt/av-wrf/build-manifest.json`.
+Multi-stage `Dockerfile` providing two targets on `linux/arm64` (native on Apple
+Silicon via OrbStack or Docker Desktop) with zero region IDs baked into the image:
+
+1. **`runtime`** (final stage, default `docker build .`): lean Python 3.12
+   producer (`check`, `plan`, `prep`, `post`, `publish`, `reconcile`).
+2. **`solver`** (`--target solver`): compiles pinned
+   [Jasper 1.900.29](https://github.com/jasper-software/jasper),
+   [WRF v4.8.0](https://github.com/wrf-model/WRF/releases) (`-DUSE_MPI=ON`,
+   `ARW` `EM_REAL`), and [WPS v4.7.0](https://github.com/wrf-model/WPS/releases)
+   (`-DWRF_DIR=/opt/av-wrf`, `-DUSE_MPI=ON`) via CMake + Ninja, verifies all
+   five binaries (`wrf.exe`, `real.exe`, `geogrid.exe`, `metgrid.exe`,
+   `ungrib.exe`) and shared libraries via `ldd`, and writes
+   `/opt/av-wrf/build-manifest.json` including SHA-256 digests of any
+   `docker/patches/*.patch` files.
 
 ```sh
-docker buildx build --platform linux/arm64 -f docker/Dockerfile -t av-wrf:local .
-docker run --rm av-wrf:local check --product wrf-armenia-3km
+# Fast default producer image:
+docker buildx build --platform linux/arm64 -f docker/Dockerfile -t av-wrf:runtime .
+
+# Full MPI WRF v4.8.0 + WPS v4.7.0 solver image (smoke check runs `av-wrf check`):
+docker buildx build --platform linux/arm64 --target solver --build-arg JOBS=12 -f docker/Dockerfile -t av-wrf:solver .
+docker run --rm av-wrf:solver
 ```
 
-Region configs and credentials stay mounted or declarative; solver patches in
-[`patches/`](patches/README.md) are hashed in [`manifest.lock`](../manifest.lock).
+Mount static WPS geography at `/opt/av-wrf/geog` (`geog_data_path` in domain
+profiles). Solver patches in [`patches/`](patches/README.md) are locked in
+[`manifest.lock`](../manifest.lock).

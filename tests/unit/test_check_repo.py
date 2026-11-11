@@ -1,4 +1,4 @@
-"""Audit real ROOT repository plus negative agent-chaos mutations."""
+"""Audit real ROOT repository plus negative agent-chaos and region-hardcoding mutations."""
 
 from __future__ import annotations
 
@@ -25,9 +25,10 @@ class TestCheckRepoHarness(unittest.TestCase):
             shutil.copytree(
                 ROOT,
                 clone,
-                ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc", ".venv"),
+                ignore=shutil.ignore_patterns(
+                    ".git", "__pycache__", "*.pyc", ".venv", ".import_linter_cache"
+                ),
             )
-            # Simulate uv sync + local .env + local run output directories
             (clone / "uv.lock").write_text("version = 1\n", encoding="utf-8")
             (clone / ".env").write_text("AV_WRF_MPI_RANKS=8\n", encoding="utf-8")
             (clone / "output" / "test").mkdir(parents=True)
@@ -40,7 +41,15 @@ class TestCheckRepoHarness(unittest.TestCase):
             self.assertTrue(any("utils.py" in e and "FIX:" in e for e in audit_repo(clone)))
             bad_utils.unlink()
 
-            # 2. Upward DAG, relative import, E501, B905 zip, mutable dataclass, & type-ignore
+            # 2. Hardcoding a configured product ID in Dockerfile is rejected
+            first_prod = sorted((clone / "config" / "products").glob("*.yaml"))[0].stem
+            dockerfile = clone / "docker" / "Dockerfile"
+            orig_df = dockerfile.read_text(encoding="utf-8")
+            dockerfile.write_text(orig_df + f'\n# CMD ["check", "--product", "{first_prod}"]\n')
+            self.assertTrue(any("hardcoded region/product" in e for e in audit_repo(clone)))
+            dockerfile.write_text(orig_df, encoding="utf-8")
+
+            # 3. Upward DAG, relative import, E501, B905 zip, mutable dataclass, & type-ignore
             grid_py = clone / "src" / "av_wrf" / "core" / "grid.py"
             orig_grid = grid_py.read_text(encoding="utf-8")
             ti_comment = "# type" + ": ignore"
@@ -70,7 +79,7 @@ class TestCheckRepoHarness(unittest.TestCase):
                 self.assertTrue(any(token in e for e in errs2), msg=f"Missing check for {token}")
             grid_py.write_text(orig_grid, encoding="utf-8")
 
-            # 3. Unauthorized edit to vendor/producer-contract fails SHA-256 lock
+            # 4. Unauthorized edit to vendor/producer-contract fails SHA-256 lock
             schema = clone / "vendor" / "producer-contract" / "wrf-zarr-v3.schema.json"
             schema.write_text(schema.read_text(encoding="utf-8") + "\n", encoding="utf-8")
             self.assertTrue(any("SHA-256 mismatch" in e for e in audit_repo(clone)))

@@ -7,8 +7,8 @@ Assumptions & Land-State Cold-Start Limits:
 2. Soil-texture hydraulic mismatch: interpolating raw volumetric `SMOIS` (`m3/m3`) across coarse
    forcing soil classes vs 30 arc-sec WRF soil classes can shift relative soil saturation and Bowen
    ratio (`HFX / LH`); Phase 1 absorbs fast surface adjustment via a 6 h cold-start spin-up, and
-   Phase 5 benchmarks warm `wrfinput` Noah-MP land-state cycling, `IMS 1 km` snow, and Lake Sevan
-   (`1,900 m` MSL) `OSTIA` skin temperatures.
+   Phase 5 benchmarks warm `wrfinput` Noah-MP land-state cycling, `IMS 1 km` snow, and high-altitude
+   inland-lake `OSTIA` skin temperatures.
 
 References:
 - Noah-MP 4-layer soil state: https://github.com/NCAR/noahmp

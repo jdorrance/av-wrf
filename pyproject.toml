@@ -11,11 +11,10 @@ requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
   "numpy>=2.1.0",
-  "zarr>=3.0.0",
+  "numcodecs>=0.13.0",
   "netCDF4>=1.7.2",
   "pyyaml>=6.0.2",
   "httpx>=0.28.0",
-  "obstore>=0.6.0",
 ]
 
 [project.scripts]
@@ -61,6 +60,10 @@ strict = true
 disallow_any_explicit = true
 files = ["src", "scripts", "tests"]
 
+[[tool.mypy.overrides]]
+module = ["netCDF4.*", "numcodecs.*"]
+ignore_missing_imports = true
+
 [tool.importlinter]
 root_packages = ["av_wrf"]
 include_external_packages = true
@@ -68,13 +71,14 @@ include_external_packages = true
 [[tool.importlinter.contracts]]
 name = "Five-layer top-down DAG"
 type = "layers"
+containers = ["av_wrf"]
 exhaustive = true
 layers = [
-  "av_wrf.cli",
-  "av_wrf.runner | av_wrf.verify",
-  "av_wrf.codecs",
-  "av_wrf.core",
-  "av_wrf.contracts",
+  "cli",
+  "runner | verify",
+  "codecs",
+  "core",
+  "contracts",
 ]
 
 [[tool.importlinter.contracts]]
@@ -86,7 +90,25 @@ modules = ["av_wrf.runner", "av_wrf.verify"]
 name = "Contracts and core forbid side-effecting packages"
 type = "forbidden"
 source_modules = ["av_wrf.contracts", "av_wrf.core"]
-forbidden_modules = ["os", "sys", "subprocess", "socket", "httpx", "obstore", "netCDF4", "zarr", "random"]
+forbidden_modules = [
+  "os",
+  "sys",
+  "subprocess",
+  "socket",
+  "shutil",
+  "tempfile",
+  "pathlib",
+  "urllib",
+  "http",
+  "httpx",
+  "boto3",
+  "obstore",
+  "netCDF4",
+  "yaml",
+  "zarr",
+  "random",
+  "importlib",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

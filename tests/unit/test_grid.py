@@ -1,4 +1,4 @@
-"""Unit tests for av_wrf.core.grid loading real YAML and optional pyproj oracle."""
+"""Unit tests for av_wrf.core.grid loading configured domain YAMLs dynamically."""
 
 from __future__ import annotations
 
@@ -13,17 +13,20 @@ for p in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(p))
 
 from av_wrf.contracts import (  # noqa: E402
+    CompBucket2D,
     CompMass2D,
-    CompMass3D,
     CompStagX3D,
     CompStagY3D,
     CompStagZ3D,
     DomainProfile,
     Slab2DF32,
+    Slab2DI32,
     Slab3DF32,
     parse_domain_profile,
 )
 from av_wrf.core import (  # noqa: E402
+    computational_latlon_bounds,
+    crop_bucket_2d,
     crop_sponge_2d,
     crop_sponge_3d,
     destagger_x_3d,
@@ -34,25 +37,21 @@ from av_wrf.core import (  # noqa: E402
     published_crs_wkt,
     published_grid_shape,
     published_lambert_grid_metadata,
+    validate_domain_profile,
 )
 from av_wrf.runner import parse_declarative_yaml  # noqa: E402
-from tests.oracle.reference_cases import (  # noqa: E402
-    ARMENIA_CENTER,
-    NZ_SOUTH_ISLAND_CENTER,
-)
+from tests.oracle.reference_cases import NH_MIDLAT_LCC, SH_MIDLAT_LCC  # noqa: E402
 
 
-def load_armenia_domain() -> DomainProfile:
-    raw = parse_declarative_yaml(
-        ROOT / "config" / "profiles" / "domains" / "armenia-3km-v1.yaml"
-    )
-    return parse_domain_profile(raw)
+def _load_configured_domains() -> tuple[DomainProfile, ...]:
+    paths = sorted((ROOT / "config" / "profiles" / "domains").glob("*.yaml"))
+    return tuple(parse_domain_profile(parse_declarative_yaml(p)) for p in paths)
 
 
 class TestGrid(unittest.TestCase):
     def test_nh_and_sh_lambert_roundtrip_and_optional_pyproj_oracle(self) -> None:
-        r_m = load_armenia_domain().earth_radius_m
-        for lat0, lon0, sp1, sp2 in (ARMENIA_CENTER, NZ_SOUTH_ISLAND_CENTER):
+        r_m = _load_configured_domains()[0].earth_radius_m
+        for lat0, lon0, sp1, sp2 in (NH_MIDLAT_LCC, SH_MIDLAT_LCC):
             x0, y0 = latlon_to_lambert_xy_m(
                 lat0,
                 lon0,
@@ -90,7 +89,7 @@ class TestGrid(unittest.TestCase):
             self.assertAlmostEqual(rec_lon, t_lon, places=9)
 
             try:
-                from pyproj import CRS, Transformer  # noqa: PLC0415
+                from pyproj import CRS, Transformer
             except ImportError:
                 continue
             proj_str = (
@@ -104,38 +103,51 @@ class TestGrid(unittest.TestCase):
             self.assertLess(abs(x_m - px), 0.05)
             self.assertLess(abs(y_m - py), 0.05)
 
-    def test_published_lambert_metadata_and_wkt_off_meridian(self) -> None:
-        dom = dataclasses.replace(
-            load_armenia_domain(), center_lon_deg=45.75, central_meridian_deg=44.50
-        )
-        meta = published_lambert_grid_metadata(dom)
-        self.assertEqual(meta["kind"], "lambert-conformal")
-        self.assertEqual((meta["height"], meta["width"]), (148, 180))
-        self.assertIn("Lambert_Conformal_Conic_2SP", published_crs_wkt(dom))
+    def test_published_lambert_metadata_and_bounds_for_all_domains(self) -> None:
+        for base_dom in _load_configured_domains():
+            validate_domain_profile(base_dom)
+            w, s, e, n = computational_latlon_bounds(base_dom)
+            self.assertLess(w, base_dom.center_lon_deg)
+            self.assertGreater(e, base_dom.center_lon_deg)
+            self.assertLess(s, base_dom.center_lat_deg)
+            self.assertGreater(n, base_dom.center_lat_deg)
 
-        cx_m = float(meta["x0M"]) + 0.5 * (int(meta["width"]) - 1) * float(meta["dxM"])
-        cy_m = float(meta["y0M"]) + 0.5 * (int(meta["height"]) - 1) * float(meta["dyM"])
-        clat, clon = lambert_xy_m_to_latlon(
-            cx_m,
-            cy_m,
-            origin_lat_deg=dom.center_lat_deg,
-            central_meridian_deg=dom.central_meridian_deg,
-            std_parallel_1_deg=dom.std_parallel_1_deg,
-            std_parallel_2_deg=dom.std_parallel_2_deg,
-            radius_m=dom.earth_radius_m,
-        )
-        self.assertAlmostEqual(clat, dom.center_lat_deg, places=9)
-        self.assertAlmostEqual(clon, dom.center_lon_deg, places=9)
+            dom = dataclasses.replace(base_dom, center_lon_deg=base_dom.central_meridian_deg + 1.25)
+            meta = published_lambert_grid_metadata(dom)
+            nj, ni = published_grid_shape(dom)
+            self.assertEqual((meta["height"], meta["width"]), (nj, ni))
+            self.assertIn("Lambert_Conformal_Conic_2SP", published_crs_wkt(dom))
 
-    def test_destagger_3d_and_sponge_crop_float32_slabs(self) -> None:
-        dom = load_armenia_domain()
-        self.assertEqual(published_grid_shape(dom), (148, 180))
+            cx_m = float(meta["x0M"]) + 0.5 * (int(meta["width"]) - 1) * float(meta["dxM"])
+            cy_m = float(meta["y0M"]) + 0.5 * (int(meta["height"]) - 1) * float(meta["dyM"])
+            clat, clon = lambert_xy_m_to_latlon(
+                cx_m,
+                cy_m,
+                origin_lat_deg=dom.center_lat_deg,
+                central_meridian_deg=dom.central_meridian_deg,
+                std_parallel_1_deg=dom.std_parallel_1_deg,
+                std_parallel_2_deg=dom.std_parallel_2_deg,
+                radius_m=dom.earth_radius_m,
+            )
+            self.assertAlmostEqual(clat, dom.center_lat_deg, places=9)
+            self.assertAlmostEqual(clon, dom.center_lon_deg, places=9)
+
+        with self.assertRaises(ValueError):
+            validate_domain_profile(dataclasses.replace(_load_configured_domains()[0], e_we=100))
+
+    def test_destagger_3d_and_sponge_crop_float32_and_int32_slabs(self) -> None:
         slab = CompMass2D(
             Slab2DF32.from_values(5, 6, [float(r * 10 + c) for r in range(5) for c in range(6)])
         )
         cropped = crop_sponge_2d(slab, trim=1)
         self.assertEqual((cropped.ny, cropped.nx), (3, 4))
         self.assertAlmostEqual(cropped.at(0, 0), 11.0, places=5)
+
+        bkt = CompBucket2D(
+            Slab2DI32.from_values(5, 6, [r * 10 + c for r in range(5) for c in range(6)])
+        )
+        bkt_c = crop_bucket_2d(bkt, trim=1)
+        self.assertEqual((bkt_c.ny, bkt_c.nx, bkt_c.at(0, 0)), (3, 4, 11))
 
         u_stag = CompStagX3D(Slab3DF32.from_values(2, 3, 4, [float(i) for i in range(24)]))
         v_stag = CompStagY3D(Slab3DF32.from_values(2, 4, 3, [float(i) for i in range(24)]))

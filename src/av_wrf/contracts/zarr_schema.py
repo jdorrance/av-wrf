@@ -1,4 +1,4 @@
-"""Canonical 22-field wrf-zarr-v3 specification mirrored with vendor/producer-contract.
+"""Canonical 22-field wrf-zarr-v3 specification, coordinates, and admission bounds.
 
 Assumptions & Provenance Declarations (required by windy-av-layer methods.ts):
 - `MOISTURE_SOURCE_OF_TRUTH = "spfh_kgkg"`: model-level RH is omitted because consumer
@@ -23,6 +23,9 @@ CAPE_PARCEL_DEFINITION = "afwa-mucape-lowest-300hpa-virtual-temp-undiluted"
 LOW_CLOUD_DEFINITION = "ecmwf-sigma-ge-0p8-max-random-overlap"
 WRF_SPHERE_RADIUS_M = 6_370_000.0
 MAX_EXPORTED_LEVELS = 40
+CONSUMER_MAX_PROFILE_GAP_M = 1_000.0
+BL_CEILING_AGL_M = 2_000.0
+MAX_ADMITTED_CFL = 1.2
 DEFAULT_SHARD_TIME_STEP = 1
 DEFAULT_INNER_SPATIAL_CHUNK: tuple[int, int] = (64, 64)
 DEFAULT_ZSTD_LEVEL = 3
@@ -45,6 +48,16 @@ def zarr_index_codecs() -> list[dict[str, object]]:
 
 
 @dataclass(frozen=True)
+class ZarrCoordSpec:
+    name: str
+    dim: str
+    data_type: str
+    pack_code: str
+    fill_value: int | float
+    units: str
+
+
+@dataclass(frozen=True)
 class ZarrFieldSpec:
     name: str
     dims: tuple[str, ...]
@@ -54,6 +67,16 @@ class ZarrFieldSpec:
     keepbits: int
 
 
+WRF_ZARR_V3_COORDS: tuple[ZarrCoordSpec, ...] = (
+    ZarrCoordSpec("time", "time", "int32", "i", -1, "hours"),
+    ZarrCoordSpec("valid_time_unix_s", "time", "int64", "q", -1, "s"),
+    ZarrCoordSpec("window_start_unix_s", "time", "int64", "q", -1, "s"),
+    ZarrCoordSpec("window_end_unix_s", "time", "int64", "q", -1, "s"),
+    ZarrCoordSpec("level", "level", "int32", "i", -1, "index"),
+    ZarrCoordSpec("y", "y", "float64", "d", 0.0, "m"),
+    ZarrCoordSpec("x", "x", "float64", "d", 0.0, "m"),
+)
+
 _T2D = ("time", "y", "x")
 _T3D = ("time", "level", "y", "x")
 
@@ -62,15 +85,9 @@ WRF_ZARR_V3_FIELDS: tuple[ZarrFieldSpec, ...] = (
     ZarrFieldSpec("surface_pressure_pa", _T2D, "Pa", "surfacePressurePa", "instant", 17),
     ZarrFieldSpec("temp_2m_k", _T2D, "K", "temp2mK", "instant", 15),
     ZarrFieldSpec("spfh_2m_kgkg", _T2D, "kg/kg", "specificHumidity2mKgKg", "instant", 15),
-    ZarrFieldSpec(
-        "sensible_heat_flux_wm2", _T2D, "W/m2", "sensibleHeatFluxWm2", "window-mean", 15
-    ),
-    ZarrFieldSpec(
-        "latent_heat_flux_wm2", _T2D, "W/m2", "latentHeatFluxWm2", "window-mean", 15
-    ),
-    ZarrFieldSpec(
-        "precip_mm_hr", _T2D, "mm/h", "precipitationMmPerHour", "window-rate", 15
-    ),
+    ZarrFieldSpec("sensible_heat_flux_wm2", _T2D, "W/m2", "sensibleHeatFluxWm2", "window-mean", 15),
+    ZarrFieldSpec("latent_heat_flux_wm2", _T2D, "W/m2", "latentHeatFluxWm2", "window-mean", 15),
+    ZarrFieldSpec("precip_mm_hr", _T2D, "mm/h", "precipitationMmPerHour", "window-rate", 15),
     ZarrFieldSpec("mslp_pa", _T2D, "Pa", "auxSurface.mslpPa", "instant", 17),
     ZarrFieldSpec("u_10m_earth_mps", _T2D, "m/s", "auxSurface.u10mMps", "instant", 15),
     ZarrFieldSpec("v_10m_earth_mps", _T2D, "m/s", "auxSurface.v10mMps", "instant", 15),
@@ -91,23 +108,34 @@ WRF_ZARR_V3_FIELDS: tuple[ZarrFieldSpec, ...] = (
 )
 
 WRF_ZARR_V3_FIELD_NAMES: frozenset[str] = frozenset(f.name for f in WRF_ZARR_V3_FIELDS)
+WRF_ZARR_V3_2D_NAMES: tuple[str, ...] = tuple(f.name for f in WRF_ZARR_V3_FIELDS if len(f.dims) < 4)
+WRF_ZARR_V3_3D_NAMES: tuple[str, ...] = tuple(
+    f.name for f in WRF_ZARR_V3_FIELDS if len(f.dims) == 4
+)
 
 __all__ = [
+    "BL_CEILING_AGL_M",
     "CAPE_PARCEL_DEFINITION",
+    "CONSUMER_MAX_PROFILE_GAP_M",
     "DEFAULT_INNER_SPATIAL_CHUNK",
     "DEFAULT_SHARD_TIME_STEP",
     "DEFAULT_ZSTD_LEVEL",
     "LOW_CLOUD_DEFINITION",
+    "MAX_ADMITTED_CFL",
     "MAX_EXPORTED_LEVELS",
     "MOISTURE_SOURCE_OF_TRUTH",
     "TEMPERATURE_DEFINITION",
     "WRF_SPHERE_RADIUS_M",
+    "WRF_ZARR_V3_2D_NAMES",
+    "WRF_ZARR_V3_3D_NAMES",
+    "WRF_ZARR_V3_COORDS",
     "WRF_ZARR_V3_FIELDS",
     "WRF_ZARR_V3_FIELD_NAMES",
     "ZARR_FORMAT_VERSION",
     "ZARR_SCHEMA_ID",
     "ZARR_SCHEMA_STATUS",
     "ZARR_SCHEMA_VERSION",
+    "ZarrCoordSpec",
     "ZarrFieldSpec",
     "zarr_index_codecs",
     "zarr_inner_codecs",

@@ -1,28 +1,83 @@
-"""Public L3a effectful runner surface."""
+"""Public L3a runner surface: stores, mirrors, stage orchestration, and dispatch."""
 
 from __future__ import annotations
 
-from av_wrf.runner.dispatch import dispatch_receipt_key, reconcile_dispatch
-from av_wrf.runner.mirrors import VerifiedForcingBundle, build_verified_bundle
-from av_wrf.runner.solver import parse_build_manifest, verify_checkpoint_compatibility
-from av_wrf.runner.stages import (
-    check_product_config,
+from av_wrf.runner.bundle import (
+    LoadedBundle,
+    load_bundle,
     parse_declarative_yaml,
-    plan_product_cycle,
+    validate_bundle,
 )
-from av_wrf.runner.store import LocalFileStore, ObjectStore, open_store
+from av_wrf.runner.dispatch import (
+    dispatch_receipt_key,
+    post_webhook_json,
+    reconcile_dispatch,
+)
+from av_wrf.runner.mirrors import VerifiedForcingBundle, build_verified_bundle
+from av_wrf.runner.post import post_cycle_from_inputs, post_cycle_store
+from av_wrf.runner.publish import (
+    load_product_ready_receipt,
+    load_ready_receipt,
+    publish_cycle_receipt,
+)
+from av_wrf.runner.solver import (
+    load_build_manifest,
+    parse_build_manifest,
+    verify_checkpoint_compatibility,
+)
+from av_wrf.runner.stages import (
+    check_all_products,
+    check_product_config,
+    load_run_lock,
+    plan_product_cycle,
+    prep_cycle_namelists,
+    resolve_cli_cycle,
+)
+from av_wrf.runner.store import (
+    LocalFileStore,
+    ObjectStore,
+    attempt_stage_prefix,
+    json_bytes,
+    open_store,
+    post_manifest_key,
+    published_cycle_prefix,
+    put_idempotent,
+    run_lock_key,
+    sha256_hex,
+)
 
 __all__ = [
+    "LoadedBundle",
     "LocalFileStore",
     "ObjectStore",
     "VerifiedForcingBundle",
+    "attempt_stage_prefix",
     "build_verified_bundle",
+    "check_all_products",
     "check_product_config",
     "dispatch_receipt_key",
+    "json_bytes",
+    "load_build_manifest",
+    "load_bundle",
+    "load_product_ready_receipt",
+    "load_ready_receipt",
+    "load_run_lock",
     "open_store",
     "parse_build_manifest",
     "parse_declarative_yaml",
     "plan_product_cycle",
+    "post_cycle_from_inputs",
+    "post_cycle_store",
+    "post_manifest_key",
+    "post_webhook_json",
+    "prep_cycle_namelists",
+    "publish_cycle_receipt",
+    "published_cycle_prefix",
+    "put_idempotent",
     "reconcile_dispatch",
+    "resolve_cli_cycle",
+    "run_lock_key",
+    "sha256_hex",
+    "validate_bundle",
     "verify_checkpoint_compatibility",
 ]
