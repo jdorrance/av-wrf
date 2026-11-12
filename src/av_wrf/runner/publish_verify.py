@@ -124,7 +124,7 @@ def verify_staged_objects(
     window: CycleWindow,
     lock: RunLock,
     *,
-    on_verified_object: Callable[[str, str, bytes], None],
+    on_verified_object: Callable[[str, bytes], None],
 ) -> bytes:
     """Verify canonical staged metadata and decoded fields and hand off each verified object."""
     diag_raw = _verify_diagnostics_receipt(stage_store, stage_root, pm.diagnostics_sha256, lock)
@@ -138,14 +138,11 @@ def verify_staged_objects(
             raise ValueError(f"Corrupt or missing staged Zarr object: {rel_key}")
         return payload
 
-    def push(rel_key: str, payload: bytes) -> None:
-        on_verified_object(rel_key, expected_shas[rel_key], payload)
-
     for rel_key, expected in (meta_expected | coord_expected).items():
         payload = fetch_verified(rel_key)
         if payload != expected:
             raise ValueError(f"Staged Zarr metadata or coordinate {rel_key} contradicts RunLock")
-        push(rel_key, payload)
+        on_verified_object(rel_key, payload)
     n_leads = len(pm.lead_hours)
     for rel_key, _ in pm.shard_sha256s:
         if rel_key in coord_expected or rel_key.startswith("surface_pressure_pa/"):
@@ -157,6 +154,6 @@ def verify_staged_objects(
             ps_key = zarr_shard_relpath("surface_pressure_pa", b.output, time_index=t_idx)
             ps_payload = fetch_verified(ps_key)
             _verify_pressure(rel_key, values, _decode_field_shard(ps_key, ps_payload, n_leads, b))
-            push(ps_key, ps_payload)
-        push(rel_key, payload)
+            on_verified_object(ps_key, ps_payload)
+        on_verified_object(rel_key, payload)
     return diag_raw

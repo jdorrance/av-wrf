@@ -88,11 +88,12 @@ class ForcingProfile:
     vtable_name: str
     interval_seconds: int
     grid_spacing_deg: float
-    pressure_level_count: int
-    soil_layer_centers_cm: tuple[float, ...]
+    metgrid_levels: int
+    metgrid_soil_levels: int
     source_ready_lag_p95_hours: float
     mirrors: tuple[str, ...]
     fail_closed: bool
+    use_sh_qv: bool = False
 
 
 @dataclass(frozen=True)

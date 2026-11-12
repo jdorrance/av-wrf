@@ -175,25 +175,42 @@ def parse_science_profile(raw: Mapping[str, object]) -> ScienceProfile:
 
 
 def parse_forcing_profile(raw: Mapping[str, object]) -> ForcingProfile:
-    _check_keys("ForcingProfile", frozenset(ForcingProfile.__dataclass_fields__), raw)
+    levels_key = "metgrid_levels" if "metgrid_levels" in raw else "pressure_level_count"
+    soil_key = "metgrid_soil_levels" if "metgrid_soil_levels" in raw else "soil_layer_centers_cm"
+    keys = frozenset(ForcingProfile.__dataclass_fields__) - {
+        "metgrid_levels",
+        "metgrid_soil_levels",
+        "use_sh_qv",
+    }
+    if "use_sh_qv" in raw:
+        keys |= {"use_sh_qv"}
+    _check_keys("ForcingProfile", keys | {levels_key, soil_key}, raw)
+    soil_levels = (
+        _req_int(raw, soil_key)
+        if soil_key == "metgrid_soil_levels"
+        else len(_req_float_tuple(raw, soil_key))
+    )
     prof = ForcingProfile(
         _req_str(raw, "profile_id"),
         _req_str(raw, "provider"),
         _req_str(raw, "vtable_name"),
         _req_int(raw, "interval_seconds"),
         _req_float(raw, "grid_spacing_deg"),
-        _req_int(raw, "pressure_level_count"),
-        _req_float_tuple(raw, "soil_layer_centers_cm"),
+        _req_int(raw, levels_key),
+        soil_levels,
         _req_float(raw, "source_ready_lag_p95_hours"),
         _req_str_tuple(raw, "mirrors"),
         _req_bool(raw, "fail_closed"),
+        _req_bool(raw, "use_sh_qv") if "use_sh_qv" in raw else False,
     )
     if not re.fullmatch(r"Vtable\.[A-Za-z0-9][A-Za-z0-9_.-]*", prof.vtable_name):
         raise ValueError("ForcingProfile.vtable_name must be a single WPS Vtable filename")
     if prof.interval_seconds < 3600 or prof.interval_seconds % 3600 != 0:
         raise ValueError("ForcingProfile.interval_seconds must be a positive multiple of 3600")
-    if prof.pressure_level_count < 10 or prof.source_ready_lag_p95_hours <= 0.0:
-        raise ValueError("ForcingProfile requires >= 10 pressure levels and positive lag")
+    if prof.metgrid_levels < 10 or prof.metgrid_soil_levels < 1:
+        raise ValueError("ForcingProfile requires at least 10 metgrid levels and one soil layer")
+    if prof.source_ready_lag_p95_hours <= 0.0:
+        raise ValueError("ForcingProfile requires positive source ready lag")
     return prof
 
 

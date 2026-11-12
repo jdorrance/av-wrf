@@ -34,7 +34,7 @@ class RawWrfBaselineInput:
 
 @dataclass(frozen=True)
 class RawWrfStepInput:
-    """Croppable computational-grid WRF fields for one output timestamp."""
+    """Validated finite WRF fields for one timestamp, with full pressure and cloud columns."""
 
     valid_time_utc: str
     valid_time_unix_s: int

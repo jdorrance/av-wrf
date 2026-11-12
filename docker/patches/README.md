@@ -1,8 +1,8 @@
-# Post-Release Solver Patches (`docker/patches/`)
+# Solver patches
 
-Audited `WRF v4.8.0` / `WPS v4.7.0` stability patches applied deterministically
-during `docker/Dockerfile` builds (e.g., `#2300` restart uninitialized-memory
-fix and `#2292` `auxinput` handle cleanup).
+This directory holds optional `wrf-*.patch` and `wps-*.patch` inputs. The current
+build applies zero standalone patches. The WRF Makefile dependency fix lives
+in [`build-wrf.sh`](../build-wrf.sh).
 
-Every file in this directory is hashed in [`manifest.lock`](../../manifest.lock).
-Add or update patches via `python3 scripts/sync_contract.py --update-locks`.
+[`manifest.lock`](../../manifest.lock) records the directory contents. The
+packaged `build-manifest.json` records the source commits and applied patch hashes.

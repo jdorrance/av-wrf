@@ -17,7 +17,12 @@ if __name__ == "__main__":
         "wps_sha": _version("git", "-C", "WPS", "rev-parse", "HEAD"),
         "patch_sha256s": [
             [patch.name, hashlib.sha256(patch.read_bytes()).hexdigest()]
-            for patch in sorted(Path("patches").glob("*.patch"))
+            for patch in sorted(
+                path
+                for project in ("wrf", "wps")
+                for path in Path("patches").glob(f"{project}-*.patch")
+                if path.is_file()
+            )
         ],
         "compiler": "gfortran-" + _version("gfortran", "-dumpfullversion"),
         "mpi": _version("mpirun", "--version"),

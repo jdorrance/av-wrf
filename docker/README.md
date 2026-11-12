@@ -27,8 +27,10 @@ Mount WPS geography at the configured `geog_data_path`. Run `geog`, pass its
 `geo_em.d01.nc` to `plan` and `solve`, and use `forcing-manifest` to seal the
 local GRIB2 files after acquisition. Set `AV_WRF_OCI_DIGEST` to the solver
 image digest for both `plan` and `solve`. Set `AV_WRF_STORE_URI` to a mounted
-durable store for live runs. Solver patches in
-[patches/](patches/README.md) are locked in [manifest.lock](../manifest.lock).
+store for live runs. See [solver patches](patches/README.md) for build provenance.
+
+The [image workflow](../.github/workflows/images.yml) runs both native WRF
+executables through namelist parsing and up to the first input open.
 
 Set `AV_WRF_MPI_LAUNCHER='srun --mpi=pmix -n'` to use a compatible Slurm
 installation. The runner appends the locked rank count and solver executable.

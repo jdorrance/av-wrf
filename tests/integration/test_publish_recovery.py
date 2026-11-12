@@ -10,7 +10,9 @@ import threading
 import unittest
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT / "src") not in sys.path:
@@ -19,13 +21,14 @@ if str(ROOT / "src") not in sys.path:
 from av_wrf.codecs import (  # noqa: E402
     build_synthetic_wrf_baseline,
     build_synthetic_wrf_step,
-    decode_shard_f32,
+    decode_shard_f32_array,
 )
 from av_wrf.contracts import (  # noqa: E402
     BuildManifest,
     CompMass2D,
     DiagnosticsReceipt,
     RawWrfStepInput,
+    ReadyReceipt,
     Slab2DF32,
     SolverReceipt,
     parse_iso_utc,
@@ -37,8 +40,8 @@ from av_wrf.runner import (  # noqa: E402
     attempt_stage_prefix,
     json_bytes,
     load_bundle,
+    load_ready_receipt,
     plan_product_cycle,
-    post_cycle_store,
     post_manifest_key,
     publish_cycle_receipt,
     put_idempotent,
@@ -46,6 +49,7 @@ from av_wrf.runner import (  # noqa: E402
     solver_receipt_key,
     verify_solver_receipt,
 )
+from av_wrf.runner.post import _stage_cycle  # noqa: E402
 from tests.integration import stage_sparse_config  # noqa: E402
 
 
@@ -85,7 +89,7 @@ def _stage_attempt_with_t2(
 ) -> str:
     manifest = BuildManifest("sha256:" + "b" * 64, "wrf-sha", "wps-sha", (), "gcc", "openmpi")
     win = resolve_cycle_window(b.product, b.output, origin_iso)
-    plan_product_cycle(
+    _, lock = plan_product_cycle(
         cfg,
         store,
         product_id=b.product.product_id,
@@ -107,184 +111,171 @@ def _stage_attempt_with_t2(
                 step, t2_k=CompMass2D(Slab2DF32.from_values(ny, nx, [t2_val] * (ny * nx)))
             )
 
-    post_cycle_store(
-        cfg,
+    _stage_cycle(
         store,
-        product_id=b.product.product_id,
-        cycle_partition=win.cycle_partition,
-        attempt_id=attempt_id,
-        f000_step=build_synthetic_wrf_baseline(b.domain, origin_iso, base_unix),
-        lead_steps=stream_leads(),
-        bundle=b,
+        b,
+        lock,
+        win,
+        build_synthetic_wrf_baseline(b.domain, origin_iso, base_unix),
+        stream_leads(),
+        "solver",
     )
     return win.cycle_partition
 
 
 class TestPublishRecoveryAndConcurrency(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.cfg = self.root / "cfg"
+        self.prod_id = stage_sparse_config(ROOT / "config", self.cfg)
+        self.bundle = load_bundle(self.cfg, self.prod_id)
+
     def test_solver_receipt_hashes_consumed_frames_and_checks_full_inventory(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store, cfg = LocalFileStore(root / "store"), root / "cfg"
-            prod_id = stage_sparse_config(ROOT / "config", cfg)
-            b = load_bundle(cfg, prod_id)
-            origin = f"2026-11-12T{b.product.publish_origin_hour_utc:02d}:00:00Z"
-            oci = "sha256:" + "b" * 64
-            _, lock = plan_product_cycle(
-                cfg,
-                store,
-                product_id=prod_id,
-                publish_origin_utc=origin,
-                attempt_id="att-hash",
-                mpi_ranks=4,
-                build_manifest=BuildManifest(oci, "w", "p", (), "gcc", "mpi"),
-                geog_bundle_sha256="a" * 64,
-                bundle=b,
-            )
-            f0, skipped, f3 = (root / f"wrfout_d01_{hr:02d}" for hr in (0, 2, 3))
-            for file in (f0, skipped, f3):
-                file.write_bytes(b"original")
-            shas = tuple((p.name, sha256_hex(b"original")) for p in (f0, skipped, f3))
-            rec = _seed_solver_receipt(store, b, lock.cycle_partition, lock.attempt_id, oci, shas)
-            skipped.write_bytes(b"changed")
-            self.assertEqual(
-                verify_solver_receipt(store, lock, root, selected_wrfouts={f0, f3}), rec
-            )
-            with self.assertRaisesRegex(ValueError, f"{skipped.name}.*SHA-256"):
-                verify_solver_receipt(store, lock, root)
-            f3.write_bytes(b"changed")
-            with self.assertRaisesRegex(ValueError, f"{f3.name}.*SHA-256"):
-                verify_solver_receipt(store, lock, root, selected_wrfouts={f0, f3})
-            skipped.unlink()
-            with self.assertRaisesRegex(ValueError, "inventory"):
-                verify_solver_receipt(store, lock, root, selected_wrfouts={f0, f3})
+        prod_id, b = self.prod_id, self.bundle
+        root = self.root
+        store, cfg = LocalFileStore(root / "store"), self.cfg
+        origin = f"2026-11-12T{b.product.publish_origin_hour_utc:02d}:00:00Z"
+        oci = "sha256:" + "b" * 64
+        _, lock = plan_product_cycle(
+            cfg,
+            store,
+            product_id=prod_id,
+            publish_origin_utc=origin,
+            attempt_id="att-hash",
+            mpi_ranks=4,
+            build_manifest=BuildManifest(oci, "w", "p", (), "gcc", "mpi"),
+            geog_bundle_sha256="a" * 64,
+            bundle=b,
+        )
+        f0, skipped, f3 = (root / f"wrfout_d01_{hr:02d}" for hr in (0, 2, 3))
+        for file in (f0, skipped, f3):
+            file.write_bytes(b"original")
+        shas = tuple((p.name, sha256_hex(b"original")) for p in (f0, skipped, f3))
+        rec = _seed_solver_receipt(store, b, lock.cycle_partition, lock.attempt_id, oci, shas)
+        skipped.write_bytes(b"changed")
+        self.assertEqual(verify_solver_receipt(store, lock, root, selected_wrfouts={f0, f3}), rec)
+        with self.assertRaisesRegex(ValueError, f"{skipped.name}.*SHA-256"):
+            verify_solver_receipt(store, lock, root)
+        f3.write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, f"{f3.name}.*SHA-256"):
+            verify_solver_receipt(store, lock, root, selected_wrfouts={f0, f3})
+        skipped.unlink()
+        with self.assertRaisesRegex(ValueError, "inventory"):
+            verify_solver_receipt(store, lock, root, selected_wrfouts={f0, f3})
 
     def test_concurrent_two_attempt_publish_race_preserves_atomic_winner(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            store_dir = Path(tmp) / "store"
-            store = LocalFileStore(store_dir)
-            cfg = Path(tmp) / "cfg"
-            prod_id = stage_sparse_config(ROOT / "config", cfg)
-            b = load_bundle(cfg, prod_id)
-            origin_iso = f"2026-11-12T{b.product.publish_origin_hour_utc:02d}:00:00Z"
-            part = _stage_attempt_with_t2(cfg, store, b, origin_iso, "att-A", 285.0)
-            _stage_attempt_with_t2(cfg, store, b, origin_iso, "att-B", 308.0)
+        prod_id, b = self.prod_id, self.bundle
+        cfg = self.cfg
+        store_dir = self.root / "store"
+        store = LocalFileStore(store_dir)
+        origin_iso = f"2026-11-12T{b.product.publish_origin_hour_utc:02d}:00:00Z"
+        part = _stage_attempt_with_t2(cfg, store, b, origin_iso, "att-A", 285.0)
+        _stage_attempt_with_t2(cfg, store, b, origin_iso, "att-B", 308.0)
 
-            barrier = threading.Barrier(2)
+        barrier = threading.Barrier(2)
 
-            def race_publish(att_id: str) -> str:
-                barrier.wait()
-                try:
-                    rec = publish_cycle_receipt(
-                        cfg,
-                        store,
-                        product_id=prod_id,
-                        cycle_partition=part,
-                        attempt_id=att_id,
-                        bundle=b,
-                        now_utc_iso="2026-11-12T00:30:00Z",
-                    )
-                    return f"won:{rec.attempt_id}"
-                except FileExistsError:
-                    return "lost"
-
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                outcomes = sorted(pool.map(race_publish, ("att-A", "att-B")))
-            self.assertEqual(len([x for x in outcomes if x.startswith("won:")]), 1)
-            self.assertEqual(outcomes.count("lost"), 1)
-            winner = next(x.split(":")[1] for x in outcomes if x.startswith("won:"))
-            exp_t2 = 285.0 if winner == "att-A" else 308.0
-
-            ready_raw = store.get_bytes(f"upstream/{b.product.model_id}/{part}/_ready.json")
-            assert ready_raw is not None
-            ready_doc = json.loads(ready_raw.decode("utf-8"))
-            self.assertEqual(ready_doc["attempt_id"], winner)
-            pub_t2 = store.get_bytes(
-                f"upstream/{b.product.model_id}/{part}/forecast.zarr/temp_2m_k/c/0/0/0"
-            )
-            assert pub_t2 is not None
-            nj = b.domain.e_sn - 1 - 2 * b.domain.bdy_trim_cells
-            ni = b.domain.e_we - 1 - 2 * b.domain.bdy_trim_cells
-            dec = decode_shard_f32(pub_t2, shard_time_steps=1, nz=1, ny=nj, nx=ni, output=b.output)
-            self.assertAlmostEqual(dec[0], exp_t2, delta=0.05)
-
-    def test_stage_retention_multi_destination_replay_and_prune_flag(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            stg_dir = Path(tmp) / "stage"
-            stg = LocalFileStore(stg_dir)
-            dst1 = LocalFileStore(Path(tmp) / "dst1")
-            dst2 = LocalFileStore(Path(tmp) / "dst2")
-            cfg = Path(tmp) / "cfg"
-            prod_id = stage_sparse_config(ROOT / "config", cfg)
-            b = load_bundle(cfg, prod_id)
-            origin_iso = f"2026-11-12T{b.product.publish_origin_hour_utc:02d}:00:00Z"
-            part = _stage_attempt_with_t2(cfg, stg, b, origin_iso, "att-replay", 296.0)
-
-            # Promote to dst1 without pruning stage -> stage remains intact for dst2!
-            rec1 = publish_cycle_receipt(
-                cfg,
-                dst1,
-                product_id=prod_id,
-                cycle_partition=part,
-                attempt_id="att-replay",
-                bundle=b,
-                stage_store=stg,
-                prune_stage=False,
-                now_utc_iso="2026-11-12T00:30:00Z",
-            )
-            stage_path = stg_dir / attempt_stage_prefix(prod_id, part, "att-replay")
-            self.assertTrue(stage_path.exists())
-            rec2 = publish_cycle_receipt(
-                cfg,
-                dst2,
-                product_id=prod_id,
-                cycle_partition=part,
-                attempt_id="att-replay",
-                bundle=b,
-                stage_store=stg,
-                prune_stage=True,
-                now_utc_iso="2026-11-12T00:30:00Z",
-            )
-            self.assertEqual(rec1, rec2)
-            self.assertFalse(stage_path.exists())
-            diag_raw = dst2.get_bytes(f"upstream/{b.product.model_id}/{part}/_diagnostics.json")
-            assert diag_raw is not None
-            diag = DiagnosticsReceipt.from_doc(json.loads(diag_raw.decode("utf-8")))
-            self.assertGreaterEqual(diag.max_cfl, 0.0)
-
-    def test_stale_backfill_and_tampered_coord_rejection(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            store_dir = Path(tmp) / "store"
-            store = LocalFileStore(store_dir)
-            cfg = Path(tmp) / "cfg"
-            prod_id = stage_sparse_config(ROOT / "config", cfg)
-            b = load_bundle(cfg, prod_id)
-            stale_iso = f"2020-01-01T{b.product.publish_origin_hour_utc:02d}:00:00Z"
-            part = _stage_attempt_with_t2(cfg, store, b, stale_iso, "att-2020", 290.0)
-            stg_2020 = attempt_stage_prefix(prod_id, part, "att-2020")
-            coord_p = store_dir / stg_2020 / "forecast.zarr" / "time/c/0"
-            good_coord = coord_p.read_bytes()
-            bad_coord = b"\x00" * len(good_coord)
-            coord_p.write_bytes(bad_coord)
-            pm_p = store_dir / post_manifest_key(prod_id, part, "att-2020")
-            pm_doc = json.loads(pm_p.read_text(encoding="utf-8"))
-            good_pm = dict(pm_doc)
-            pm_doc["shard_sha256s"] = [
-                [k, sha256_hex(bad_coord) if k == "time/c/0" else s]
-                for k, s in pm_doc["shard_sha256s"]
-            ]
-            pm_p.write_bytes(json_bytes(pm_doc))
-            with self.assertRaises(ValueError):
-                publish_cycle_receipt(
+        def race_publish(att_id: str) -> str:
+            barrier.wait()
+            try:
+                rec = publish_cycle_receipt(
                     cfg,
                     store,
                     product_id=prod_id,
                     cycle_partition=part,
-                    attempt_id="att-2020",
+                    attempt_id=att_id,
                     bundle=b,
                     now_utc_iso="2026-11-12T00:30:00Z",
                 )
-            coord_p.write_bytes(good_coord)
-            pm_p.write_bytes(json_bytes(good_pm))
+                return f"won:{rec.attempt_id}"
+            except FileExistsError:
+                return "lost"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = sorted(pool.map(race_publish, ("att-A", "att-B")))
+        self.assertEqual(len([x for x in outcomes if x.startswith("won:")]), 1)
+        self.assertEqual(outcomes.count("lost"), 1)
+        winner = next(x.split(":")[1] for x in outcomes if x.startswith("won:"))
+        exp_t2 = 285.0 if winner == "att-A" else 308.0
+
+        ready = load_ready_receipt(store, b.product.model_id, part)
+        self.assertEqual(ready.attempt_id, winner)
+        shard = "forecast.zarr/temp_2m_k/c/0/0/0"
+        pub_key = f"upstream/{b.product.model_id}/{part}/{shard}"
+        pub_t2 = store.get_bytes(pub_key)
+        assert pub_t2 is not None
+        nj = b.domain.e_sn - 1 - 2 * b.domain.bdy_trim_cells
+        ni = b.domain.e_we - 1 - 2 * b.domain.bdy_trim_cells
+        dec = decode_shard_f32_array(
+            pub_t2, shard_time_steps=1, nz=1, ny=nj, nx=ni, output=b.output
+        )
+        self.assertAlmostEqual(dec.flat[0], exp_t2, delta=0.05)
+        staged = store_dir / attempt_stage_prefix(prod_id, part, winner) / shard
+        staged.write_bytes(b"damaged stage")
+        self.assertEqual(store.get_bytes(pub_key), pub_t2)
+
+    def test_stage_retention_multi_destination_replay_and_prune_flag(self) -> None:
+        prod_id, b = self.prod_id, self.bundle
+        cfg = self.cfg
+        stg_dir = self.root / "stage"
+        stg = LocalFileStore(stg_dir)
+        dst1 = LocalFileStore(self.root / "dst1")
+        dst2 = LocalFileStore(self.root / "dst2")
+        origin_iso = f"2026-11-12T{b.product.publish_origin_hour_utc:02d}:00:00Z"
+        part = _stage_attempt_with_t2(cfg, stg, b, origin_iso, "att-replay", 296.0)
+
+        def promote(dst: LocalFileStore, *, prune: bool) -> ReadyReceipt:
+            return publish_cycle_receipt(
+                cfg,
+                dst,
+                product_id=prod_id,
+                cycle_partition=part,
+                attempt_id="att-replay",
+                bundle=b,
+                stage_store=stg,
+                prune_stage=prune,
+            )
+
+        rec1 = promote(dst1, prune=False)
+        stage_path = stg_dir / attempt_stage_prefix(prod_id, part, "att-replay")
+        self.assertTrue(stage_path.exists())
+        rec2 = promote(dst2, prune=True)
+        self.assertEqual(rec1, rec2)
+        self.assertFalse(stage_path.exists())
+        diag_raw = dst2.get_bytes(f"upstream/{b.product.model_id}/{part}/_diagnostics.json")
+        assert diag_raw is not None
+        diag = DiagnosticsReceipt.from_doc(json.loads(diag_raw.decode("utf-8")))
+        self.assertGreaterEqual(diag.max_cfl, 0.0)
+
+        wrong_part = f"20261113/{part.split('/')[1]}"
+        dst2.put_if_absent(
+            f"upstream/{rec2.model_id}/{wrong_part}/_ready.json", json_bytes(rec2.to_doc())
+        )
+        with self.assertRaisesRegex(ValueError, "receipt identity"):
+            load_ready_receipt(dst2, rec2.model_id, wrong_part)
+
+    def test_stale_backfill_and_tampered_coord_rejection(self) -> None:
+        prod_id, b = self.prod_id, self.bundle
+        cfg = self.cfg
+        store_dir = self.root / "store"
+        store = LocalFileStore(store_dir)
+        stale_iso = f"2020-01-01T{b.product.publish_origin_hour_utc:02d}:00:00Z"
+        part = _stage_attempt_with_t2(cfg, store, b, stale_iso, "att-2020", 290.0)
+        stg_2020 = attempt_stage_prefix(prod_id, part, "att-2020")
+        coord_p = store_dir / stg_2020 / "forecast.zarr" / "time/c/0"
+        good_coord = coord_p.read_bytes()
+        bad_coord = b"\x00" * len(good_coord)
+        coord_p.write_bytes(bad_coord)
+        pm_p = store_dir / post_manifest_key(prod_id, part, "att-2020")
+        pm_doc = json.loads(pm_p.read_text(encoding="utf-8"))
+        good_pm = dict(pm_doc)
+        pm_doc["shard_sha256s"] = [
+            [k, sha256_hex(bad_coord) if k == "time/c/0" else s] for k, s in pm_doc["shard_sha256s"]
+        ]
+        pm_p.write_bytes(json_bytes(pm_doc))
+
+        def publish() -> None:
             publish_cycle_receipt(
                 cfg,
                 store,
@@ -292,54 +283,66 @@ class TestPublishRecoveryAndConcurrency(unittest.TestCase):
                 cycle_partition=part,
                 attempt_id="att-2020",
                 bundle=b,
-                now_utc_iso="2026-11-12T00:30:00Z",
             )
-            self.assertIsNone(store.get_bytes(f"upstream/{b.product.model_id}/latest.json"))
+
+        with self.assertRaisesRegex(ValueError, "contradicts RunLock"):
+            publish()
+        coord_p.write_bytes(good_coord)
+        pm_p.write_bytes(json_bytes(good_pm))
+        with patch("av_wrf.runner.publish.datetime") as clock:
+            clock.now.return_value = parse_iso_utc(stale_iso)
+            put = store.put_if_absent
+
+            def finish_after_deadline(key: str, payload: bytes) -> str:
+                if key.endswith("/_ready.json"):
+                    clock.now.return_value += timedelta(days=1)
+                return put(key, payload)
+
+            with patch.object(store, "put_if_absent", side_effect=finish_after_deadline):
+                publish()
+        self.assertIsNone(store.get_bytes(f"upstream/{b.product.model_id}/latest.json"))
 
     def test_rejects_corrupt_zstd_payload_with_valid_index_and_manifest_hash(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            cfg = root / "cfg"
-            prod_id = stage_sparse_config(ROOT / "config", cfg)
-            b = load_bundle(cfg, prod_id)
-            stage, dst = LocalFileStore(root / "stage"), LocalFileStore(root / "dst")
-            attempt_id = "att-corrupt"
-            origin = f"2026-11-12T{b.product.publish_origin_hour_utc:02d}:00:00Z"
-            part = _stage_attempt_with_t2(cfg, stage, b, origin, attempt_id, 290.0)
-            stage_prefix = attempt_stage_prefix(prod_id, part, attempt_id)
-            shard = "temp_2m_k/c/0/0/0"
-            shard_file = root / "stage" / stage_prefix / "forecast.zarr" / shard
-            valid_shard = shard_file.read_bytes()
-            corrupt_shard = bytes([valid_shard[0] ^ 1]) + valid_shard[1:]
-            shard_file.write_bytes(corrupt_shard)
-            manifest_file = root / "stage" / post_manifest_key(prod_id, part, attempt_id)
-            valid_manifest = manifest_file.read_bytes()
-            corrupt_manifest = json.loads(valid_manifest)
-            corrupt_manifest["shard_sha256s"] = [
-                [key, sha256_hex(corrupt_shard) if key == shard else sha]
-                for key, sha in corrupt_manifest["shard_sha256s"]
-            ]
-            manifest_file.write_bytes(json_bytes(corrupt_manifest))
+        prod_id, b = self.prod_id, self.bundle
+        root = self.root
+        stage, dst = LocalFileStore(root / "stage"), LocalFileStore(root / "dst")
+        attempt_id = "att-corrupt"
+        origin = f"2026-11-12T{b.product.publish_origin_hour_utc:02d}:00:00Z"
+        part = _stage_attempt_with_t2(self.cfg, stage, b, origin, attempt_id, 290.0)
+        stage_prefix = attempt_stage_prefix(prod_id, part, attempt_id)
+        shard = "temp_2m_k/c/0/0/0"
+        shard_file = root / "stage" / stage_prefix / "forecast.zarr" / shard
+        valid_shard = shard_file.read_bytes()
+        corrupt_shard = bytes([valid_shard[0] ^ 1]) + valid_shard[1:]
+        shard_file.write_bytes(corrupt_shard)
+        manifest_file = root / "stage" / post_manifest_key(prod_id, part, attempt_id)
+        valid_manifest = manifest_file.read_bytes()
+        corrupt_manifest = json.loads(valid_manifest)
+        corrupt_manifest["shard_sha256s"] = [
+            [key, sha256_hex(corrupt_shard) if key == shard else sha]
+            for key, sha in corrupt_manifest["shard_sha256s"]
+        ]
+        manifest_file.write_bytes(json_bytes(corrupt_manifest))
 
-            def publish() -> None:
-                publish_cycle_receipt(
-                    cfg,
-                    dst,
-                    product_id=prod_id,
-                    cycle_partition=part,
-                    attempt_id=attempt_id,
-                    bundle=b,
-                    stage_store=stage,
-                )
+        def publish() -> None:
+            publish_cycle_receipt(
+                self.cfg,
+                dst,
+                product_id=prod_id,
+                cycle_partition=part,
+                attempt_id=attempt_id,
+                bundle=b,
+                stage_store=stage,
+            )
 
-            with self.assertRaisesRegex(ValueError, "Corrupt Zstd payload"):
-                publish()
-            ready_key = f"upstream/{b.product.model_id}/{part}/_ready.json"
-            self.assertIsNone(dst.get_bytes(ready_key))
-            shard_file.write_bytes(valid_shard)
-            manifest_file.write_bytes(valid_manifest)
+        with self.assertRaisesRegex(ValueError, "Corrupt Zstd payload"):
             publish()
-            self.assertIsNotNone(dst.get_bytes(ready_key))
+        ready_key = f"upstream/{b.product.model_id}/{part}/_ready.json"
+        self.assertIsNone(dst.get_bytes(ready_key))
+        shard_file.write_bytes(valid_shard)
+        manifest_file.write_bytes(valid_manifest)
+        publish()
+        self.assertIsNotNone(dst.get_bytes(ready_key))
 
 
 if __name__ == "__main__":

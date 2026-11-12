@@ -14,7 +14,6 @@ from av_wrf.contracts import (
     ReadyReceipt,
     RunLock,
     StagedPostManifest,
-    format_iso_utc,
 )
 from av_wrf.core import (
     is_cycle_live_fresh,
@@ -40,10 +39,8 @@ MAX_CAS_RETRIES = 8
 
 
 def _advance_latest_pointer_with_retry(
-    store: ObjectStore, receipt: ReadyReceipt, b: LoadedBundle, now_utc_iso: str
+    store: ObjectStore, receipt: ReadyReceipt, b: LoadedBundle, now_utc_iso: str | None
 ) -> None:
-    if not is_cycle_live_fresh(b.product, b.output, receipt.publish_origin_utc, now_utc_iso):
-        return
     latest_key = f"upstream/{receipt.model_id}/latest.json"
     ready_key = f"{published_cycle_prefix(receipt.model_id, receipt.cycle_partition)}/_ready.json"
     next_payload = json_bytes(
@@ -56,6 +53,9 @@ def _advance_latest_pointer_with_retry(
     )
     for _ in range(MAX_CAS_RETRIES):
         current_raw, expected_tok = store.get_with_token(latest_key)
+        now = datetime.now(UTC).isoformat() if now_utc_iso is None else now_utc_iso
+        if not is_cycle_live_fresh(b.product, b.output, receipt.publish_origin_utc, now):
+            return
         if current_raw is not None:
             cur_doc = json.loads(current_raw.decode("utf-8"))
             if (
@@ -71,23 +71,28 @@ def _advance_latest_pointer_with_retry(
     raise RuntimeError(f"Failed to advance {latest_key} after {MAX_CAS_RETRIES} CAS attempts")
 
 
-def _check_existing_published_ready(
-    dst_store: ObjectStore,
-    ready_key: str,
-    lock: RunLock,
+def _read_ready(
+    store: ObjectStore, ready_key: str, model_id: str, cycle_partition: str
 ) -> ReadyReceipt | None:
-    existing_ready = dst_store.get_bytes(ready_key)
-    if existing_ready is None:
+    raw = store.get_bytes(ready_key)
+    if raw is None:
         return None
-    existing_doc = json.loads(existing_ready.decode("utf-8"))
-    if not isinstance(existing_doc, dict):
+    doc = json.loads(raw)
+    if not isinstance(doc, dict):
         raise ValueError("Corrupt _ready.json in published store")
-    committed = ReadyReceipt.from_doc(existing_doc)
-    if (
+    receipt = ReadyReceipt.from_doc(doc)
+    if (receipt.model_id, receipt.cycle_partition) != (model_id, cycle_partition):
+        raise ValueError(f"Published receipt identity does not match {ready_key}")
+    return receipt
+
+
+def _check_existing_published_ready(
+    dst_store: ObjectStore, ready_key: str, lock: RunLock
+) -> ReadyReceipt | None:
+    committed = _read_ready(dst_store, ready_key, lock.model_id, lock.cycle_partition)
+    if committed is not None and (
         committed.attempt_id != lock.attempt_id
         or committed.config_sha256 != lock.config_sha256
-        or committed.model_id != lock.model_id
-        or committed.cycle_partition != lock.cycle_partition
         or committed.publish_origin_utc != lock.publish_origin_utc
     ):
         raise FileExistsError(
@@ -138,7 +143,7 @@ def _promote_under_cycle_lock(
     is_synth: bool,
 ) -> ReadyReceipt:
     ready_key = f"{pub_root}/_ready.json"
-    staged_zarr, pub_zarr = f"{stage_root}/{pm.zarr_relpath}", f"{pub_root}/{pm.zarr_relpath}"
+    pub_zarr = f"{pub_root}/{pm.zarr_relpath}"
     with dst_store.cycle_lock(pub_root):
         already = _check_existing_published_ready(dst_store, ready_key, lock)
         if already is not None:
@@ -152,12 +157,8 @@ def _promote_under_cycle_lock(
                 dst_store.delete_prefix(f"{pub_root}/_diagnostics.json")
             dst_store.compare_and_swap(owner_key, owner_doc, owner_tok)
 
-        def push_verified(rel_key: str, sha: str, payload: bytes) -> None:
-            dst_key = f"{pub_zarr}/{rel_key}"
-            if stage_store is dst_store:
-                dst_store.copy_if_absent(f"{staged_zarr}/{rel_key}", dst_key, sha)
-            else:
-                put_idempotent(dst_store, dst_key, payload)
+        def push_verified(rel_key: str, payload: bytes) -> None:
+            put_idempotent(dst_store, f"{pub_zarr}/{rel_key}", payload)
 
         diag_raw = verify_staged_objects(
             stage_store, stage_root, pm, b, window, lock, on_verified_object=push_verified
@@ -184,11 +185,8 @@ def publish_cycle_receipt(
 ) -> ReadyReceipt:
     """Verify RunLock provenance, ZEP-0002 shards & coords, lock cycle, promote, and CAS latest."""
     stg = store if stage_store is None else stage_store
-    now_iso = format_iso_utc(datetime.now(UTC)) if now_utc_iso is None else now_utc_iso
     b = load_bundle(config_root, product_id) if bundle is None else bundle
-    lock = load_run_lock(stg, product_id, cycle_partition, attempt_id)
-    if lock.config_sha256 != b.config_sha256:
-        raise ValueError("Config bundle SHA-256 drifted from frozen RunLock")
+    lock = load_run_lock(stg, product_id, cycle_partition, attempt_id, bundle=b)
     stage_root = attempt_stage_prefix(product_id, cycle_partition, attempt_id)
     pm_raw = stg.get_bytes(post_manifest_key(product_id, cycle_partition, attempt_id))
     if pm_raw is None:
@@ -198,12 +196,14 @@ def publish_cycle_receipt(
         already = _check_existing_published_ready(store, chk, lock)
         if already is not None:
             if chk == live_r:
-                _advance_latest_pointer_with_retry(store, already, b, now_iso)
+                _advance_latest_pointer_with_retry(store, already, b, now_utc_iso)
             return already
         raise FileNotFoundError("Missing post_manifest.json; run `av-wrf post` before `publish`")
 
     window = resolve_cycle_window(b.product, b.output, lock.publish_origin_utc)
     pm = validate_post_manifest(json.loads(pm_raw.decode("utf-8")), b, window)
+    if pm.producer_sha256 is not None and pm.producer_sha256 != lock.producer_sha256:
+        raise ValueError("Staged producer SHA-256 differs from the RunLock")
     is_synth = pm.execution_mode == "synthetic"
     if is_synth and not allow_synthetic:
         raise ValueError("Refusing to publish synthetic forecast to live upstream store")
@@ -218,7 +218,7 @@ def publish_cycle_receipt(
         stg, store, stage_root, pub_root, pm, b, window, lock, is_synth
     )
     if not is_synth:
-        _advance_latest_pointer_with_retry(store, receipt, b, now_iso)
+        _advance_latest_pointer_with_retry(store, receipt, b, now_utc_iso)
     if prune_stage:
         stg.delete_prefix(stage_root)
     return receipt
@@ -226,23 +226,8 @@ def publish_cycle_receipt(
 
 def load_ready_receipt(store: ObjectStore, model_id: str, cycle_partition: str) -> ReadyReceipt:
     """Load an immutable ReadyReceipt from ObjectStore for webhook reconciliation."""
-    raw = store.get_bytes(f"{published_cycle_prefix(model_id, cycle_partition)}/_ready.json")
-    if raw is None:
+    key = f"{published_cycle_prefix(model_id, cycle_partition)}/_ready.json"
+    receipt = _read_ready(store, key, model_id, cycle_partition)
+    if receipt is None:
         raise FileNotFoundError(f"Missing _ready.json for {model_id} {cycle_partition}")
-    doc = json.loads(raw.decode("utf-8"))
-    if not isinstance(doc, dict):
-        raise ValueError("Expected JSON object in _ready.json")
-    return ReadyReceipt.from_doc(doc)
-
-
-def load_product_ready_receipt(
-    config_root: Path,
-    store: ObjectStore,
-    *,
-    product_id: str,
-    cycle_partition: str,
-    bundle: LoadedBundle | None = None,
-) -> ReadyReceipt:
-    """Resolve product_id -> model_id inside runner and load the published ReadyReceipt."""
-    b = load_bundle(config_root, product_id) if bundle is None else bundle
-    return load_ready_receipt(store, b.product.model_id, cycle_partition)
+    return receipt

@@ -42,8 +42,7 @@ python3 scripts/check_repo.py
 - [src/av_wrf/runner](src/av_wrf/runner/README.md): `flock`-serialized local storage,
   verified GFS input, attempt-staged `post`, full-horizon `publish`, and
   idempotent webhook dispatch.
-- [src/av_wrf/verify](src/av_wrf/verify/README.md): prospective input/baseline
-  archiver and mature-lead NWP + soaring-proxy scorecards.
+- [src/av_wrf/verify](src/av_wrf/verify/README.md): sounding-based soaring proxies.
 - [src/av_wrf/cli](src/av_wrf/cli/README.md): `av-wrf` CLI entrypoint and sole
   `os.environ` reader.
 - [config](config/README.md): sole owner of declarative regional product and

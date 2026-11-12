@@ -12,6 +12,9 @@ import math
 from av_wrf.codecs.zarr_shard import outer_shard_yx, resolve_inner_chunk_yx
 from av_wrf.contracts import (
     CAPE_PARCEL_DEFINITION,
+    DEFAULT_INNER_SPATIAL_CHUNK,
+    DEFAULT_SHARD_TIME_STEP,
+    DEFAULT_ZSTD_LEVEL,
     LOW_CLOUD_DEFINITION,
     MOISTURE_SOURCE_OF_TRUTH,
     TEMPERATURE_DEFINITION,
@@ -146,6 +149,12 @@ def build_zarr_v3_store_metadata(
         raise ValueError(
             f"OutputProfile.schema_id '{output.schema_id}' != locked '{ZARR_SCHEMA_ID}'"
         )
+    if (output.shard_time_steps, output.inner_chunk_yx, output.zstd_level) != (
+        DEFAULT_SHARD_TIME_STEP,
+        DEFAULT_INNER_SPATIAL_CHUNK,
+        DEFAULT_ZSTD_LEVEL,
+    ):
+        raise ValueError(f"OutputProfile sharding and compression must match {ZARR_SCHEMA_ID}")
     nj, ni = published_grid_shape(domain)
     t_len = len(lead_hours)
     k_len = domain.exported_levels_k

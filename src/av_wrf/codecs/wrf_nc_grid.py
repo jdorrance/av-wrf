@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
@@ -16,6 +17,9 @@ from av_wrf.core import (
     validate_solver_znw,
     validate_wrfinput_columns,
 )
+
+if TYPE_CHECKING:
+    import netCDF4
 
 NC_FLOAT_FILL_THRESHOLD = 1.0e30
 GRID_COORD_TOL_DEG = 5.0e-4
@@ -69,8 +73,9 @@ def extract_clean_f32_nc(
     arr = np.asarray(sliced)
     if arr.shape != expected_shape or arr.dtype.kind != "f":
         raise ValueError(f"{nc_path}:{name}[t={t_idx}] expected float shape {expected_shape}")
-    valid = (arr > -NC_FLOAT_FILL_THRESHOLD) & (arr < NC_FLOAT_FILL_THRESHOLD)
-    if not bool(np.all(valid)):
+    limit = NC_FLOAT_FILL_THRESHOLD
+    if not -limit < np.min(arr, initial=0.0) <= np.max(arr, initial=0.0) < limit:
+        valid = (arr > -limit) & (arr < limit)
         bad = tuple(int(x) for x in np.argwhere(~valid)[0])
         raise ValueError(
             f"{nc_path}:{name}[t={t_idx}]: fill or non-finite value {arr[bad]} at {bad}"
@@ -158,8 +163,8 @@ def verify_grid_against_domain(
     t_idx: int = 0,
     *,
     wps: bool = False,
-) -> None:
-    """Validate WPS or WRF Lambert grid attributes and mass-grid corner registration."""
+) -> npt.NDArray[np.float32]:
+    """Validate WPS or WRF Lambert registration and return the mass-grid longitude slab."""
     _check_global_grid_attrs(ds, domain, nc_path)
     variables: Mapping[str, object] = getattr(ds, "variables", {})
     ny, nx = domain.e_sn - 1, domain.e_we - 1
@@ -186,6 +191,46 @@ def verify_grid_against_domain(
             raise ValueError(
                 f"{nc_path}: {lat_name}/{lon_name} at ({jr},{ir}) disagrees with DomainProfile"
             )
+    return xlong
+
+
+def _southern_lambert_sine(
+    sine: npt.NDArray[np.float32], xlong: npt.NDArray[np.float32], stand_lon: float
+) -> npt.NDArray[np.float32]:
+    # WPS get_rotang uses a positive cone in both hemispheres. The signed southern cone
+    # gives a grid-to-Earth sine with the sign of the wrapped longitude offset.
+    # https://github.com/wrf-model/WPS/blob/v4.7.0/geogrid/src/process_tile_module.F#L1873-L1895
+    dlon = (xlong.astype(np.float64) - stand_lon + 180.0) % 360.0 - 180.0
+    return np.copysign(sine, dlon, dtype=np.float32, casting="same_kind")
+
+
+def check_geogrid_rotation(
+    ds: netCDF4.Dataset,
+    nc_path: Path,
+    domain: DomainProfile,
+    xlong: npt.NDArray[np.float32],
+    *,
+    repair: bool = False,
+) -> None:
+    """Check southern WPS sine signs or correct a newly generated writable geo_em."""
+    if domain.std_parallel_1_deg >= 0.0:
+        return
+    ny, nx = xlong.shape
+    variables = ds.variables
+    for suffix, longitude in (
+        ("", xlong),
+        ("_U", extract_clean_f32_nc(variables, nc_path, "XLONG_U", 0, (ny, nx + 1))),
+        ("_V", extract_clean_f32_nc(variables, nc_path, "XLONG_V", 0, (ny + 1, nx))),
+    ):
+        name = "SINALPHA" + suffix
+        sine = extract_clean_f32_nc(variables, nc_path, name, 0, longitude.shape)
+        corrected = _southern_lambert_sine(sine, longitude, domain.central_meridian_deg)
+        if not np.array_equal(sine, corrected):
+            if not repair:
+                raise ValueError(
+                    f"{nc_path}: incorrect southern Lambert {name}; rerun `av-wrf geog`"
+                )
+            variables[name][0] = corrected
 
 
 def verify_wrfout_grid_against_domain(
@@ -195,9 +240,9 @@ def verify_wrfout_grid_against_domain(
     t_idx: int = 0,
     *,
     science: ScienceProfile | None = None,
-) -> None:
-    """Validate WRF grid registration, eta faces and hybrid coordinate parameters."""
-    verify_grid_against_domain(ds, domain, nc_path, t_idx)
+) -> npt.NDArray[np.float32]:
+    """Validate WRF registration and hybrid eta faces, then return mass-grid longitude."""
+    xlong = verify_grid_against_domain(ds, domain, nc_path, t_idx)
     variables: Mapping[str, object] = getattr(ds, "variables", {})
     znw_arr = extract_clean_f32_nc(variables, nc_path, "ZNW", t_idx, (domain.e_vert,))
     validate_solver_znw([float(eta) for eta in znw_arr], domain)
@@ -206,6 +251,7 @@ def verify_wrfout_grid_against_domain(
         or not math.isclose(float(getattr(ds, "ETAC", math.nan)), science.etac, abs_tol=1e-6)
     ):
         raise ValueError(f"{nc_path}: HYBRID_OPT or ETAC disagrees with ScienceProfile")
+    return xlong
 
 
 def validate_wrfinput_nc(

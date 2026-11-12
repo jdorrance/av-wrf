@@ -1,14 +1,13 @@
 """Pure vectorized meteorological formulas, THM consistency, and bit-grooming.
 
 WRF inversion uses fixed `WRF_T0_K = 300.0 K`, `r_d = 287.0`, `cp = 1004.5`, `r_v = 461.6`,
-`xlv = 2.5e6`, and `g = 9.81` (`WRF/share/module_model_constants.F`); MSLP uses a C0-continuous
-Shuell plateau cap across `290.5 K`; 10 m gusts use surface air density `PSFC / (Rd * T_v0)`.
+`xlv = 2.5e6`, and `g = 9.81` (`WRF/share/module_model_constants.F`); the MSLP fallback
+uses a continuous plateau adjustment at `290.5 K`.
 """
 
 from __future__ import annotations
 
 from array import array
-from itertools import pairwise
 
 import numpy as np
 import numpy.typing as npt
@@ -28,8 +27,8 @@ G0_MPS2 = 9.81
 STD_LAPSE_K_PER_M = 0.0065
 IFS_GUST_COEFF = 7.71
 VON_KARMAN = 0.40
-CONSUMER_KELVIN_OFFSET = 273.15
-CONSUMER_EPSILON = 0.622
+ZERO_CELSIUS_K = 273.15
+WATER_DRY_AIR_MOLAR_MASS_RATIO = 0.622
 
 
 def potential_to_temp_vec(
@@ -52,8 +51,8 @@ def verify_t_thm_consistency(
     thm_v = np.frombuffer(thm.buf, dtype=np.float32)
     qv_raw = np.frombuffer(qv.buf, dtype=np.float32)
     p_pa = np.add(
-        np.frombuffer(p_pert.buf, dtype=np.float32),
-        np.frombuffer(pb.buf, dtype=np.float32),
+        np.frombuffer(p_pert.buf, dtype=np.float32, count=td_v.size),
+        np.frombuffer(pb.buf, dtype=np.float32, count=td_v.size),
         dtype=np.float64,
     )
     if not (
@@ -93,11 +92,11 @@ def clamp_spfh_2m_vec(
 ) -> npt.NDArray[np.float64]:
     """Vectorized Bolton (1980) 2 m liquid-saturation cap."""
     q = np.maximum(0.0, spfh_2m_kgkg)
-    es_pa = 611.2 * np.exp(
-        (17.67 * (t2_k - CONSUMER_KELVIN_OFFSET)) / np.maximum(1.0, t2_k - 29.65)
-    )
+    es_pa = 611.2 * np.exp((17.67 * (t2_k - ZERO_CELSIUS_K)) / np.maximum(1.0, t2_k - 29.65))
     safe_p = psfc_pa > es_pa * 1.01
-    r_sat = np.where(safe_p, CONSUMER_EPSILON * es_pa / np.maximum(1.0, psfc_pa - es_pa), q)
+    r_sat = np.where(
+        safe_p, WATER_DRY_AIR_MOLAR_MASS_RATIO * es_pa / np.maximum(1.0, psfc_pa - es_pa), q
+    )
     return np.where(safe_p, np.minimum(q, (r_sat / (1.0 + r_sat)) * (1.0 - 2.0**-14)), q)
 
 
@@ -107,7 +106,7 @@ def geometric_w_to_omega_vec(
     temp_k: npt.NDArray[np.float64],
     spfh_kgkg: npt.NDArray[np.float64],
 ) -> npt.NDArray[np.float64]:
-    """Vectorized hydrostatic vertical velocity conversion `omega = -rho_m * g0 * w`."""
+    """Encode native geometric w as the moist hydrostatic proxy `-rho_m * g0 * w`."""
     tv_k = temp_k * (1.0 + VIRTUAL_TEMP_COEFF * np.maximum(0.0, spfh_kgkg))
     return -(pressure_pa / (R_DRY_J_KG_K * tv_k)) * G0_MPS2 * w_mps
 
@@ -118,20 +117,13 @@ def hypsometric_mslp_vec(
     t2_k: npt.NDArray[np.float64],
     spfh_2m: npt.NDArray[np.float64],
 ) -> npt.NDArray[np.float64]:
-    """Continuous WMO / Shuell plateau MSLP reduction with zero branch jump across 290.5 K."""
-    z_m = np.maximum(0.0, terrain_m)
+    """Reduce surface pressure to sea level with a continuous plateau adjustment."""
     tv_sfc = t2_k * (1.0 + VIRTUAL_TEMP_COEFF * np.maximum(0.0, spfh_2m))
     tv_0 = np.where(tv_sfc < 255.0, 0.5 * (255.0 + tv_sfc), tv_sfc)
-    tv_sl = tv_0 + STD_LAPSE_K_PER_M * z_m
-    hot_plat = 0.5 * (290.5 + tv_0)
-    tv_0_adj = np.where((tv_0 > 290.5) & (tv_sl > 290.5), hot_plat, tv_0)
-    tv_sl_adj = np.where(
-        (tv_0 <= 290.5) & (tv_sl > 290.5),
-        290.5,
-        np.where((tv_0 > 290.5) & (tv_sl > 290.5), hot_plat, tv_sl),
-    )
-    tv_mean = np.maximum(180.0, 0.5 * (tv_0_adj + tv_sl_adj))
-    return psfc_pa * np.exp((G0_MPS2 * z_m) / (R_DRY_J_KG_K * tv_mean))
+    tv_sl = tv_0 + STD_LAPSE_K_PER_M * terrain_m
+    np.minimum(290.5, tv_sl, out=tv_sl, where=terrain_m > 0.0)
+    tv_mean = np.maximum(180.0, 0.5 * (tv_0 + tv_sl))
+    return psfc_pa * np.exp((G0_MPS2 * terrain_m) / (R_DRY_J_KG_K * tv_mean))
 
 
 def parameterized_gust_10m_vec(
@@ -145,7 +137,7 @@ def parameterized_gust_10m_vec(
     spfh_2m: npt.NDArray[np.float64],
     psfc_pa: npt.NDArray[np.float64],
 ) -> npt.NDArray[np.float64]:
-    """Instantaneous 10 m wind plus a Panofsky-style turbulence increment."""
+    """Estimate the instantaneous 10 m gust from IFS turbulence using native PBL height."""
     q2, tk = np.maximum(0.0, spfh_2m), np.maximum(200.0, t2_k)
     tv0 = tk * (1.0 + VIRTUAL_TEMP_COEFF * q2)
     rho = np.maximum(10_000.0, psfc_pa) / (R_DRY_J_KG_K * tv0)
@@ -153,22 +145,37 @@ def parameterized_gust_10m_vec(
         sensible_flux_wm2 / (rho * CP_DRY_J_KG_K)
     ) + VIRTUAL_TEMP_COEFF * tk * (latent_flux_wm2 / (rho * LV_VAPOR_J_KG))
     wstar3 = (G0_MPS2 * np.maximum(0.0, pblh_m) / tv0) * np.maximum(0.0, vflux)
+    # IFS Cy43r1 eqs. 3.97 and 3.98 use (1 - 0.5*z_i/(12*L))^(1/3) in unstable air.
+    # Substituting Monin-Obukhov 1/L gives u_star^3 + (0.5*kappa/12)*w_star^3.
+    # https://doi.org/10.21957/sqvo5yxja
     eddy = IFS_GUST_COEFF * np.cbrt(
         np.power(np.maximum(0.0, ustar_mps), 3.0) + (0.5 * VON_KARMAN / 12.0) * wstar3
     )
     return np.hypot(u10_mps, v10_mps) + eddy
 
 
-def max_random_cloud_pct_vec(cloud: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
-    """Compute Geleyn/Hogan maximum-random overlap over clipped `(level, cell)` fractions."""
-    clear: npt.NDArray[np.float64] = np.subtract(1.0, cloud[0], dtype=np.float64)
-    for prev, curr in pairwise(cloud):
-        active = prev < 0.999999
-        ratio = (1.0 - np.maximum(prev, curr)) / np.where(active, 1.0 - prev, 1.0)
-        clear *= np.where(active, ratio, 0.0)
-    np.subtract(1.0, clear, out=clear)
-    clear *= 100.0
-    return clear
+def max_random_cloud_cover_pct(
+    cloud: npt.NDArray[np.float32],
+    pressure_pa: npt.NDArray[np.float64],
+    psfc_pa: npt.NDArray[np.float32],
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """Return total and low cloud percent from native cloud and descending pressure columns."""
+    # ECMWF's sigma layer uses 0.8*PSFC. The producer contract includes the boundary.
+    # https://codes.ecmwf.int/grib/param-db/186
+    # The adjacent-layer clear fraction follows IFS Cy49r1 Part II equation 3.24.
+    # https://www.ecmwf.int/sites/default/files/elibrary/112024/81624-ifs-documentation-cy49r1.pdf
+    cutoff = np.multiply(psfc_pa, 0.8, dtype=np.float64)
+    prev = 1.0 - np.clip(cloud[0], 0.0, 1.0, dtype=np.float64)
+    clear = prev.copy()
+    low_clear = np.where(pressure_pa[0] >= cutoff, clear, 1.0)
+    for fraction, pressure in zip(cloud[1:], pressure_pa[1:], strict=True):
+        curr = 1.0 - np.clip(fraction, 0.0, 1.0, dtype=np.float64)
+        ratio = np.minimum(prev, curr)
+        np.divide(ratio, prev, out=ratio, where=prev > 0.0)
+        clear *= ratio
+        np.copyto(low_clear, clear, where=pressure >= cutoff)
+        prev = curr
+    return (1.0 - clear) * 100.0, (1.0 - low_clear) * 100.0
 
 
 def rotate_grid_to_earth_vec(

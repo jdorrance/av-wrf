@@ -18,7 +18,7 @@ from av_wrf.contracts import (
     Slab2DI32,
     Slab3DF32,
 )
-from av_wrf.core import MOIST_THETA_COEFF, WRF_T0_K, estimate_auto_levels_agl_m
+from av_wrf.core import G0_MPS2, MOIST_THETA_COEFF, WRF_T0_K, estimate_auto_levels_agl_m
 
 
 def _synthetic_base_3d(
@@ -31,10 +31,10 @@ def _synthetic_base_3d(
     for m in mids:
         faces_agl.append(faces_agl[-1] + 2.0 * (m - faces_agl[-1]))
     p_pb = array("f")
-    z_phb = array("f", [(1200.0 + faces_agl[0]) * 9.81]) * n2
+    z_phb = array("f", [(1200.0 + faces_agl[0]) * G0_MPS2]) * n2
     for k in range(nz):
         p_pb.extend(array("f", [87_800.0 * (0.97**k)]) * n2)
-        z_phb.extend(array("f", [(1200.0 + faces_agl[k + 1]) * 9.81]) * n2)
+        z_phb.extend(array("f", [(1200.0 + faces_agl[k + 1]) * G0_MPS2]) * n2)
     pb = CompMass3D(Slab3DF32(nz=nz, ny=ny, nx=nx, buf=p_pb))
     ph = CompStagZ3D(Slab3DF32(nz=nz + 1, ny=ny, nx=nx, buf=array("f", [0.0]) * ((nz + 1) * n2)))
     phb = CompStagZ3D(Slab3DF32(nz=nz + 1, ny=ny, nx=nx, buf=z_phb))

@@ -94,33 +94,40 @@ their respective sides of the Zarr v3 contract:
 ## 4. Winds, Vertical Velocity, MSLP, Surface Fluxes, and CAPE
 
 1. **Grid-to-Earth wind rotation & solver vs. diagnostic CFL (`core/namelist.py`, `runner/solver_exec.py`):**
-   WRF `SINALPHA = -sin(theta_lambert)` where $\theta = n(\lambda - \lambda_0)$
-   ([`wrf-python` #142](https://github.com/NCAR/wrf-python/issues/142)). Actual RK3
-   substep stability is gated on `namelist.py` (`\Delta t \le 6 \Delta x_{\text{phys}}`),
+   WPS computes `SINALPHA` with an unsigned Lambert cone. Geography generation
+   restores the southern sine sign on mass and staggered grids before hashing.
+   Solve checks those signs before running WPS, and post normalizes imported WRF
+   wind coefficients. [WPS `get_rotang`](https://github.com/wrf-model/WPS/blob/v4.7.0/geogrid/src/process_tile_module.F#L1873-L1895)
+   Actual RK3 substep stability is gated on `namelist.py` (`\Delta t \le 6 \Delta x_{\text{phys}}`),
    solver logs, and `wrf.exe` completion. `DiagnosticsReceipt.max_cfl`
    uses grid-relative output winds and nominal cell spacing as a diagnostic proxy.
-2. **Hydrostatic $\omega$ round-trip (`geometric_w_to_omega_vec`):** Nonhydrostatic
-   WRF outputs geometric $w = dz/dt$ (`m/s`). `av-wrf` converts via hydrostatic
-   $\omega = -\rho_m g w$ so `windy-av-layer` (`geometricWFromOmegaMps`) recovers
-   mountain-wave $w$ cleanly.
-3. **10 m gust and flux time support:** The endpoint gust estimate uses native
-   `U10`, `V10`, `UST`, `HFX`, `LH`, and `PBLH` for a turbulent increment.
+2. **Hydrostatic pressure-velocity proxy (`geometric_w_to_omega_vec`):** The producer
+   encodes native WRF geometric $w$ as $-\rho_m g w$ using moist density and WRF
+   constants. A matching inverse recovers $w$ within storage rounding. Material
+   pressure velocity also depends on pressure evolution and advection.
+   The consumer's dry-density inverse underestimates $|w|$ by about 0.55% at
+   `q = 0.01 kg/kg`.
+3. **10 m gust and flux time support:** The endpoint gust estimate adapts the
+   IFS turbulence term with native `PBLH` and a virtual-temperature flux from
+   `HFX` and `LH`. It represents boundary-layer turbulence at the valid time.
+   [IFS Cy43r1 §3.10.4, equations 3.97–3.99](https://doi.org/10.21957/sqvo5yxja)
    Exported sensible and latent fluxes use signed `ACHFX` and `ACLHF` differences.
    Precipitation uses bucket-adjusted `RAINC + RAINNC`. All three accumulators
    share the full interval between published valid times, so tail rain totals
    can be recovered by integrating the reported rate. A shorter heat window
    requires its own time support in the consumer contract.
-4. **Plateau MSLP (`AFWA_MSLP` / `hypsometric_mslp_vec`):** Uses WRF's native
-   `AFWA_MSLP` (`afwa_diag_opt = 1`) when present in `wrfout` and falls back to a
-   $C^0$-continuous WMO / Shuell plateau reduction (`tv_sl` capped smoothly at
-   `290.5 K` when `tv_0 <= 290.5 K` with zero discontinuity across temperature branches).
+4. **Plateau MSLP (`AFWA_MSLP` / `hypsometric_mslp_vec`):** Uses positive native
+   `AFWA_MSLP` values (`afwa_diag_opt = 1`). The fallback reduces pressure over
+   signed terrain with a 6.5 K/km lapse rate. It moves virtual temperatures below
+   255 K halfway toward that threshold and caps the sea-level virtual
+   temperature at 290.5 K when reducing from above sea level.
+   [Native WRF AFWA MSLP](https://github.com/wrf-model/WRF/blob/06d4240ae989cc3e50af412bb472df3d9048783c/phys/module_diag_functions.F#L911-L962)
 5. **CAPE provenance (`afwa_buoy_opt = 1`, strict `AFWA_CAPE_MU`):** Enabling
    `afwa_buoy_opt = 1` in `&afwa` ([`registry.afwa`](https://github.com/wrf-model/WRF/blob/v4.8.0/Registry/registry.afwa))
-   computes `AFWA_CAPE_MU`. WRF starts at the surface and searches for maximum
-   equivalent potential temperature at pressures above the absolute `500 hPa`
-   cutoff ([`module_diag_functions.F`](https://github.com/wrf-model/WRF/blob/v4.8.0/phys/module_diag_functions.F#L517-L562)).
-   The Zarr group records this method. The provisional catalog's 300 hPa label
-   needs a consumer contract migration.
+   computes `AFWA_CAPE_MU`. WRF initializes the parcel at the lowest model level
+   and searches for maximum equivalent potential temperature at pressures above
+   the absolute `500 hPa` cutoff. [WRF `Buoyancy`](https://github.com/wrf-model/WRF/blob/06d4240ae989cc3e50af412bb472df3d9048783c/phys/module_diag_functions.F#L556-L603)
+   The Zarr group and producer contract record this method.
 
 ## 5. Comparison Against Dr. Jack Glendening (RASP / BLIPMAP) & Operational Caveats
 

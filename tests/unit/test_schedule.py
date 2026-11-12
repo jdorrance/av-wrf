@@ -24,6 +24,23 @@ from av_wrf.runner import load_bundle  # noqa: E402
 
 
 class TestSchedule(unittest.TestCase):
+    def test_cron_requires_full_solver_margin_before_cycle_expiry(self) -> None:
+        cfg = ROOT / "config"
+        b = load_bundle(cfg, next((cfg / "products").glob("*.yaml")).stem)
+        product = dataclasses.replace(b.product, local_deadline_hhmm="18:00")
+        hour = (product.publish_origin_hour_utc + product.max_cycle_age_hours - 1) % 24
+        validate_horizon_policy(
+            dataclasses.replace(product, schedule_cron_utc=f"0 {hour} * * *"),
+            b.primary_source,
+            b.output,
+        )
+        with self.assertRaisesRegex(ValueError, "before the live cycle expires"):
+            validate_horizon_policy(
+                dataclasses.replace(product, schedule_cron_utc=f"1 {hour} * * *"),
+                b.primary_source,
+                b.output,
+            )
+
     def test_all_shipped_products_horizon_deadline_freshness_and_cycle_parsing(self) -> None:
         cfg_root = ROOT / "config"
         prod_paths = sorted((cfg_root / "products").glob("*.yaml"))

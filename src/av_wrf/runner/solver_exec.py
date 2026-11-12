@@ -3,24 +3,25 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from collections.abc import Mapping
 from datetime import timedelta
 from pathlib import Path
 
-from av_wrf.codecs import validate_wrfinput_nc, verify_grid_against_domain
-from av_wrf.contracts import BuildManifest, DomainProfile, RunLock, SolverReceipt, parse_iso_utc
+from av_wrf.codecs import check_geogrid_rotation, validate_wrfinput_nc, verify_grid_against_domain
+from av_wrf.contracts import BuildManifest, DomainProfile, RunLock, SolverReceipt
 from av_wrf.core import (
     compile_geogrid_namelist_sections,
     compile_wps_namelist_sections,
     compile_wrf_run_namelist,
     render_fortran_namelist,
-    required_forcing_forecast_hours,
+    resolve_cycle_window,
     validate_domain_profile,
 )
 from av_wrf.runner.bundle import LoadedBundle, load_bundle
-from av_wrf.runner.mirrors import verify_forcing_manifest
-from av_wrf.runner.solver import load_build_manifest, verify_solver_receipt
+from av_wrf.runner.mirrors import resolve_forcing_window, verify_forcing_manifest
+from av_wrf.runner.solver import _hash_complete_wrfout, load_build_manifest, verify_solver_receipt
 from av_wrf.runner.stages import load_run_lock
 from av_wrf.runner.store import (
     ObjectStore,
@@ -32,7 +33,7 @@ from av_wrf.runner.store import (
 
 
 def _resolve_solver_exe(solver_prefix: Path, exe_name: str) -> Path:
-    """Resolve compiled executable strictly under `<solver_prefix>/bin/` (no PATH fallback)."""
+    """Resolve a `bin` executable whose target stays within the solver prefix."""
     candidate = (solver_prefix / "bin" / exe_name).resolve()
     if (
         solver_prefix.resolve() not in candidate.parents
@@ -73,7 +74,7 @@ def run_geogrid(
     solver_prefix: Path = Path("/opt/av-wrf"),
     bundle: LoadedBundle | None = None,
 ) -> tuple[Path, str]:
-    """Validate static geography, execute `geogrid.exe`, and write `geog_receipt.json`."""
+    """Generate the validated static grid and return its path and SHA-256."""
     b = load_bundle(config_root, product_id) if bundle is None else bundle
     validate_domain_profile(b.domain)
     geog_root = Path(b.domain.geog_data_path)
@@ -89,71 +90,53 @@ def run_geogrid(
     wps_txt = render_fortran_namelist(compile_geogrid_namelist_sections(b.domain))
     (work_dir / "namelist.wps").write_text(wps_txt, encoding="utf-8")
     subprocess.run([str(exe)], cwd=work_dir, check=True)
-    _validate_geo_em(geo_em, b.domain)
-    geo_sha = sha256_file(geo_em)
-    receipt = {
-        "product_id": b.product.product_id,
-        "domain_profile_id": b.domain.profile_id,
-        "dem_source": b.domain.dem_source,
-        "landuse_source": b.domain.landuse_source,
-        "geo_em_sha256": geo_sha,
-    }
-    (work_dir / "geog_receipt.json").write_bytes(json_bytes(receipt))
-    return geo_em, geo_sha
+    # WPS picks the first matching resolution for each field and logs the selected source.
+    # https://github.com/wrf-model/WPS/blob/v4.7.0/geogrid/src/source_data_module.F#L802-L831
+    log_path = work_dir / "geogrid.log"
+    log = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
+    selected = set(re.findall(r"Using (\S+) data source for (HGT_M|LANDUSEF)\.", log))
+    expected = {(b.domain.dem_source, "HGT_M"), (b.domain.landuse_source, "LANDUSEF")}
+    if selected != expected:
+        geo_em.unlink(missing_ok=True)
+        if not log.strip():
+            raise RuntimeError(f"Missing or empty WPS geogrid.log: {log_path}")
+        raise ValueError(f"Geogrid selected {sorted(selected)}, expected {sorted(expected)}")
+    _validate_geo_em(geo_em, b.domain, repair_rotation=True)
+    return geo_em, sha256_file(geo_em)
 
 
-def _validate_geo_em(path: Path, domain: DomainProfile) -> None:
+def _validate_geo_em(path: Path, domain: DomainProfile, *, repair_rotation: bool = False) -> None:
     import netCDF4
 
-    with netCDF4.Dataset(str(path), mode="r") as ds:
-        verify_grid_against_domain(ds, domain, path, wps=True)
+    with netCDF4.Dataset(
+        str(path), mode="r+" if repair_rotation and domain.std_parallel_1_deg < 0.0 else "r"
+    ) as ds:
+        xlong = verify_grid_against_domain(ds, domain, path, wps=True)
         _verify_wps_values(ds.variables, path, ("HGT_M", "LU_INDEX", "LANDMASK"))
+        check_geogrid_rotation(ds, path, domain, xlong, repair=repair_rotation)
 
 
 def _inspect_metgrid_dims(attempt_dir: Path, b: LoadedBundle, lock: RunLock) -> tuple[int, int]:
     import netCDF4
 
-    init = parse_iso_utc(lock.forcing_cycle_utc)
-    dates = tuple(
-        (init + timedelta(hours=h)).strftime("%Y-%m-%d_%H:%M:%S")
-        for h in required_forcing_forecast_hours(lock, b.primary_source)
-    )
+    recipe, cycle, hours = resolve_forcing_window(lock, b.primary_source, domain=b.domain)
+    dates = tuple((cycle + timedelta(hours=h)).strftime("%Y-%m-%d_%H:%M:%S") for h in hours)
     files = tuple(attempt_dir / f"met_em.d01.{date}.nc" for date in dates)
     if set(attempt_dir.glob("met_em.d01.*.nc")) != set(files):
         raise RuntimeError("metgrid timestamps differ from the RunLock forcing window")
-    dims_seen: set[tuple[int, int]] = set()
+    dims_seen: set[tuple[int, tuple[int, ...]]] = set()
     for path, date in zip(files, dates, strict=True):
         with netCDF4.Dataset(str(path), mode="r") as ds:
             if bytes(ds["Times"][0].tobytes()).decode("ascii") != date:
                 raise ValueError(f"met_em Times does not match filename: {path}")
-            dims_seen.add(
-                (len(ds.dimensions["num_metgrid_levels"]), len(ds.dimensions["num_st_layers"]))
-            )
-            _verify_wps_values(
-                ds.variables,
-                path,
-                (
-                    "PRES",
-                    "GHT",
-                    "TT",
-                    "RH",
-                    "UU",
-                    "VV",
-                    "PSFC",
-                    "PMSL",
-                    "SKINTEMP",
-                    "SOILHGT",
-                    "LANDSEA",
-                    "SM",
-                    "ST",
-                    "SNOW",
-                    "SEAICE",
-                ),
-            )
+            soil_levels = tuple(len(ds.dimensions[name]) for name in recipe.metgrid_soil_dimensions)
+            dims_seen.add((len(ds.dimensions["num_metgrid_levels"]), soil_levels))
+            _verify_wps_values(ds.variables, path, recipe.metgrid_fields)
             verify_grid_against_domain(ds, b.domain, path, wps=True)
     if len(dims_seen) != 1:
         raise ValueError(f"Inconsistent met_em level dimensions across window: {dims_seen}")
-    return next(iter(dims_seen))
+    levels, soil_levels = next(iter(dims_seen))
+    return levels, max(soil_levels)
 
 
 def _verify_wps_values(
@@ -167,7 +150,7 @@ def _verify_wps_values(
         if not isinstance(var, netCDF4.Variable):
             raise ValueError(f"Missing required WPS field {name} in {path}")
         values = var[:]
-        if np.ma.is_masked(values) or not np.all(np.isfinite(values)) or np.any(abs(values) > 1e19):
+        if np.ma.is_masked(values) or not -1e19 <= np.min(values) <= np.max(values) <= 1e19:
             raise ValueError(f"Invalid values in WPS field {name} in {path}")
 
 
@@ -180,10 +163,13 @@ def _stage_wps_attempt(
     solver_prefix: Path,
     forcing_shas: tuple[tuple[str, str], ...],
 ) -> None:
-    vtable_name = b.primary_source.vtable_name
-    _link_file(
-        solver_prefix / "share" / "wps" / "Variable_Tables" / vtable_name, attempt_dir / "Vtable"
-    )
+    source = b.primary_source
+    recipe, _, _ = resolve_forcing_window(lock, source, domain=b.domain)
+    vtable = attempt_dir / "Vtable"
+    if recipe.vtable_text is None:
+        _link_file(solver_prefix / "share" / "wps" / "Variable_Tables" / source.vtable_name, vtable)
+    else:
+        vtable.write_text(recipe.vtable_text, encoding="utf-8")
     (attempt_dir / "metgrid").mkdir(exist_ok=True)
     _link_file(
         solver_prefix / "share" / "wps" / "METGRID.TBL.ARW", attempt_dir / "metgrid" / "METGRID.TBL"
@@ -192,7 +178,7 @@ def _stage_wps_attempt(
     for idx, (fname, _) in enumerate(forcing_shas):
         _link_file(grib_dir / fname, attempt_dir / f"GRIBFILE.{_grib_alpha_suffix(idx)}")
     wps_txt = render_fortran_namelist(
-        compile_wps_namelist_sections(b.domain, b.science, lock, b.primary_source)
+        compile_wps_namelist_sections(b.domain, b.science, lock, source)
     )
     (attempt_dir / "namelist.wps").write_text(wps_txt, encoding="utf-8")
 
@@ -207,13 +193,20 @@ def _exec_mpi_step(
     rsl0 = attempt_dir / "rsl.error.0000"
     if not rsl0.is_file():
         raise RuntimeError(f"{exe_name} produced no rsl.error.0000 log")
-    if marker not in rsl0.read_text(encoding="utf-8", errors="replace"):
+    completed = False
+    for log in sorted(attempt_dir.glob("rsl.*")) if reject_cfl else (rsl0,):
+        with log.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if log == rsl0 and marker in line:
+                    completed = True
+                    if not reject_cfl:
+                        break
+                if reject_cfl:
+                    lowered = line.lower()
+                    if "exceeded cfl" in lowered or "points exceeded v_cfl" in lowered:
+                        raise RuntimeError(f"Solver CFL violation detected in {log.name}")
+    if not completed:
         raise RuntimeError(f"{exe_name} missing completion marker '{marker}' in rsl.error.0000")
-    if reject_cfl:
-        for rsl_file in sorted(attempt_dir.glob("rsl.*")):
-            txt = rsl_file.read_text(encoding="utf-8", errors="replace").lower()
-            if "exceeded cfl" in txt or "points exceeded v_cfl" in txt:
-                raise RuntimeError(f"Solver CFL violation detected in {rsl_file.name}")
 
 
 def _link_run_tables(run_tables: Path, attempt_dir: Path) -> None:
@@ -224,7 +217,7 @@ def _link_run_tables(run_tables: Path, attempt_dir: Path) -> None:
         if (
             item.is_file()
             and not item.name.startswith("namelist")
-            and item.name not in {"real", "wrf", "ndown", "tc"}
+            and item.name.removesuffix(".exe") not in {"real", "wrf", "ndown", "tc"}
         ):
             _link_file(item, attempt_dir / item.name)
 
@@ -235,7 +228,7 @@ def _execute_solver_binaries(
     lock: RunLock,
     solver_prefix: Path,
     mpi_launcher: tuple[str, ...],
-) -> tuple[tuple[str, str], ...]:
+) -> None:
     subprocess.run(
         [str(_resolve_solver_exe(solver_prefix, "ungrib.exe"))], cwd=attempt_dir, check=True
     )
@@ -277,12 +270,6 @@ def _execute_solver_binaries(
         "SUCCESS COMPLETE WRF",
         reject_cfl=True,
     )
-    wrfouts = tuple(
-        (p.name, sha256_file(p)) for p in sorted(attempt_dir.glob("wrfout_d01_*")) if p.is_file()
-    )
-    if not wrfouts:
-        raise RuntimeError("wrf.exe completed without writing wrfout_d01_* files")
-    return wrfouts
 
 
 def run_wrf_cycle(
@@ -302,9 +289,7 @@ def run_wrf_cycle(
 ) -> SolverReceipt:
     """Execute `ungrib -> metgrid -> real -> wrf` in clean attempt scratch and bind receipt."""
     b = load_bundle(config_root, product_id) if bundle is None else bundle
-    lock = load_run_lock(store, product_id, cycle_partition, attempt_id)
-    if lock.config_sha256 != b.config_sha256:
-        raise ValueError("Config bundle SHA-256 drifted from frozen RunLock")
+    lock = load_run_lock(store, product_id, cycle_partition, attempt_id, bundle=b)
     _verify_runtime_build_manifest(solver_prefix, lock, runtime_manifest)
     root = work_dir.resolve()
     attempt_dir = root / product_id / cycle_partition.replace("/", "_") / attempt_id
@@ -313,6 +298,8 @@ def run_wrf_cycle(
     receipt_key = solver_receipt_key(product_id, cycle_partition, attempt_id)
     if store.get_bytes(receipt_key) is not None:
         return verify_solver_receipt(store, lock, attempt_dir)
+    if attempt_dir.exists():
+        raise FileExistsError(f"Solver attempt scratch already exists: {attempt_dir}")
     geo_sha = sha256_file(geog_file)
     if geo_sha != lock.geog_bundle_sha256:
         raise ValueError(f"geo_em.d01.nc SHA-256 {geo_sha} != RunLock {lock.geog_bundle_sha256}")
@@ -322,7 +309,8 @@ def run_wrf_cycle(
     _stage_wps_attempt(
         attempt_dir, b, lock, grib_dir, geog_file, solver_prefix, manifest.file_sha256s
     )
-    wrfouts = _execute_solver_binaries(attempt_dir, b, lock, solver_prefix, mpi_launcher)
+    _execute_solver_binaries(attempt_dir, b, lock, solver_prefix, mpi_launcher)
+    window = resolve_cycle_window(b.product, b.output, lock.publish_origin_utc)
     receipt = SolverReceipt(
         product_id,
         cycle_partition,
@@ -331,7 +319,7 @@ def run_wrf_cycle(
         lock.build_manifest.oci_digest,
         geo_sha,
         manifest.file_sha256s,
-        wrfouts,
+        _hash_complete_wrfout(attempt_dir, window),
     )
     put_idempotent(
         store,

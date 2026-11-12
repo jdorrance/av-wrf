@@ -16,6 +16,7 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 from av_wrf.codecs import (  # noqa: E402
+    check_geogrid_rotation,
     read_wrfout_baseline_nc,
     read_wrfout_step_nc,
     select_cycle_wrfout_slices,
@@ -159,6 +160,88 @@ def _small_domain_and_science() -> tuple[DomainProfile, ScienceProfile]:
 
 
 class TestRealNetcdfBoundary(unittest.TestCase):
+    def test_post_rejects_negative_cape_and_boundary_layer_height(self) -> None:
+        dom, sci = _small_domain_and_science()
+        with tempfile.TemporaryDirectory() as tmp:
+            origin, lead = (Path(tmp) / f"f{h}.nc" for h in (0, 1))
+            _write_real_wrfout(origin, dom, "2026-11-12_00:00:00")
+            _write_real_wrfout(lead, dom, "2026-11-12_01:00:00")
+            base = build_accum_baseline(read_wrfout_baseline_nc(origin, dom), dom.bdy_trim_cells)
+            raw = read_wrfout_step_nc(lead, dom, sci)
+            idx = dom.bdy_trim_cells * dom.e_we
+            for field, slab in (("AFWA_CAPE_MU", raw.afwa_cape_jkg), ("PBLH", raw.pblh_m)):
+                valid = slab.buf[idx]
+                slab.buf[idx] = -1.0
+                with self.assertRaisesRegex(ValueError, f"Negative value.*{field}"):
+                    post_frame(base, raw, dom, sci)
+                slab.buf[idx] = valid
+
+    def test_southern_lambert_rotation_sign_across_antimeridian(self) -> None:
+        dom, sci = _small_domain_and_science()
+        dom = dataclasses.replace(
+            dom,
+            center_lat_deg=-dom.center_lat_deg,
+            center_lon_deg=179.9,
+            central_meridian_deg=179.9,
+            std_parallel_1_deg=-dom.std_parallel_1_deg,
+            std_parallel_2_deg=-dom.std_parallel_2_deg,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "southern.nc"
+            _write_real_wrfout(path, dom, "2026-11-12_01:00:00")
+            with netCDF4.Dataset(str(path), mode="a") as ds:
+                lon = np.asarray(ds.variables["XLONG"][:], np.float64)
+                offset = (lon - dom.central_meridian_deg + 180.0) % 360.0 - 180.0
+                theta = np.deg2rad(0.64 * offset)
+                expected = np.sin(theta).astype(np.float32)
+                self.assertLess(lon[0, 0, -1], 0.0)
+                self.assertGreater(expected[0, 0, -1], 0.0)
+                ds.variables["COSALPHA"][:] = np.cos(theta)
+                ds.variables["SINALPHA"][:] = -expected
+            legacy = read_wrfout_step_nc(path, dom, sci)
+            np.testing.assert_array_equal(np.asarray(legacy.sin_alpha.buf), expected.ravel())
+            with netCDF4.Dataset(str(path), mode="a") as ds:
+                ds.variables["SINALPHA"][:] = expected
+            signed = read_wrfout_step_nc(path, dom, sci)
+            self.assertEqual(legacy.sin_alpha, signed.sin_alpha)
+
+            with netCDF4.Dataset(str(path), mode="a") as ds:
+                ds.variables["SINALPHA"][:] = -expected
+                for suffix, y, x, pad in (
+                    ("_U", "south_north", "west_east_stag", ((0, 0), (0, 0), (0, 1))),
+                    ("_V", "south_north_stag", "west_east", ((0, 0), (0, 1), (0, 0))),
+                ):
+                    dims = ("Time", y, x)
+                    ds.createVariable(f"XLONG{suffix}", "f4", dims)[:] = np.pad(
+                        lon, pad, mode="edge"
+                    )
+                    ds.createVariable(f"SINALPHA{suffix}", "f4", dims)[:] = np.pad(
+                        -expected, pad, mode="edge"
+                    )
+                longitude = lon[0].astype(np.float32)
+                with self.assertRaisesRegex(ValueError, "incorrect southern Lambert SINALPHA"):
+                    check_geogrid_rotation(ds, path, dom, longitude)
+                check_geogrid_rotation(ds, path, dom, longitude, repair=True)
+            with netCDF4.Dataset(str(path)) as ds:
+                check_geogrid_rotation(ds, path, dom, longitude)
+
+    def test_low_cloud_uses_native_levels_above_exported_column(self) -> None:
+        dom, sci = _small_domain_and_science()
+        dom = dataclasses.replace(dom, exported_levels_k=3)
+        with tempfile.TemporaryDirectory() as tmp:
+            origin, lead = (Path(tmp) / f"f{h}.nc" for h in (0, 1))
+            _write_real_wrfout(origin, dom, "2026-11-12_00:00:00")
+            _write_real_wrfout(lead, dom, "2026-11-12_01:00:00")
+            with netCDF4.Dataset(str(lead), mode="a") as ds:
+                cld = ds.variables["CLDFRA"]
+                cld[:] = 0.0
+                cld[0, 3, :, :] = 0.5
+                cld[0, 10, :, :] = 0.5
+            base = build_accum_baseline(read_wrfout_baseline_nc(origin, dom), dom.bdy_trim_cells)
+            frame, _ = post_frame(base, read_wrfout_step_nc(lead, dom, sci), dom, sci)
+            self.assertEqual(frame.fields_2d["cloud_total_pct"].at(0, 0), 75.0)
+            self.assertEqual(frame.fields_2d["cloud_low_pct"].at(0, 0), 50.0)
+
     def test_netcdf_boundary_rejects_masks_missing_cape_mu_znw_and_grid_shift(self) -> None:
         dom, sci = _small_domain_and_science()
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,6 +291,18 @@ class TestRealNetcdfBoundary(unittest.TestCase):
                 float(np.hypot(4.0, 1.5)) + 7.71 * 0.4,
                 delta=0.001,
             )
+            with netCDF4.Dataset(str(f3_p), mode="a") as ds:
+                mslp = ds.createVariable("AFWA_MSLP", "f4", ("Time", "south_north", "west_east"))
+                mslp[:] = 100_500.0
+                trim = dom.bdy_trim_cells
+                mslp[f3_i, trim, trim] = 0.0
+            mixed, _ = post_frame(
+                base0, read_wrfout_step_nc(f3_p, dom, sci, time_index=f3_i), dom, sci
+            )
+            self.assertEqual(
+                mixed.fields_2d["mslp_pa"].at(0, 0), frame3.fields_2d["mslp_pa"].at(0, 0)
+            )
+            self.assertEqual(mixed.fields_2d["mslp_pa"].at(0, 1), 100_500.0)
 
 
 if __name__ == "__main__":

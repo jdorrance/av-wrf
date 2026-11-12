@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Iterable, Sequence
-from datetime import timedelta
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
@@ -33,7 +33,6 @@ from av_wrf.contracts import (
     PubMass3D,
     RunLock,
     StagedPostManifest,
-    format_iso_utc,
     parse_iso_utc,
 )
 from av_wrf.core import (
@@ -47,7 +46,7 @@ from av_wrf.core import (
 )
 from av_wrf.runner.bundle import LoadedBundle, load_bundle
 from av_wrf.runner.solver import verify_solver_receipt
-from av_wrf.runner.stages import load_run_lock
+from av_wrf.runner.stages import _producer_sha256, load_run_lock
 from av_wrf.runner.store import (
     ObjectStore,
     attempt_stage_prefix,
@@ -86,18 +85,13 @@ def _flush_shard_batch(
         digests.append((rel, put_idempotent(store, f"{zarr_stage}/{rel}", raw)))
 
 
-def _frame_window_totals(
-    frame: NormalizedWrfFrame,
-    prev_psfc: Sequence[float],
-) -> tuple[float, float, float, float, float, Sequence[float]]:
+def _frame_window_totals(frame: NormalizedWrfFrame) -> tuple[float, float, float, float]:
     dt_h = float(frame.window_end_unix_s - frame.window_start_unix_s) / 3600.0
-    ps_b = frame.fields_2d["surface_pressure_pa"].buf
-    dps = round(pressure_tendency_abs_hpa_hr(prev_psfc, ps_b, dt_h), 4)
     sh_m, lh_m, pr_m = (
         float(np.mean(np.frombuffer(frame.fields_2d[key].buf, np.float32), dtype=np.float64))
         for key in ("sensible_heat_flux_wm2", "latent_heat_flux_wm2", "precip_mm_hr")
     )
-    return sh_m * dt_h, lh_m * dt_h, pr_m * dt_h, dt_h, dps, ps_b
+    return sh_m * dt_h, lh_m * dt_h, pr_m * dt_h, dt_h
 
 
 def _stream_staged_frames(
@@ -122,32 +116,32 @@ def _stream_staged_frames(
     dps_series: list[float] = []
     sh_wh, lh_wh, total_h, pr_tot, max_cfl = 0.0, 0.0, 0.0, 0.0, 0.0
     prev_psfc: Sequence[float] = crop_sponge_2d(f000_step.psfc_pa, b.domain.bdy_trim_cells).buf
-    outer_t, batch, batch_start, seen = min(n_exp, b.output.shard_time_steps), [], 0, 0
-    for raw_step in lead_steps:
-        if seen >= n_exp:
-            raise ValueError(f"Received more than {n_exp} lead steps")
-        expected_time = window.valid_times_utc[seen]
-        if (raw_step.valid_time_utc, raw_step.valid_time_unix_s) != (expected_time, valid_s[seen]):
+    outer_t, batch, batch_start = min(n_exp, b.output.shard_time_steps), [], 0
+    scheduled = zip(window.valid_times_utc, starts_s, valid_s, lead_steps, strict=True)
+    for i, (expected_time, start_s, end_s, raw_step) in enumerate(scheduled):
+        if (raw_step.valid_time_utc, raw_step.valid_time_unix_s) != (expected_time, end_s):
             raise ValueError(f"WRF step timestamp does not match scheduled {expected_time}")
+        if raw_step.terrain_m != f000_step.terrain_m:
+            raise ValueError(f"WRF HGT changed since f000 at {expected_time}")
         frame, base = post_frame(base, raw_step, b.domain, b.science)
-        if (frame.window_start_unix_s, frame.window_end_unix_s) != (starts_s[seen], valid_s[seen]):
+        if (frame.window_start_unix_s, frame.window_end_unix_s) != (start_s, end_s):
             raise ValueError(f"Unexpected accumulation window for {expected_time}")
         max_cfl = max(max_cfl, validate_frame_columns(frame, b.domain))
-        if seen == 0:
+        if i == 0:
             rel_t = zarr_shard_relpath("terrain_m", b.output)
             raw_t = encode_2d_shard_bytes([frame.fields_2d["terrain_m"]], b.output)
             digests.append((rel_t, put_idempotent(store, f"{zarr_stage}/{rel_t}", raw_t)))
-        d_sh, d_lh, d_pr, dt_h, dps, prev_psfc = _frame_window_totals(frame, prev_psfc)
+        d_sh, d_lh, d_pr, dt_h = _frame_window_totals(frame)
         sh_wh, lh_wh, pr_tot, total_h = sh_wh + d_sh, lh_wh + d_lh, pr_tot + d_pr, total_h + dt_h
-        dps_series.append(dps)
+        if i < 6:
+            psfc = frame.fields_2d["surface_pressure_pa"].buf
+            dps_series.append(round(pressure_tendency_abs_hpa_hr(prev_psfc, psfc, dt_h), 4))
+            prev_psfc = psfc
         batch.append(frame)
-        seen += 1
-        if len(batch) == outer_t or seen == n_exp:
+        if len(batch) == outer_t or i + 1 == n_exp:
             _flush_shard_batch(store, zarr_stage, batch_start, outer_t, batch, b, digests)
             batch.clear()
-            batch_start = seen
-    if seen != n_exp:
-        raise ValueError(f"Expected {n_exp} lead steps, received {seen}")
+            batch_start = i + 1
     coords = encode_coord_chunks(b.domain, window.lead_hours, valid_s, starts_s, valid_s)
     for c_rel, c_bytes in sorted(coords.items()):
         digests.append((c_rel, put_idempotent(store, f"{zarr_stage}/{c_rel}", c_bytes)))
@@ -180,7 +174,7 @@ def _stage_diagnostics_and_manifest(
         lk.attempt_id,
         (("post", elapsed_s),),
         max_cfl,
-        tuple(dps[:6]),
+        tuple(dps),
         round(sh_m, 4),
         round(lh_m, 4),
         round(pr_tot, 4),
@@ -199,34 +193,23 @@ def _stage_diagnostics_and_manifest(
         tuple(shard_digests),
         diag_sha,
         execution_mode=execution_mode,
+        producer_sha256=lk.producer_sha256,
     )
     pm_key = post_manifest_key(lk.product_id, lk.cycle_partition, lk.attempt_id)
     put_idempotent(store, pm_key, json_bytes(pm.to_doc()))
 
 
-def post_cycle_store(
-    config_root: Path,
+def _stage_cycle(
     store: ObjectStore,
-    *,
-    product_id: str,
-    cycle_partition: str,
-    attempt_id: str,
+    b: LoadedBundle,
+    lk: RunLock,
+    window: CycleWindow,
     f000_step: RawWrfBaselineInput | RawWrfStepInput,
     lead_steps: Iterable[RawWrfStepInput],
-    bundle: LoadedBundle | None = None,
-    lock: RunLock | None = None,
-    execution_mode: str = "solver",
+    execution_mode: Literal["solver", "synthetic"],
 ) -> str:
-    """Stream f000 + lead frames into an attempt-scoped sharded Zarr v3 store in ObjectStore."""
-    if execution_mode not in ("solver", "synthetic"):
-        raise ValueError(f"Invalid execution_mode: {execution_mode}")
     t0 = time.perf_counter()
-    b = load_bundle(config_root, product_id) if bundle is None else bundle
-    lk = load_run_lock(store, product_id, cycle_partition, attempt_id) if lock is None else lock
-    if lk.config_sha256 != b.config_sha256:
-        raise ValueError("Config bundle SHA-256 drifted from frozen RunLock")
-    window = resolve_cycle_window(b.product, b.output, lk.publish_origin_utc)
-    stage_root = attempt_stage_prefix(product_id, cycle_partition, attempt_id)
+    stage_root = attempt_stage_prefix(lk.product_id, lk.cycle_partition, lk.attempt_id)
     zarr_stage = f"{stage_root}/forecast.zarr"
     meta_map = build_zarr_v3_store_metadata(b.domain, b.output, window.lead_hours)
     meta_digests = [
@@ -241,22 +224,6 @@ def post_cycle_store(
     return zarr_stage
 
 
-def _build_synthetic_steps(
-    b: LoadedBundle, lk: RunLock, window: CycleWindow
-) -> tuple[RawWrfBaselineInput, Iterable[RawWrfStepInput]]:
-    orig_dt = parse_iso_utc(lk.publish_origin_utc)
-    f000 = build_synthetic_wrf_baseline(b.domain, lk.publish_origin_utc, int(orig_dt.timestamp()))
-
-    def gen() -> Iterable[RawWrfStepInput]:
-        for h in window.lead_hours:
-            vt_dt = orig_dt + timedelta(hours=h)
-            yield build_synthetic_wrf_step(
-                b.domain, format_iso_utc(vt_dt), int(vt_dt.timestamp()), h
-            )
-
-    return f000, gen()
-
-
 def _open_cycle_inputs(
     store: ObjectStore,
     b: LoadedBundle,
@@ -264,10 +231,17 @@ def _open_cycle_inputs(
     win: CycleWindow,
     wrfout_dir: Path | None,
     synthetic: bool,
-) -> tuple[str, RawWrfBaselineInput | RawWrfStepInput, Iterable[RawWrfStepInput]]:
+) -> tuple[Literal["solver", "synthetic"], RawWrfBaselineInput, Iterable[RawWrfStepInput]]:
     if synthetic:
-        f000_s, steps_s = _build_synthetic_steps(b, lk, win)
-        return "synthetic", f000_s, steps_s
+        if wrfout_dir is not None:
+            raise ValueError("Pass either --wrfout-dir or --synthetic to `av-wrf post`")
+        origin_s = int(parse_iso_utc(win.publish_origin_utc).timestamp())
+        baseline = build_synthetic_wrf_baseline(b.domain, win.publish_origin_utc, origin_s)
+        steps = (
+            build_synthetic_wrf_step(b.domain, valid_time, origin_s + 3600 * hour, hour)
+            for hour, valid_time in zip(win.lead_hours, win.valid_times_utc, strict=True)
+        )
+        return "synthetic", baseline, steps
     if wrfout_dir is None:
         raise ValueError("Pass --wrfout-dir <dir> or --synthetic to `av-wrf post`")
     (f0_p, f0_i), leads = select_cycle_wrfout_slices(
@@ -307,21 +281,11 @@ def post_cycle_from_inputs(
     synthetic: bool = False,
     bundle: LoadedBundle | None = None,
 ) -> tuple[str, int]:
-    """Stream `post_cycle_store` one lead at a time from `wrfout_d01_*` or synthetic steps."""
+    """Stage Zarr from verified solver output or an explicitly synthetic fixture."""
     b = load_bundle(config_root, product_id) if bundle is None else bundle
-    lk = load_run_lock(store, product_id, cycle_partition, attempt_id)
+    lk = load_run_lock(store, product_id, cycle_partition, attempt_id, bundle=b)
+    if lk.producer_sha256 is not None and lk.producer_sha256 != _producer_sha256():
+        raise ValueError("Producer code SHA-256 drifted from frozen RunLock")
     win = resolve_cycle_window(b.product, b.output, lk.publish_origin_utc)
     mode, f0, st = _open_cycle_inputs(store, b, lk, win, wrfout_dir, synthetic)
-    pfx = post_cycle_store(
-        config_root,
-        store,
-        product_id=product_id,
-        cycle_partition=cycle_partition,
-        attempt_id=attempt_id,
-        f000_step=f0,
-        lead_steps=st,
-        bundle=b,
-        lock=lk,
-        execution_mode=mode,
-    )
-    return pfx, len(win.lead_hours)
+    return _stage_cycle(store, b, lk, win, f0, st, mode), len(win.lead_hours)

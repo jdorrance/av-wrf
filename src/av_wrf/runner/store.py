@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import errno
 import fcntl
 import hashlib
 import json
@@ -29,6 +28,13 @@ def _inproc_lock_for(path: Path) -> threading.Lock:
             lk = threading.Lock()
             _INPROC_LOCKS[path] = lk
         return lk
+
+
+@contextlib.contextmanager
+def _exclusive_lock(path: Path) -> Iterator[None]:
+    with _inproc_lock_for(path), path.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
 
 
 def sha256_hex(payload: bytes) -> str:
@@ -78,12 +84,11 @@ def synthetic_cycle_prefix(model_id: str, cycle_partition: str) -> str:
 
 
 class ObjectStore(Protocol):
-    """Minimal immutable-put, copy, cycle-lock, and opaque-token CAS object storage boundary."""
+    """Exclusive writes return payload SHA-256. CAS uses opaque backend tokens."""
 
     def get_bytes(self, key: str) -> bytes | None: ...
     def get_with_token(self, key: str) -> tuple[bytes | None, str | None]: ...
     def put_if_absent(self, key: str, payload: bytes) -> str: ...
-    def copy_if_absent(self, src_key: str, dst_key: str, expected_sha256: str) -> str: ...
     def delete_prefix(self, prefix: str) -> None: ...
     def compare_and_swap(self, key: str, payload: bytes, expected_token: str | None) -> str: ...
     def cycle_lock(self, prefix: str) -> AbstractContextManager[None]: ...
@@ -110,24 +115,35 @@ def put_idempotent(
         raise
 
 
-def _install_temp_exclusively(tmp_path: Path, dst_path: Path, key: str) -> None:
-    """Atomically publish fully written `tmp_path` at `dst_path` without overwriting winners."""
-    try:
-        os.link(tmp_path, dst_path)
-    except FileExistsError as exc:
-        raise FileExistsError(f"Immutable object already exists: {key}") from exc
+def _ignore_missing_path(_operation: object, _path: str, exc: BaseException) -> None:
+    if not isinstance(exc, FileNotFoundError):
+        raise exc
 
 
 def _cas_token_for_bytes(payload: bytes) -> str:
     return f"etag:{sha256_hex(payload)}"
 
 
+def _sync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class LocalFileStore:
-    """Filesystem ObjectStore enforcing atomic exclusive puts, hardlinks, cycle lock, and CAS."""
+    """Atomic, synced writes and exclusive flock on a local POSIX filesystem."""
 
     def __init__(self, root_dir: Path) -> None:
         self._root = root_dir.resolve()
-        self._root.mkdir(parents=True, exist_ok=True)
+        if not self._root.is_dir():
+            ancestor = next(parent for parent in self._root.parents if parent.is_dir())
+            self._root.mkdir(parents=True, exist_ok=True)
+            for parent in self._root.parents:
+                _sync_directory(parent)
+                if parent == ancestor:
+                    break
 
     def _resolve(self, key: str) -> Path:
         clean = key.lstrip("/")
@@ -140,7 +156,10 @@ class LocalFileStore:
 
     def get_bytes(self, key: str) -> bytes | None:
         path = self._resolve(key)
-        return path.read_bytes() if path.is_file() else None
+        try:
+            return path.read_bytes() if path.is_file() else None
+        except FileNotFoundError:
+            return None
 
     def get_with_token(self, key: str) -> tuple[bytes | None, str | None]:
         raw = self.get_bytes(key)
@@ -150,104 +169,64 @@ class LocalFileStore:
 
     def put_if_absent(self, key: str, payload: bytes) -> str:
         path = self._resolve(key)
-        if path.is_file():
-            raise FileExistsError(f"Immutable object already exists: {key}")
-        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if path.is_file():
+                raise FileExistsError(key)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._write_atomic(path, payload, replace=False)
+        except FileExistsError as exc:
+            # A partial promotion from an earlier writer can be adopted on retry.
+            with path.open("rb") as existing:
+                os.fsync(existing.fileno())
+            self._sync_object_parents(path)
+            raise FileExistsError(f"Immutable object already exists: {key}") from exc
+        return sha256_hex(payload)
+
+    def _sync_object_parents(self, path: Path) -> None:
+        for parent in path.parents:
+            _sync_directory(parent)
+            if parent == self._root:
+                break
+
+    def _write_atomic(self, path: Path, payload: bytes, *, replace: bool) -> None:
         tmp = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+        install = os.replace if replace else os.link
         try:
             with tmp.open("xb") as handle:
                 handle.write(payload)
                 handle.flush()
-            _install_temp_exclusively(tmp, path, key)
+                os.fsync(handle.fileno())
+            install(tmp, path)
         finally:
             tmp.unlink(missing_ok=True)
-        return sha256_hex(payload)
-
-    def _copy_cross_mount(self, src: Path, dst: Path, src_key: str, dst_key: str, sha: str) -> None:
-        tmp = dst.parent / f".{dst.name}.{uuid.uuid4().hex}.tmp"
-        try:
-            shutil.copy2(src, tmp)
-            if sha256_file(tmp) != sha:
-                raise ValueError(f"Staged source SHA-256 mismatch on {src_key}")
-            try:
-                _install_temp_exclusively(tmp, dst, dst_key)
-            except FileExistsError:
-                if sha256_file(dst) != sha:
-                    raise
-        finally:
-            tmp.unlink(missing_ok=True)
-
-    def copy_if_absent(self, src_key: str, dst_key: str, expected_sha256: str) -> str:
-        src = self._resolve(src_key)
-        dst = self._resolve(dst_key)
-        if dst.is_file():
-            if sha256_file(dst) == expected_sha256:
-                return expected_sha256
-            raise FileExistsError(f"Immutable destination differs from expected SHA-256: {dst_key}")
-        if not src.is_file():
-            raise FileNotFoundError(f"Missing staged source object: {src_key}")
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.link(src, dst)
-        except FileExistsError:
-            if sha256_file(dst) != expected_sha256:
-                raise
-        except OSError as exc:
-            if exc.errno != errno.EXDEV:
-                raise
-            self._copy_cross_mount(src, dst, src_key, dst_key, expected_sha256)
-        return expected_sha256
+        self._sync_object_parents(path)
 
     def delete_prefix(self, prefix: str) -> None:
         target = self._resolve(prefix)
         if target.is_dir():
-            shutil.rmtree(target)
-        elif target.is_file():
-            target.unlink()
+            shutil.rmtree(target, onexc=_ignore_missing_path)
+        else:
+            target.unlink(missing_ok=True)
 
-    @contextlib.contextmanager
-    def cycle_lock(self, prefix: str) -> Iterator[None]:
+    def cycle_lock(self, prefix: str) -> AbstractContextManager[None]:
         """Hold exclusive thread + OS flock on `<prefix>/.publish.lock` through promotion."""
         dir_path = self._resolve(prefix)
         dir_path.mkdir(parents=True, exist_ok=True)
-        lock_file = dir_path / ".publish.lock"
-        thread_lock = _inproc_lock_for(lock_file)
-        with thread_lock, lock_file.open("a+b") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return _exclusive_lock(dir_path / ".publish.lock")
 
     def compare_and_swap(self, key: str, payload: bytes, expected_token: str | None) -> str:
         path = self._resolve(key)
         path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = path.parent / f".{path.name}.cas.lock"
-        thread_lock = _inproc_lock_for(lock_path)
-        with thread_lock, lock_path.open("a+b") as lock_handle:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-            try:
-                current = path.read_bytes() if path.is_file() else None
-                if current is None:
-                    matched = expected_token is None
-                    actual_tok: str | None = None
-                else:
-                    actual_tok = _cas_token_for_bytes(current)
-                    matched = expected_token in (actual_tok, actual_tok.removeprefix("etag:"))
-                if not matched:
-                    raise CASConflict(
-                        f"CAS conflict on {key}: expected {expected_token}, found {actual_tok}"
-                    )
-                tmp = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
-                try:
-                    with tmp.open("xb") as out_f:
-                        out_f.write(payload)
-                        out_f.flush()
-                    tmp.replace(path)
-                finally:
-                    tmp.unlink(missing_ok=True)
-            finally:
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        with _exclusive_lock(lock_path):
+            _, actual_tok = self.get_with_token(key)
+            if expected_token != actual_tok and (
+                actual_tok is None or expected_token != actual_tok.removeprefix("etag:")
+            ):
+                raise CASConflict(
+                    f"CAS conflict on {key}: expected {expected_token}, found {actual_tok}"
+                )
+            self._write_atomic(path, payload, replace=True)
         return _cas_token_for_bytes(payload)
 
 

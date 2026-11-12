@@ -6,7 +6,7 @@ Build a lean, testable regional WRF forecasting producer in `av-wrf` with a pure
 
 1. **Strict producer/consumer boundary.** `av-wrf` prepares static geography, initializes and integrates `WRF-ARW`, stages normalized native-model-level Zarr v3 frames, enforces full-horizon and column admission gates, writes immutable `_ready.json` and `_diagnostics.json` cycle receipts under exclusive cycle locks, and triggers `windy-av-layer`. All parcel thermodynamics (`dry-lenschow-1p2-model-levels-v2`), Copernicus GLO-90 subgrid terrain-column refinement, `samples.bin`, `profiles.bin`, and `.pmtiles` stay exclusively in `windy-av-layer`.
 2. **Declarative regions in `config/` only (`KISS` / `YAGNI`).**
-   - **Phase 1 production scope:** One Linux container architecture (`linux/arm64`, pinned by platform OCI digest), declarative `3 km` regional and fast-pilot products under [`config/products/`](../config/README.md) (listed in [`docs/reference.md`](reference.md)), one frozen physics suite, source-owned lateral boundary cadences (`ForcingProfile.interval_seconds` & `vtable_name`) with fail-closed `forcing_manifest.json` validation, explicit model selection in `av-layers`, and Day-1 retention, budget alarms, scoped credentials, and rollback.
+   - **Initial scope:** One Linux container architecture (`linux/arm64`, pinned by platform OCI digest), declarative `3 km` regional and fast-pilot products under [`config/products/`](../config/README.md) (listed in [`docs/reference.md`](reference.md)), one frozen physics suite, source-owned lateral boundary cadences with verified `forcing_manifest.json`, and explicit model selection in `av-layers`. Phase 4 owns retention, budget alarms, scoped credentials, and rollback.
    - **Deferred until baseline skill and cost are measured:** Additional NH/SH regions (Phase 6), CONUS experiments against operational [NOAA RRFS](https://www.noaa.gov/news-release/noaa-weather-modeling-hits-key-milestone-with-rapid-refresh-forecast-system-debut), `1 km` child nests (`>= 100×100` interior cells), cross-cycle warm land-state splicing, `Auto` model switching, secondary compute backends, and experimental solver engines (`MPAS`, `WRF-JAX`).
 3. **Pure numerical core + thin effectful runner.**
    - The pure core handles grid geometry, namelists, vertical checks, thermodynamics, and accumulated fields over each published window.
@@ -39,6 +39,8 @@ Build a lean, testable regional WRF forecasting producer in `av-wrf` with a pure
    - The planner checks the source arrival buffer and the solver margin before the local briefing deadline for the actual cycle date. Live pointer updates also observe that deadline, the cycle age limit, and the remaining horizon.
 
 ## 4. Execution Sequence & Gates
+
+See the [adversarial review remediation plan](review-plan.md) for validated findings and benchmarks.
 
 | Phase | Scope & Deliverable | Decisive Gate |
 | :--- | :--- | :--- |

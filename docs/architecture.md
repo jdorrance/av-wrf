@@ -29,7 +29,7 @@ Imports flow strictly top-down (`L4 -> L3 -> L2 -> L1 -> L0`), enforced by
 ```mermaid
 flowchart TB
   cli["L4: av_wrf.cli<br/>CLI flags & sole os.environ reader"] --> runner["L3a: av_wrf.runner<br/>stores, stages, post, publish, solver, dispatch"]
-  cli --> verify["L3b: av_wrf.verify<br/>archiver, obs, scorecards"]
+  cli --> verify["L3b: av_wrf.verify<br/>sounding scorecards"]
   runner --> codecs["L2: av_wrf.codecs<br/>wrf_nc, zarr_shard, zarr_v3"]
   verify --> codecs
   codecs --> core["L1: av_wrf.core<br/>grid, thermo, schedule, vertical, namelist, post, metrics"]
@@ -54,7 +54,8 @@ flowchart TB
 - [`src/av_wrf/runner/`](../src/av_wrf/runner/README.md): `store.py`
   (`ObjectStore`, `LocalFileStore`, `cycle_lock`, `get_with_token`,
   `sha256_file`), `stages.py` (`check`, `plan`, `prep`), `mirrors.py`
-  (`write_forcing_manifest`, `verify_forcing_manifest`), `post.py`,
+  (forcing recipe registry and manifest verification), `forcing_gfs.py`
+  (GFS availability, acquisition and WPS inventory), `post.py`,
   `publish.py` + `publish_verify.py` (exclusive cycle-locked promotion, paired
   pressure checks, stage retention), `solver.py` + `solver_exec.py`, and
   `dispatch.py` (expiring-lease webhook delivery).
@@ -62,13 +63,16 @@ flowchart TB
   cycle ownership through the ready commit. The implemented backend uses a
   shared filesystem. A remote adapter needs equivalent fencing or a consumer
   contract for committing an attempt-specific payload.
-- Local promotion provides atomic visibility to concurrent processes. It does
-  not issue persistence barriers for host power loss.
+- Local writes sync file contents before installation and directory entries
+  through the store root before returning. The filesystem supplies `flock`
+  exclusion and `fsync` persistence.
+- Published objects have independent storage from staged objects. Keep staging
+  for replay to additional destinations. Pass `publish --prune-stage` on the
+  final promotion when no further replay needs the staged payload.
 - WRF boundary forcing enters through the GRIB recipe. A direct native model
   needs its own reader and grid mapping into published fields before reusing
   the Zarr and promotion path.
-- [`src/av_wrf/verify/`](../src/av_wrf/verify/README.md): `archiver.py`,
-  `observations.py`, and `scorecard.py` for mature-lead evaluation.
+- [`src/av_wrf/verify/`](../src/av_wrf/verify/README.md): sounding records and scorecards.
 - [`src/av_wrf/cli/`](../src/av_wrf/cli/README.md): `env.py` (`RuntimeEnv`) and
   `main.py` (`av-wrf` subcommands with lazy store handles and `--store-uri` /
   `--prune-stage`).

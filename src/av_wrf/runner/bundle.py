@@ -11,7 +11,6 @@ import yaml
 
 from av_wrf.codecs import build_zarr_v3_store_metadata
 from av_wrf.contracts import (
-    ZARR_SCHEMA_ID,
     DomainProfile,
     ForcingProfile,
     OutputProfile,
@@ -26,11 +25,11 @@ from av_wrf.contracts import (
 from av_wrf.core import (
     compile_wrf_namelist_sections,
     estimate_auto_levels_agl_m,
-    selected_lead_hours,
+    resolve_cycle_window,
     validate_horizon_policy,
     validate_vertical_column,
 )
-from av_wrf.runner.mirrors import validate_source_recipe
+from av_wrf.runner.mirrors import resolve_forcing_window
 
 
 @dataclass(frozen=True)
@@ -126,11 +125,9 @@ def validate_bundle(
     b: LoadedBundle, *, publish_origin_utc: str | None = None
 ) -> tuple[int, int, tuple[int, ...]]:
     """Validate horizon SLA, candidate source, vertical BL stretch, and Zarr v3 store schema."""
-    if b.output.schema_id != ZARR_SCHEMA_ID:
-        raise ValueError(
-            f"OutputProfile.schema_id '{b.output.schema_id}' != locked '{ZARR_SCHEMA_ID}'"
-        )
-    validate_source_recipe(b.primary_source)
+    origin = publish_origin_utc or f"2000-01-01T{b.product.publish_origin_hour_utc:02d}:00:00Z"
+    window = resolve_cycle_window(b.product, b.output, origin)
+    resolve_forcing_window(window, b.primary_source, domain=b.domain)
     remaining_floor = validate_horizon_policy(
         b.product, b.primary_source, b.output, publish_origin_utc=publish_origin_utc
     )
@@ -149,6 +146,6 @@ def validate_bundle(
         )
         for elev_m in b.domain.terrain_elevations_m
     ]
-    leads = selected_lead_hours(b.output)
+    leads = window.lead_hours
     build_zarr_v3_store_metadata(b.domain, b.output, leads)
     return remaining_floor, min(bl_counts), leads

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -14,23 +16,127 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
+from av_wrf.codecs import build_synthetic_wrf_baseline, build_synthetic_wrf_step  # noqa: E402
 from av_wrf.contracts import (  # noqa: E402
     WRF_ZARR_V3_2D_NAMES,
     WRF_ZARR_V3_3D_NAMES,
     BuildManifest,
+    RawWrfStepInput,
+    parse_iso_utc,
 )
 from av_wrf.core import resolve_cycle_window  # noqa: E402
 from av_wrf.runner import (  # noqa: E402
     LocalFileStore,
+    json_bytes,
     load_bundle,
     plan_product_cycle,
     post_cycle_from_inputs,
+    post_manifest_key,
     publish_cycle_receipt,
 )
+from av_wrf.runner.post import _stage_cycle  # noqa: E402
 from tests.integration import stage_sparse_config  # noqa: E402
 
 
 class TestZarrV3RoundTrip(unittest.TestCase):
+    def test_publish_checks_staged_producer_and_accepts_legacy_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = root / "config"
+            product = stage_sparse_config(ROOT / "config", cfg)
+            bundle = load_bundle(cfg, product)
+            store_dir = root / "store"
+            store = LocalFileStore(store_dir)
+            origin = f"2026-11-12T{bundle.product.publish_origin_hour_utc:02d}:00:00Z"
+            _, lock = plan_product_cycle(
+                cfg,
+                store,
+                product_id=product,
+                publish_origin_utc=origin,
+                attempt_id="att-code",
+                mpi_ranks=1,
+                bundle=bundle,
+                build_manifest=BuildManifest("host-dev-unpinned", "wrf", "wps", (), "gcc", "mpi"),
+            )
+            post_cycle_from_inputs(
+                cfg,
+                store,
+                product_id=product,
+                cycle_partition=lock.cycle_partition,
+                attempt_id=lock.attempt_id,
+                wrfout_dir=None,
+                synthetic=True,
+                bundle=bundle,
+            )
+            manifest = store_dir / post_manifest_key(product, lock.cycle_partition, lock.attempt_id)
+            doc = json.loads(manifest.read_bytes())
+            self.assertIsNotNone(lock.producer_sha256)
+            self.assertEqual(doc["producer_sha256"], lock.producer_sha256)
+
+            def publish() -> None:
+                publish_cycle_receipt(
+                    cfg,
+                    store,
+                    product_id=product,
+                    cycle_partition=lock.cycle_partition,
+                    attempt_id=lock.attempt_id,
+                    bundle=bundle,
+                    allow_synthetic=True,
+                )
+
+            manifest.write_bytes(json_bytes({**doc, "producer_sha256": "0" * 64}))
+            with self.assertRaisesRegex(ValueError, "Staged producer SHA-256 differs"):
+                publish()
+            del doc["producer_sha256"]
+            manifest.write_bytes(json_bytes(doc))
+            publish()
+
+    def test_rejects_later_terrain_change_before_post_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tp, cfg = Path(tmp), Path(tmp) / "cfg"
+            b = load_bundle(cfg, stage_sparse_config(ROOT / "config", cfg))
+            store = LocalFileStore(tp / "store")
+            orig = f"2026-11-12T{b.product.publish_origin_hour_utc:02d}:00:00Z"
+            _, lock = plan_product_cycle(
+                cfg,
+                store,
+                product_id=b.product.product_id,
+                publish_origin_utc=orig,
+                attempt_id="att-terrain",
+                mpi_ranks=4,
+                build_manifest=BuildManifest("host-dev-unpinned", "w", "p", (), "gcc", "mpi"),
+                bundle=b,
+            )
+            win = resolve_cycle_window(b.product, b.output, orig)
+            orig_s = int(parse_iso_utc(orig).timestamp())
+
+            def leads() -> Iterator[RawWrfStepInput]:
+                for i, (hour, time) in enumerate(
+                    zip(win.lead_hours, win.valid_times_utc, strict=True)
+                ):
+                    step = build_synthetic_wrf_step(b.domain, time, orig_s + 3600 * hour, hour)
+                    if i == 1:
+                        step.terrain_m.buf[b.domain.bdy_trim_cells * (step.terrain_m.nx + 1)] += (
+                            20.0
+                        )
+                    yield step
+
+            with self.assertRaisesRegex(ValueError, "HGT changed since f000"):
+                _stage_cycle(
+                    store,
+                    b,
+                    lock,
+                    win,
+                    build_synthetic_wrf_baseline(b.domain, orig, orig_s),
+                    leads(),
+                    "synthetic",
+                )
+            self.assertIsNone(
+                store.get_bytes(
+                    post_manifest_key(lock.product_id, lock.cycle_partition, lock.attempt_id)
+                )
+            )
+
     def test_zarr_python_v3_reader_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tp, cfg = Path(tmp), Path(tmp) / "cfg"

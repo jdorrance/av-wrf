@@ -15,7 +15,6 @@ from av_wrf.contracts import (
     ForcingProfile,
     OutputProfile,
     ProductSpec,
-    RunLock,
     format_iso_utc,
     parse_iso_utc,
 )
@@ -86,6 +85,10 @@ def _briefing_deadline_utc(origin_utc: datetime, clock: tuple[ZoneInfo, int, int
     return deadline_local.astimezone(UTC)
 
 
+def _latest_live_age_hours(product: ProductSpec, output: OutputProfile) -> int:
+    return min(product.max_cycle_age_hours, output.map_end_hour - product.min_horizon_hours)
+
+
 def validate_horizon_policy(
     product: ProductSpec,
     source: ForcingProfile,
@@ -111,21 +114,29 @@ def validate_horizon_policy(
             f"is shorter than spinup_hours ({product.spinup_hours}h)"
         )
     cron_h, cron_m = _parse_cron_hour_minute(product.schedule_cron_utc)
-    cron_offset_h = ((cron_h + cron_m / 60.0) - product.forcing_cycle_hour_utc) % 24.0
+    cron_offset_min = (60 * (cron_h - product.forcing_cycle_hour_utc) + cron_m) % (24 * 60)
+    cron_offset_h = cron_offset_min / 60
     required_ready_h = source.source_ready_lag_p95_hours + MIN_CRON_ARRIVAL_BUFFER_HOURS
     if cron_offset_h < required_ready_h:
         raise ValueError(
             f"Schedule '{product.schedule_cron_utc}' triggers {cron_offset_h:.2f}h after "
             f"{product.forcing_cycle_hour_utc:02d}Z, before ready window ({required_ready_h:.2f}h)"
         )
+    cron_after_origin = timedelta(minutes=cron_offset_min - 60 * origin_gap)
+    margin = timedelta(hours=MIN_SOLVER_DEADLINE_MARGIN_HOURS)
+    latest_live_age = timedelta(hours=_latest_live_age_hours(product, output))
+    if latest_live_age - cron_after_origin < margin:
+        raise ValueError(
+            f"Daily UTC cron leaves less than {MIN_SOLVER_DEADLINE_MARGIN_HOURS:g}h "
+            "before the live cycle expires"
+        )
     clock = _briefing_clock(product)
     if publish_origin_utc is not None:
         origin = parse_iso_utc(publish_origin_utc)
-        cron = origin + timedelta(hours=cron_offset_h - origin_gap)
-        deadline = _briefing_deadline_utc(origin, clock)
-        margin = (deadline - cron).total_seconds() / 3600.0
-        if margin < MIN_SOLVER_DEADLINE_MARGIN_HOURS:
-            raise ValueError(f"Daily UTC cron leaves only {margin:.2f}h before briefing deadline")
+        until_briefing = _briefing_deadline_utc(origin, clock) - (origin + cron_after_origin)
+        if until_briefing < margin:
+            hours = until_briefing.total_seconds() / 3600
+            raise ValueError(f"Daily UTC cron leaves only {hours:.2f}h before briefing deadline")
     if not source.fail_closed:
         raise ValueError(f"ForcingProfile '{source.profile_id}' must enforce fail_closed=True")
     return remaining_floor
@@ -143,16 +154,12 @@ def is_cycle_live_fresh(
     earliest_live_dt = origin_dt - timedelta(
         hours=product.spinup_hours, minutes=MAX_FUTURE_CLOCK_SKEW_MINUTES
     )
-    if now_dt < earliest_live_dt:
-        return False
-    if now_dt > _briefing_deadline_utc(origin_dt, _briefing_clock(product)):
-        return False
-    age_s = (now_dt - origin_dt).total_seconds()
-    if age_s > product.max_cycle_age_hours * 3600.0:
-        return False
-    horizon_end_dt = origin_dt + timedelta(hours=output.map_end_hour)
-    remaining_s = (horizon_end_dt - max(now_dt, origin_dt)).total_seconds()
-    return remaining_s >= product.min_horizon_hours * 3600.0
+    latest_live_age = _latest_live_age_hours(product, output)
+    return (
+        latest_live_age >= 0
+        and earliest_live_dt <= now_dt <= origin_dt + timedelta(hours=latest_live_age)
+        and now_dt <= _briefing_deadline_utc(origin_dt, _briefing_clock(product))
+    )
 
 
 def parse_cycle_arg(raw_cycle: str, product: ProductSpec) -> tuple[str, str]:
@@ -216,14 +223,3 @@ def resolve_cycle_window(
         valid_times_utc=tuple(valid_times),
         window_starts_utc=tuple(window_starts),
     )
-
-
-def verify_run_lock_timestamps(lock: RunLock) -> None:
-    """Enforce wrf_init + spinup == publish_origin and forcing_cycle <= wrf_init."""
-    forcing_dt = parse_iso_utc(lock.forcing_cycle_utc)
-    init_dt = parse_iso_utc(lock.wrf_init_utc)
-    origin_dt = parse_iso_utc(lock.publish_origin_utc)
-    if init_dt < forcing_dt:
-        raise ValueError("wrf_init_utc precedes forcing_cycle_utc")
-    if init_dt + timedelta(hours=lock.spinup_hours) != origin_dt:
-        raise ValueError("wrf_init_utc + spinup_hours does not equal publish_origin_utc")

@@ -112,6 +112,7 @@ class RunLock:
     geog_bundle_sha256: str
     build_manifest: BuildManifest
     mpi_ranks: int
+    producer_sha256: str | None = None
 
     def to_doc(self) -> dict[str, object]:
         return dataclasses.asdict(self)
@@ -139,6 +140,7 @@ class RunLock:
             req_str(doc, "geog_bundle_sha256"),
             BuildManifest.from_doc(bm_raw),
             req_int(doc, "mpi_ranks"),
+            req_str(doc, "producer_sha256") if doc.get("producer_sha256") is not None else None,
         )
 
 

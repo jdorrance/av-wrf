@@ -130,9 +130,13 @@ class StagedPostManifest:
     shard_sha256s: tuple[tuple[str, str], ...]
     diagnostics_sha256: str
     execution_mode: str = "solver"
+    producer_sha256: str | None = None
 
     def to_doc(self) -> dict[str, object]:
-        return dataclasses.asdict(self)
+        doc = dataclasses.asdict(self)
+        if self.producer_sha256 is None:
+            del doc["producer_sha256"]
+        return doc
 
     @classmethod
     def from_doc(cls, doc: Mapping[str, object]) -> StagedPostManifest:
@@ -147,6 +151,7 @@ class StagedPostManifest:
             req_pair_tuple(doc, "shard_sha256s"),
             req_str(doc, "diagnostics_sha256"),
             mode,
+            req_str(doc, "producer_sha256") if "producer_sha256" in doc else None,
         )
 
 

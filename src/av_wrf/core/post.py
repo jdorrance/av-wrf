@@ -37,7 +37,7 @@ from av_wrf.core.thermo import (
     geometric_w_to_omega_vec,
     groom_f32_buf,
     hypsometric_mslp_vec,
-    max_random_cloud_pct_vec,
+    max_random_cloud_cover_pct,
     mixing_ratio_to_spfh_vec,
     parameterized_gust_10m_vec,
     potential_to_temp_vec,
@@ -65,10 +65,12 @@ def _mass_view(slab: CompMass3D, trim: int, shape: tuple[int, int, int]) -> npt.
     return sub
 
 
-def _crop2_f64(slab: CompMass2D, trim: int, label: str) -> _ArrF64:
+def _crop2_f64(slab: CompMass2D, trim: int, label: str, *, nonnegative: bool = False) -> _ArrF64:
     view = _crop_sponge_2d_view(slab, trim)
     if not bool(np.all(np.isfinite(view))):
         raise ValueError(f"Non-finite value encountered in {label}")
+    if nonnegative and np.any(view < 0.0):
+        raise ValueError(f"Negative value encountered in {label}")
     return view.astype(np.float64)
 
 
@@ -93,36 +95,24 @@ def _crop_accum_baseline(raw: RawWrfBaselineInput | RawWrfStepInput, trim: int) 
     )
 
 
-def _compute_cloud_slabs(
-    cld_all: npt.NDArray[np.float32], p_groomed: array[float], psfc: _ArrF64, k_exp: int
-) -> tuple[array[float], array[float]]:
-    plane = psfc.size
-    c = cld_all.astype(np.float64).reshape(cld_all.shape[0], plane)
-    np.clip(c, 0.0, 1.0, out=c)
-    total = max_random_cloud_pct_vec(c)
-    p_2d = np.frombuffer(p_groomed, dtype=np.float32).reshape(k_exp, plane)
-    # Admitted pressure columns decrease with height, so qualifying levels form a prefix.
-    low = c[:k_exp]
-    low[p_2d < 0.8 * psfc.ravel()] = 0.0
-    return groom_f32_buf(total, 15), groom_f32_buf(max_random_cloud_pct_vec(low), 15)
-
-
 def _validate_and_groom_3d_pressure(
-    raw: RawWrfStepInput, psfc_2d: _ArrF64, trim: int, shp3: tuple[int, int, int]
+    raw: RawWrfStepInput, psfc_2d: _ArrF64, trim: int, k_exp: int
 ) -> tuple[_ArrF64, array[float]]:
+    ny, nx = psfc_2d.shape
+    shape = (raw.cldfra.nz, ny, nx)
     p_pa = np.add(
-        _mass_view(raw.p_pert_pa, trim, shp3),
-        _mass_view(raw.pb_pa, trim, shp3),
+        _mass_view(raw.p_pert_pa, trim, shape),
+        _mass_view(raw.pb_pa, trim, shape),
         dtype=np.float64,
     )
-    if bool(np.any(p_pa <= 0.0)) or bool(np.any(psfc_2d <= 0.0)):
+    if not np.all(p_pa[-1] > 0.0) or not np.all(psfc_2d > 0.0):
         raise ValueError("Non-positive surface or 3D pressure in post_frame")
-    if bool(np.any(p_pa[0] > psfc_2d)):
+    if not np.all(p_pa[0] <= psfc_2d):
         raise ValueError("Lowest model-level pressure exceeds surface_pressure_pa")
-    if bool(np.any(p_pa[1:] >= p_pa[:-1])):
+    if not np.all(p_pa[1:] < p_pa[:-1]):
         raise ValueError("Non-monotonic 3D column pressure (pressure must decrease with height)")
-    p_buf = groom_f32_buf(p_pa, 17)
-    p_gr = np.frombuffer(p_buf, dtype=np.float32).reshape(shp3)
+    p_buf = groom_f32_buf(p_pa[:k_exp], 17)
+    p_gr = np.frombuffer(p_buf, dtype=np.float32).reshape(k_exp, ny, nx)
     if bool(np.any(p_gr[0] > psfc_2d)) or bool(np.any(p_gr[1:] >= p_gr[:-1])):
         raise ValueError("Bit-groomed 3D column pressure violated monotonic ordering")
     return p_pa, p_buf
@@ -138,7 +128,12 @@ def _post_3d_slabs(
     trim, k_exp = domain.bdy_trim_cells, domain.exported_levels_k
     ny, nx = psfc.shape
     shp3 = (k_exp, ny, nx)
-    p_pa, p_buf = _validate_and_groom_3d_pressure(raw, psfc, trim, shp3)
+    p_all, p_buf = _validate_and_groom_3d_pressure(raw, psfc, trim, k_exp)
+    cloud = _mass_view(raw.cldfra, trim, (raw.cldfra.nz, ny, nx))
+    cld_tot, cld_low = max_random_cloud_cover_pct(
+        cloud, p_all, _crop_sponge_2d_view(raw.psfc_pa, trim)
+    )
+    p_pa = p_all[:k_exp]
     ph = np.frombuffer(crop_destagger_z_3d(raw.ph_stag_m2s2, trim, k_exp).buf, np.float32)
     phb = np.frombuffer(crop_destagger_z_3d(raw.phb_stag_m2s2, trim, k_exp).buf, np.float32)
     z_msl = np.add(ph, phb, dtype=np.float64).reshape(shp3)
@@ -173,9 +168,7 @@ def _post_3d_slabs(
         ("omega_pas", groom_f32_buf(omega, 15)),
     )
     f3d = {nm: PubMass3D(Slab3DF32(nz=k_exp, ny=ny, nx=nx, buf=b)) for nm, b in bufs}
-    cld = _mass_view(raw.cldfra, trim, (raw.cldfra.nz, ny, nx))
-    cld_tot, cld_low = _compute_cloud_slabs(cld, p_buf, psfc, k_exp)
-    return f3d, cld_tot, cld_low, stats
+    return f3d, groom_f32_buf(cld_tot, 15), groom_f32_buf(cld_low, 15), stats
 
 
 def _surface_accum_rates(
@@ -223,10 +216,15 @@ def _post_surface_slabs(
     u10g = _crop2_f64(raw.u10_grid_mps, trim, "U10")
     v10g = _crop2_f64(raw.v10_grid_mps, trim, "V10")
     ue, ve = rotate_grid_to_earth_vec(u10g, v10g, ca, sa)
-    pblh = _crop2_f64(raw.pblh_m, trim, "PBLH")
-    mslp = _crop2_f64(raw.afwa_mslp_pa, trim, "AFWA_MSLP") if raw.afwa_mslp_pa else None
-    if mslp is None or bool(np.any(mslp <= 0.0)):
+    pblh = _crop2_f64(raw.pblh_m, trim, "PBLH", nonnegative=True)
+    cape = _crop2_f64(raw.afwa_cape_jkg, trim, "AFWA_CAPE_MU", nonnegative=True)
+    if raw.afwa_mslp_pa is None:
         mslp = hypsometric_mslp_vec(psfc, hgt, t2, sp2)
+    else:
+        mslp = _crop2_f64(raw.afwa_mslp_pa, trim, "AFWA_MSLP")
+        mask = mslp <= 0.0
+        if np.any(mask):
+            mslp[mask] = hypsometric_mslp_vec(psfc[mask], hgt[mask], t2[mask], sp2[mask])
     gust = parameterized_gust_10m_vec(
         ue,
         ve,
@@ -253,35 +251,17 @@ def _post_surface_slabs(
     return {
         "temp_2m_k": t2_s,
         "pbl_height_m": _groom_2d(pblh, 15),
-        "cape_jkg": _groom_2d(_crop2_f64(raw.afwa_cape_jkg, trim, "AFWA_CAPE_MU"), 15),
+        "cape_jkg": _groom_2d(cape, 15),
         **{nm: PubMass2D(Slab2DF32(ny=ny, nx=nx, buf=b)) for nm, b in pairs},
     }
-
-
-def _ensure_raw_step_finite(raw: RawWrfStepInput) -> None:
-    for sl in (
-        raw.p_pert_pa.buf,
-        raw.pb_pa.buf,
-        raw.ph_stag_m2s2.buf,
-        raw.phb_stag_m2s2.buf,
-        raw.theta_pert_k.buf,
-        raw.qvapor_kgkg.buf,
-        raw.cldfra.buf,
-        raw.u_stag_mps.buf,
-        raw.v_stag_mps.buf,
-        raw.w_stag_mps.buf,
-    ):
-        if not bool(np.all(np.isfinite(np.frombuffer(sl, dtype=np.float32)))):
-            raise ValueError("Non-finite float in computational-grid WRF step input")
 
 
 def post_frame(
     prev: AccumBaseline, raw: RawWrfStepInput, domain: DomainProfile, science: ScienceProfile
 ) -> tuple[NormalizedWrfFrame, AccumBaseline]:
-    """Transform one raw WRF step + predecessor baseline into all 22 Published-Grid arrays."""
+    """Transform one validated finite WRF step and baseline into 22 Published-Grid arrays."""
     if raw.valid_time_unix_s <= prev.valid_time_unix_s:
         raise ValueError("raw.valid_time_unix_s must strictly exceed prev.valid_time_unix_s")
-    _ensure_raw_step_finite(raw)
     trim = domain.bdy_trim_cells
     hgt = _groom_2d(_crop2_f64(raw.terrain_m, trim, "HGT"), 17)
     psfc = _groom_2d(_crop2_f64(raw.psfc_pa, trim, "PSFC"), 17)

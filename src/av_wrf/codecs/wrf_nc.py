@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from av_wrf.codecs.wrf_nc_grid import (
+    _southern_lambert_sine,
     extract_clean_f32_nc,
     extract_clean_i32_nc,
     parse_wrf_timestamp,
@@ -127,14 +128,15 @@ def _read_3d_fields(
     CompStagZ3D,
 ]:
     ny, nx, k_exp, nz_full = dims
-    p_pert = _r3_nc(v, nc_path, "P", t_i, k_exp, ny, nx, crop=True)
-    pb = _r3_nc(v, nc_path, "PB", t_i, k_exp, ny, nx, crop=True)
+    p_pert = _r3_nc(v, nc_path, "P", t_i, nz_full, ny, nx, crop=False)
+    pb = _r3_nc(v, nc_path, "PB", t_i, nz_full, ny, nx, crop=False)
     t_dry = _r3_nc(v, nc_path, "T", t_i, k_exp, ny, nx, crop=True)
     qv = _r3_nc(v, nc_path, "QVAPOR", t_i, k_exp, ny, nx, crop=True)
     if "THM" not in v:
         raise ValueError(f"Missing required WRF v4 'THM' variable in {nc_path}")
-    thm = _r3_nc(v, nc_path, "THM", t_i, k_exp, ny, nx, crop=True)
-    verify_t_thm_consistency(t_dry, thm, p_pert, pb, qv, sc)
+    verify_t_thm_consistency(
+        t_dry, _r3_nc(v, nc_path, "THM", t_i, k_exp, ny, nx, crop=True), p_pert, pb, qv, sc
+    )
     u_arr = extract_clean_f32_nc(v, nc_path, "U", t_i, (k_exp, ny, nx + 1), z_stop=k_exp)
     v_arr = extract_clean_f32_nc(v, nc_path, "V", t_i, (k_exp, ny + 1, nx), z_stop=k_exp)
     return (
@@ -249,18 +251,22 @@ def read_wrfout_step_nc(
     time_index: int = 0,
     expected_valid_utc: str | None = None,
 ) -> RawWrfStepInput:
-    """Read one computational-grid wrfout time, using `0:k_exp` hyperslabs for native fields."""
+    """Read one wrfout time with full pressure/cloud columns and export-level hyperslabs."""
     verify_local_wrf_nc(nc_path)
     import netCDF4
 
     dims = (domain.e_sn - 1, domain.e_we - 1, domain.exported_levels_k, domain.e_vert - 1)
     with netCDF4.Dataset(str(nc_path), mode="r") as ds:
-        verify_wrfout_grid_against_domain(ds, domain, nc_path, time_index, science=science)
+        xlong = verify_wrfout_grid_against_domain(ds, domain, nc_path, time_index, science=science)
         raw_t = bytes(ds.variables["Times"][time_index].tobytes()).decode("ascii")
         stamp = parse_wrf_timestamp(raw_t)
         if expected_valid_utc is not None and stamp[0] != expected_valid_utc:
             raise ValueError(f"wrfout Times {stamp[0]} != expected {expected_valid_utc}")
-        return _assemble_step_from_vars(ds.variables, nc_path, stamp, time_index, dims, science)
+        step = _assemble_step_from_vars(ds.variables, nc_path, stamp, time_index, dims, science)
+    if domain.std_parallel_1_deg < 0.0:
+        sine = np.frombuffer(step.sin_alpha.buf, np.float32).reshape(xlong.shape)
+        sine[:] = _southern_lambert_sine(sine, xlong, domain.central_meridian_deg)
+    return step
 
 
 __all__ = [

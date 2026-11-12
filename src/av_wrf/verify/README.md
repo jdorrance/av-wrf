@@ -1,7 +1,6 @@
 # `av_wrf.verify` (`L3b`)
 
-Prospective input/baseline archiver, regional observation parsers, and
-mature-lead NWP + soaring-proxy scorecards.
+Compute boundary-layer and wind shear scores from a typed sounding.
 
 ```python
 from av_wrf.verify import evaluate_column_soaring_proxies

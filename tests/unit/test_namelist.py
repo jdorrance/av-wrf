@@ -14,7 +14,6 @@ for p in (ROOT, ROOT / "src"):
 
 from av_wrf.contracts import BuildManifest, RunLock, ScienceProfile  # noqa: E402
 from av_wrf.core import (  # noqa: E402
-    NON_NAMELIST_METADATA_FIELDS,
     compile_geogrid_namelist_sections,
     compile_wps_namelist_sections,
     compile_wrf_namelist_sections,
@@ -81,7 +80,7 @@ class TestNamelist(unittest.TestCase):
 
         all_fields = {f.name for f in dataclasses.fields(ScienceProfile)}
         self.assertEqual(
-            all_fields - NON_NAMELIST_METADATA_FIELDS,
+            all_fields - {"profile_id", "wrf_version", "wps_version"},
             set(PROFILE_TO_NAMELIST_KEY.keys()),
         )
         compiled = compile_wrf_namelist_sections(dom, sci, src)
@@ -106,6 +105,7 @@ class TestNamelist(unittest.TestCase):
             dataclasses.replace(sci, time_step_s=24),
             dataclasses.replace(sci, afwa_buoy_opt=0),
             dataclasses.replace(sci, base_temp_k=100.0),
+            dataclasses.replace(sci, hybrid_opt=0),
             dataclasses.replace(sci, history_interval_min=45),
             dataclasses.replace(sci, wrf_version="99"),
         ):
@@ -164,6 +164,24 @@ class TestNamelist(unittest.TestCase):
             sections = compile_geogrid_namelist_sections(domain)
             self.assertEqual(sections["geogrid"]["geog_data_res"], "custom+default")
             self.assertNotIn("start_date", sections["share"])
+
+    def test_wide_lambert_grid_limits_timestep_at_its_corners(self) -> None:
+        product = next((ROOT / "config" / "products").glob("*.yaml")).stem
+        bundle = load_bundle(ROOT / "config", product)
+        domain = dataclasses.replace(
+            bundle.domain,
+            e_we=401,
+            e_sn=101,
+            dx_m=12_000,
+            dy_m=12_000,
+            center_lat_deg=55.0,
+            std_parallel_1_deg=54.0,
+            std_parallel_2_deg=56.0,
+        )
+        with self.assertRaisesRegex(ValueError, "exceeds 6\\*dx_phys"):
+            compile_wrf_namelist_sections(
+                domain, dataclasses.replace(bundle.science, time_step_s=71), bundle.primary_source
+            )
 
 
 if __name__ == "__main__":

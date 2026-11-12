@@ -17,11 +17,10 @@ from av_wrf.codecs.wrf_nc import (
     verify_local_wrf_nc,
     verify_wrfout_grid_against_domain,
 )
-from av_wrf.codecs.wrf_nc_grid import verify_grid_against_domain
+from av_wrf.codecs.wrf_nc_grid import check_geogrid_rotation, verify_grid_against_domain
 from av_wrf.codecs.zarr_shard import (
     MAX_SPATIAL_TILES_PER_FRAME,
     crc32c_u32,
-    decode_shard_f32,
     decode_shard_f32_array,
     encode_2d_shard_bytes,
     encode_3d_shard_bytes,
@@ -43,8 +42,8 @@ __all__ = [
     "build_synthetic_wrf_baseline",
     "build_synthetic_wrf_step",
     "build_zarr_v3_store_metadata",
+    "check_geogrid_rotation",
     "crc32c_u32",
-    "decode_shard_f32",
     "decode_shard_f32_array",
     "encode_2d_shard_bytes",
     "encode_3d_shard_bytes",

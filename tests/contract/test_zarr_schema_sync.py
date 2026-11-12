@@ -19,7 +19,7 @@ from av_wrf.cli import main as cli_main  # noqa: E402
 from av_wrf.codecs import (  # noqa: E402
     build_zarr_v3_store_metadata,
     crc32c_u32,
-    decode_shard_f32,
+    decode_shard_f32_array,
     encode_2d_shard_bytes,
     encode_3d_shard_bytes,
     expected_shard_keys,
@@ -30,6 +30,7 @@ from av_wrf.codecs import (  # noqa: E402
     zarr_shard_relpath,
 )
 from av_wrf.contracts import (  # noqa: E402
+    CAPE_PARCEL_DEFINITION,
     DEFAULT_INNER_SPATIAL_CHUNK,
     DEFAULT_SHARD_TIME_STEP,
     LOW_CLOUD_DEFINITION,
@@ -69,10 +70,7 @@ class TestVendorZarrContract(unittest.TestCase):
         self.assertEqual(raw["zarrFormat"], ZARR_FORMAT_VERSION)
         self.assertEqual(raw["moistureSourceOfTruth"], MOISTURE_SOURCE_OF_TRUTH)
         self.assertEqual(raw["temperatureDefinition"], TEMPERATURE_DEFINITION)
-        # The provisional catalog retains this label until the consumer migrates.
-        self.assertEqual(
-            raw["capeParcelDefinition"], "afwa-mucape-lowest-300hpa-virtual-temp-undiluted"
-        )
+        self.assertEqual(raw["capeParcelDefinition"], CAPE_PARCEL_DEFINITION)
         self.assertEqual(raw["lowCloudDefinition"], LOW_CLOUD_DEFINITION)
         self.assertEqual(raw["earthRadiusM"], WRF_SPHERE_RADIUS_M)
         self.assertEqual(raw["maxVerticalLevels"], MAX_EXPORTED_LEVELS)
@@ -111,9 +109,9 @@ class TestVendorZarrContract(unittest.TestCase):
         f0 = PubMass2D(Slab2DF32.from_values(10, 13, [float(i) for i in range(130)]))
         f1 = PubMass2D(Slab2DF32.from_values(10, 13, [float(i) + 500.0 for i in range(130)]))
         shard2d = encode_2d_shard_bytes([f0, f1], out, shard_time_steps=3)
-        dec2d = decode_shard_f32(
+        dec2d = decode_shard_f32_array(
             shard2d, shard_time_steps=3, n_frames=2, nz=1, ny=10, nx=13, output=out
-        )
+        ).ravel()
         self.assertEqual(list(dec2d[:130]), list(f0.buf))
         self.assertEqual(list(dec2d[130:260]), list(f1.buf))
         self.assertTrue(all(math.isnan(v) for v in dec2d[260:]))
@@ -123,8 +121,8 @@ class TestVendorZarrContract(unittest.TestCase):
         v0 = PubMass3D(Slab3DF32.from_values(2, 10, 13, [float(i) * 0.5 for i in range(260)]))
         v1 = PubMass3D(Slab3DF32.from_values(2, 10, 13, [float(i) * 1.5 for i in range(260)]))
         shard3d = encode_3d_shard_bytes([v0, v1], out, shard_time_steps=2)
-        dec3d = decode_shard_f32(shard3d, shard_time_steps=2, nz=2, ny=10, nx=13, output=out)
-        self.assertEqual(list(dec3d), [*v0.buf, *v1.buf])
+        dec3d = decode_shard_f32_array(shard3d, shard_time_steps=2, nz=2, ny=10, nx=13, output=out)
+        self.assertEqual(dec3d.ravel().tolist(), [*v0.buf, *v1.buf])
 
         idx_len = 8 * 16
         body = shard3d[: -(idx_len + 4)]
@@ -143,9 +141,7 @@ class TestVendorZarrContract(unittest.TestCase):
             self.assertEqual(len(docs), 30)
             group_attrs = docs["zarr.json"]["attributes"]
             assert isinstance(group_attrs, dict)
-            self.assertEqual(
-                group_attrs["cape_parcel_definition"], "afwa-mucape-max-theta-e-pressure-gt-500hpa"
-            )
+            self.assertEqual(group_attrs["cape_parcel_definition"], CAPE_PARCEL_DEFINITION)
             nj, ni = published_grid_shape(b.domain)
             temp_meta = docs["temp_k/zarr.json"]
             self.assertEqual(temp_meta["shape"], [len(leads), b.domain.exported_levels_k, nj, ni])
@@ -155,10 +151,17 @@ class TestVendorZarrContract(unittest.TestCase):
             self.assertEqual(shard_cfg["chunk_shape"], [1, b.domain.exported_levels_k, 64, 64])
             self.assertEqual(zarr_shard_relpath("terrain_m", b.output), "terrain_m/c/0/0")
             self.assertIn("terrain_m/c/0/0", expected_shard_keys(b.output, len(leads)))
-            with self.assertRaises(ValueError):
-                build_zarr_v3_store_metadata(
-                    b.domain, dataclasses.replace(b.output, schema_id="bad-schema"), leads
-                )
+            for changed in (
+                dataclasses.replace(b.output, schema_id="bad-schema"),
+                dataclasses.replace(b.output, shard_time_steps=2),
+                dataclasses.replace(b.output, inner_chunk_yx=(32, 64)),
+                dataclasses.replace(b.output, zstd_level=4),
+            ):
+                with (
+                    self.subTest(output=changed),
+                    self.assertRaisesRegex(ValueError, ZARR_SCHEMA_ID),
+                ):
+                    build_zarr_v3_store_metadata(b.domain, changed, leads)
 
         self.assertEqual(cli_main(["check", "--config-dir", str(ROOT / "config")]), 0)
         prod_id = sorted((ROOT / "config" / "products").glob("*.yaml"))[0].stem

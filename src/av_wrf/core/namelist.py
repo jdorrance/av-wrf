@@ -2,24 +2,20 @@
 
 from __future__ import annotations
 
-import math
 from datetime import timedelta
 
 from av_wrf.contracts import (
+    CycleWindow,
     DomainProfile,
     ForcingProfile,
     RunLock,
     ScienceProfile,
     parse_iso_utc,
 )
-from av_wrf.core.grid import lambert_map_scale, validate_domain_profile
+from av_wrf.core.grid import computational_latlon_bounds, lambert_map_scale, validate_domain_profile
 
 NamelistScalar = int | float | str | bool
 NamelistSections = dict[str, dict[str, NamelistScalar]]
-
-NON_NAMELIST_METADATA_FIELDS: frozenset[str] = frozenset(
-    {"profile_id", "wrf_version", "wps_version"}
-)
 
 
 def _validate_dynamics(science: ScienceProfile, domain: DomainProfile) -> None:
@@ -28,14 +24,8 @@ def _validate_dynamics(science: ScienceProfile, domain: DomainProfile) -> None:
     if domain.bdy_trim_cells <= science.spec_bdy_width:
         raise ValueError("bdy_trim_cells must exceed spec_bdy_width")
     # https://www2.mmm.ucar.edu/wrf/users/docs/technote/v4_technote.pdf
-    half_span_deg = math.degrees(
-        0.5 * max(1, domain.e_sn - 1) * abs(domain.dy_m) / domain.earth_radius_m
-    )
-    sample_lats = (
-        max(-89.0, domain.center_lat_deg - half_span_deg),
-        domain.center_lat_deg,
-        min(89.0, domain.center_lat_deg + half_span_deg),
-    )
+    # Lambert scale has a single latitude minimum. Its maximum is at a footprint extreme.
+    _, south, _, north = computational_latlon_bounds(domain, halo_deg=0.0, snap_deg=0.001)
     m_max = max(
         lambert_map_scale(
             lat,
@@ -44,7 +34,7 @@ def _validate_dynamics(science: ScienceProfile, domain: DomainProfile) -> None:
             origin_lat_deg=domain.center_lat_deg,
             radius_m=domain.earth_radius_m,
         )
-        for lat in sample_lats
+        for lat in (south, north)
     )
     min_phys_dx_km = (min(abs(domain.dx_m), abs(domain.dy_m)) / m_max) / 1000.0
     max_dt_s = 6.0 * min_phys_dx_km
@@ -55,7 +45,7 @@ def _validate_dynamics(science: ScienceProfile, domain: DomainProfile) -> None:
         )
 
 
-def validate_science_profile(science: ScienceProfile, domain: DomainProfile) -> None:
+def _validate_science_profile(science: ScienceProfile, domain: DomainProfile) -> None:
     """Enforce domain sizing policy and WRF v4.8 physics, CFL, AFWA, and sponge invariants."""
     validate_domain_profile(domain)
     if (science.wrf_version, science.wps_version) != ("4.8.0", "4.7.0"):
@@ -69,6 +59,8 @@ def validate_science_profile(science: ScienceProfile, domain: DomainProfile) -> 
         raise ValueError("WRF v4.8 forbids shinhong_scu_mixing=True with shinhong_nonlocal_flux")
     if science.use_theta_m not in (0, 1) or not (250.0 <= science.base_temp_k <= 320.0):
         raise ValueError("Invalid use_theta_m or base_temp_k")
+    if science.hybrid_opt != 2:
+        raise ValueError("The vertical preflight requires hybrid_opt=2")
     if science.afwa_diag_opt != 1 or science.afwa_buoy_opt != 1:
         raise ValueError("afwa_diag_opt=1 and afwa_buoy_opt=1 are required")
     if not (science.bucket_mm > 0 and science.history_interval_min > 0):
@@ -78,9 +70,7 @@ def validate_science_profile(science: ScienceProfile, domain: DomainProfile) -> 
     _validate_dynamics(science, domain)
 
 
-def _physics_and_dynamics_sections(
-    science: ScienceProfile,
-) -> dict[str, dict[str, int | float | bool]]:
+def _physics_and_dynamics_sections(science: ScienceProfile) -> NamelistSections:
     return {
         "physics": {
             "mp_physics": science.mp_physics,
@@ -132,12 +122,12 @@ def compile_wrf_namelist_sections(
     *,
     metgrid_levels: int | None = None,
     metgrid_soil_levels: int | None = None,
-) -> dict[str, dict[str, int | float | bool]]:
+) -> NamelistSections:
     """Compile validated domain, science, and forcing profiles into WRF namelist sections."""
-    validate_science_profile(science, domain)
-    mg_levels = forcing.pressure_level_count if metgrid_levels is None else metgrid_levels
+    _validate_science_profile(science, domain)
+    mg_levels = forcing.metgrid_levels if metgrid_levels is None else metgrid_levels
     soil_levels = (
-        len(forcing.soil_layer_centers_cm) if metgrid_soil_levels is None else metgrid_soil_levels
+        forcing.metgrid_soil_levels if metgrid_soil_levels is None else metgrid_soil_levels
     )
     if mg_levels < 2 or soil_levels < 1 or forcing.interval_seconds < 1:
         raise ValueError("metgrid levels and forcing interval_seconds must be positive")
@@ -155,6 +145,9 @@ def compile_wrf_namelist_sections(
             "e_vert": domain.e_vert,
             "num_metgrid_levels": mg_levels,
             "num_metgrid_soil_levels": soil_levels,
+            # WRF real can interpolate specific humidity via its mixing-ratio conversion.
+            # https://github.com/wrf-model/WRF/blob/v4.8.0/dyn_em/module_initialize_real.F
+            **({"use_sh_qv": True} if forcing.use_sh_qv else {}),
             "dx": domain.dx_m,
             "dy": domain.dy_m,
             "grid_id": 1,
@@ -222,14 +215,18 @@ def compile_geogrid_namelist_sections(domain: DomainProfile) -> NamelistSections
     }
 
 
-def _forcing_bracket_duration_s(lock: RunLock, interval_s: int) -> int:
+def _forcing_bracket_duration_s(window: RunLock | CycleWindow, interval_s: int) -> int:
     if interval_s <= 0 or interval_s % 3600:
         raise ValueError("Forcing interval must be a positive whole-hour multiple")
-    total_s = (lock.spinup_hours + max(lock.lead_hours)) * 3600
+    origin = parse_iso_utc(window.publish_origin_utc)
+    init = parse_iso_utc(window.wrf_init_utc)
+    total_s = int((origin - init).total_seconds()) + max(window.lead_hours) * 3600
     return ((total_s + interval_s - 1) // interval_s) * interval_s
 
 
-def required_forcing_forecast_hours(lock: RunLock, source: ForcingProfile) -> tuple[int, ...]:
+def required_forcing_forecast_hours(
+    lock: RunLock | CycleWindow, source: ForcingProfile
+) -> tuple[int, ...]:
     """Return source-native forecast hours, including the final WRF boundary bracket."""
     step_s = source.interval_seconds
     duration_s = _forcing_bracket_duration_s(lock, step_s)
@@ -247,7 +244,7 @@ def compile_wps_namelist_sections(
     domain: DomainProfile, science: ScienceProfile, lock: RunLock, forcing: ForcingProfile
 ) -> NamelistSections:
     """Compile WPS sections with boundary inputs through the final bracketing time."""
-    validate_science_profile(science, domain)
+    _validate_science_profile(science, domain)
     start_dt = parse_iso_utc(lock.wrf_init_utc)
     interval_s = forcing.interval_seconds
     end_dt = start_dt + timedelta(seconds=_forcing_bracket_duration_s(lock, interval_s))
@@ -293,7 +290,7 @@ def compile_wrf_run_namelist(
         else (total_hours * 3600)
     )
     end_dt = start_dt + timedelta(seconds=end_s)
-    tc: dict[str, NamelistScalar] = {
+    base["time_control"] = {
         "run_days": 0,
         "run_hours": total_hours,
         "run_minutes": 0,
@@ -313,12 +310,8 @@ def compile_wrf_run_namelist(
         "io_form_boundary": 2,
         **base["time_control"],
     }
-    out: NamelistSections = {"time_control": tc}
-    for sec_name, sec_vals in base.items():
-        if sec_name != "time_control":
-            out[sec_name] = dict(sec_vals)
-    out["bdy_control"]["specified"] = True
-    return out
+    base["bdy_control"]["specified"] = True
+    return base
 
 
 def _format_fortran_literal(val: NamelistScalar) -> str:

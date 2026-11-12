@@ -7,7 +7,7 @@
   "verticalCoordinate": "model-levels",
   "moistureSourceOfTruth": "spfh_kgkg",
   "temperatureDefinition": "sensible-air-temperature-k",
-  "capeParcelDefinition": "afwa-mucape-lowest-300hpa-virtual-temp-undiluted",
+  "capeParcelDefinition": "afwa-mucape-max-theta-e-pressure-gt-500hpa",
   "lowCloudDefinition": "ecmwf-sigma-ge-0p8-max-random-overlap",
   "earthRadiusM": 6370000.0,
   "maxVerticalLevels": 40,

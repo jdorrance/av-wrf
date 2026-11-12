@@ -2,10 +2,40 @@ name: images
 
 on:
   pull_request:
-    paths: ['docker/**', 'pyproject.toml', 'uv.lock', '.github/workflows/images.yml']
+    paths:
+      - 'src/av_wrf/contracts/config*.py'
+      - 'src/av_wrf/core/grid.py'
+      - 'src/av_wrf/core/namelist.py'
+      - 'src/av_wrf/core/schedule.py'
+      - 'src/av_wrf/runner/bundle.py'
+      - 'src/av_wrf/runner/forcing_*.py'
+      - 'src/av_wrf/runner/grib.py'
+      - 'src/av_wrf/runner/mirrors.py'
+      - 'src/av_wrf/runner/solver_exec.py'
+      - 'src/av_wrf/runner/stages.py'
+      - 'config/**'
+      - 'docker/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/images.yml'
   push:
     branches: [main]
-    paths: ['docker/**', 'pyproject.toml', 'uv.lock', '.github/workflows/images.yml']
+    paths:
+      - 'src/av_wrf/contracts/config*.py'
+      - 'src/av_wrf/core/grid.py'
+      - 'src/av_wrf/core/namelist.py'
+      - 'src/av_wrf/core/schedule.py'
+      - 'src/av_wrf/runner/bundle.py'
+      - 'src/av_wrf/runner/forcing_*.py'
+      - 'src/av_wrf/runner/grib.py'
+      - 'src/av_wrf/runner/mirrors.py'
+      - 'src/av_wrf/runner/solver_exec.py'
+      - 'src/av_wrf/runner/stages.py'
+      - 'config/**'
+      - 'docker/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/images.yml'
   workflow_dispatch:
 
 permissions:
@@ -24,3 +54,7 @@ jobs:
           docker buildx build --load --target solver --build-arg JOBS=2
           -f docker/Dockerfile -t av-wrf:solver .
       - run: docker run --rm --network none av-wrf:solver check
+      - run: >-
+          docker run --rm --network none --entrypoint python
+          --mount "type=bind,source=$PWD/docker/check-namelist.py,target=/check-namelist.py,readonly"
+          av-wrf:solver /check-namelist.py

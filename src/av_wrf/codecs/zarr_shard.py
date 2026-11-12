@@ -12,7 +12,6 @@ References:
 from __future__ import annotations
 
 import struct
-from array import array
 from collections.abc import Sequence
 
 import numpy as np
@@ -220,31 +219,6 @@ def decode_shard_f32_array(
                 tile_vals = np.frombuffer(raw_tile, dtype="<f4").reshape(nz, iy, ix)
                 out_arr[s, :, ty : ty + vy, tx : tx + vx] = tile_vals[:, :vy, :vx]
     return out_arr
-
-
-def decode_shard_f32(
-    shard_bytes: bytes,
-    *,
-    shard_time_steps: int = 1,
-    n_frames: int | None = None,
-    nz: int,
-    ny: int,
-    nx: int,
-    output: OutputProfile,
-) -> array[float]:
-    """Verify ZEP-0002 index + CRC-32C and decode `shard_time_steps` slots to float32 array."""
-    out_arr = decode_shard_f32_array(
-        shard_bytes,
-        shard_time_steps=shard_time_steps,
-        n_frames=n_frames,
-        nz=nz,
-        ny=ny,
-        nx=nx,
-        output=output,
-    )
-    out = array("f")
-    out.frombytes(np.ascontiguousarray(out_arr, dtype=np.float32).tobytes())
-    return out
 
 
 def encode_coord_chunks(

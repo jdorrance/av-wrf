@@ -35,6 +35,7 @@ DECLARED_MARKDOWN: frozenset[str] = frozenset(
         "README.md",
         "docs/architecture.md",
         "docs/plan.md",
+        "docs/review-plan.md",
         "docs/reference.md",
         "docs/science.md",
         "config/README.md",

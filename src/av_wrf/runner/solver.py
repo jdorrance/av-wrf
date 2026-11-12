@@ -7,7 +7,8 @@ import re
 from collections.abc import Mapping
 from pathlib import Path
 
-from av_wrf.contracts import BuildManifest, RunLock, SolverReceipt
+from av_wrf.codecs import select_cycle_wrfout_slices
+from av_wrf.contracts import BuildManifest, CycleWindow, RunLock, SolverReceipt
 from av_wrf.runner.store import ObjectStore, sha256_file, solver_receipt_key
 
 
@@ -60,10 +61,19 @@ def load_build_manifest(
     return BuildManifest("host-dev-unpinned", "host-unbuilt", "host-unbuilt", (), "host", "host")
 
 
+def _wrfout_files(wrfout_dir: Path) -> list[Path]:
+    return sorted(wrfout_dir.glob("wrfout_d01_*"))
+
+
+def _hash_complete_wrfout(wrfout_dir: Path, window: CycleWindow) -> tuple[tuple[str, str], ...]:
+    select_cycle_wrfout_slices(wrfout_dir, window.publish_origin_utc, window.valid_times_utc)
+    return tuple((p.name, sha256_file(p)) for p in _wrfout_files(wrfout_dir))
+
+
 def _verify_wrfout_files(
     wrfout_dir: Path, expected: tuple[tuple[str, str], ...], selected: set[Path] | None
 ) -> None:
-    outputs = sorted(p for p in wrfout_dir.glob("wrfout_d01_*") if p.is_file())
+    outputs = _wrfout_files(wrfout_dir)
     if tuple(p.name for p in outputs) != tuple(name for name, _ in expected):
         raise ValueError("wrfout_d01_* inventory does not match SolverReceipt filenames")
     if selected is not None and not selected.issubset(outputs):

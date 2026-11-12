@@ -12,7 +12,7 @@ Source: [`src/av_wrf/cli/main.py`](../src/av_wrf/cli/main.py).
 
 - `av-wrf check`: Validate configured product(s), vertical stretch, namelist, and Zarr v3.
 - `av-wrf plan`: Resolve cycle timestamps and persist an immutable run.lock.json.
-- `av-wrf geog`: Preflight static DEM/land-use tiles and build geo_em.d01.nc.
+- `av-wrf geog`: Build and validate geo_em.d01.nc in a new working directory.
 - `av-wrf prep`: Write Fortran namelist.wps + namelist.input and forcing_subset.json recipe.
 - `av-wrf forcing-manifest`: Verify local GRIB2 inputs and record the forcing inventory.
 - `av-wrf solve`: Execute WPS ungrib/metgrid + MPI real/wrf and bind solver_receipt.json.

@@ -29,14 +29,12 @@ from av_wrf.core.metrics import (
     vector_wind_shear_mps,
 )
 from av_wrf.core.namelist import (
-    NON_NAMELIST_METADATA_FIELDS,
     compile_geogrid_namelist_sections,
     compile_wps_namelist_sections,
     compile_wrf_namelist_sections,
     compile_wrf_run_namelist,
     render_fortran_namelist,
     required_forcing_forecast_hours,
-    validate_science_profile,
 )
 from av_wrf.core.post import (
     NormalizedWrfFrame,
@@ -52,7 +50,6 @@ from av_wrf.core.schedule import (
     resolve_cycle_window,
     selected_lead_hours,
     validate_horizon_policy,
-    verify_run_lock_timestamps,
 )
 from av_wrf.core.thermo import (
     CP_DRY_J_KG_K,
@@ -96,7 +93,6 @@ __all__ = [
     "MIN_SPINUP_HOURS",
     "MIN_STABLE_DZBOT_M",
     "MOIST_THETA_COEFF",
-    "NON_NAMELIST_METADATA_FIELDS",
     "P0_PA",
     "R_DRY_J_KG_K",
     "WRF_T0_K",
@@ -141,11 +137,9 @@ __all__ = [
     "validate_domain_profile",
     "validate_frame_columns",
     "validate_horizon_policy",
-    "validate_science_profile",
     "validate_solver_znw",
     "validate_vertical_column",
     "validate_wrfinput_columns",
     "vector_wind_shear_mps",
-    "verify_run_lock_timestamps",
     "verify_t_thm_consistency",
 ]

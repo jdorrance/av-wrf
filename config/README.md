@@ -14,8 +14,12 @@ uv run av-wrf check
   geometry, vertical stretching, `terrain_elevations_m` checkpoints, and
   `geog_data_path` (mount WPS static geography at `/opt/av-wrf/geog`).
 - `profiles/science/*.yaml`: frozen WRF v4.8 physics and dynamics parameters.
-- `profiles/sources/*.yaml`: native forcing cadence, WPS table, inventory,
-  mirror locations, and dissemination lag. GFS is the verified solve recipe.
+- `profiles/sources/*.yaml`: WPS boundary cadence (`interval_seconds`), target
+  grid spacing after any remapping, WPS table, metgrid level counts, mirrors,
+  and dissemination lag. GFS is the verified solve recipe.
+  New profiles use `metgrid_levels` and `metgrid_soil_levels` for prep.
+  Solve uses dimensions observed in `met_em`. Set `use_sh_qv` for inputs that
+  preserve specific humidity through WPS into `real.exe`.
   `check` reports whether the candidate has a solve recipe.
 - `profiles/outputs/*.yaml`: lead hours, interval transitions, and Zarr v3
   `sharding_indexed` tile/time-step policy.
