@@ -1,4 +1,4 @@
-"""Pure lead-hour selection, UTC/partition parsing, live freshness, and cycle-window math.
+"""Pure lead-hour selection, UTC/partition parsing, local deadline SLA, and cycle-window math.
 
 References:
 - Consumer horizon & lead rules: windy-av-layer/packages/contracts/src/products.ts
@@ -8,6 +8,7 @@ References:
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from av_wrf.contracts import (
     CycleWindow,
@@ -21,6 +22,7 @@ from av_wrf.contracts import (
 
 MIN_SPINUP_HOURS = 6
 MIN_CRON_ARRIVAL_BUFFER_HOURS = 0.25
+MIN_SOLVER_DEADLINE_MARGIN_HOURS = 1.0
 MAX_FUTURE_CLOCK_SKEW_MINUTES = 15
 
 
@@ -46,8 +48,8 @@ def selected_lead_hours(output: OutputProfile) -> tuple[int, ...]:
 
 def _parse_cron_hour_minute(cron_expr: str) -> tuple[int, int]:
     parts = cron_expr.strip().split()
-    if len(parts) != 5:
-        raise ValueError(f"Expected 5-field UTC cron expression, got '{cron_expr}'")
+    if len(parts) != 5 or parts[2:] != ["*", "*", "*"]:
+        raise ValueError(f"Expected a daily UTC cron expression, got '{cron_expr}'")
     minute = int(parts[0])
     hour = int(parts[1])
     if not (0 <= minute < 60 and 0 <= hour < 24):
@@ -55,16 +57,47 @@ def _parse_cron_hour_minute(cron_expr: str) -> tuple[int, int]:
     return hour, minute
 
 
+def _parse_hhmm(hhmm: str) -> tuple[int, int]:
+    token = hhmm.strip()
+    hh_s, sep, mm_s = token.partition(":")
+    if sep != ":" or len(hh_s) != 2 or len(mm_s) != 2 or not (hh_s.isdigit() and mm_s.isdigit()):
+        raise ValueError(f"Expected HH:MM local_deadline_hhmm, got '{hhmm}'")
+    hh, mm = int(hh_s), int(mm_s)
+    if not (0 <= hh < 24 and 0 <= mm < 60):
+        raise ValueError(f"Out-of-range HH:MM in local_deadline_hhmm '{hhmm}'")
+    return hh, mm
+
+
+def _briefing_clock(product: ProductSpec) -> tuple[ZoneInfo, int, int]:
+    try:
+        tz = ZoneInfo(product.region_tz)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"Unknown IANA region_tz '{product.region_tz}'") from exc
+    dl_h, dl_m = _parse_hhmm(product.local_deadline_hhmm)
+    return tz, dl_h, dl_m
+
+
+def _briefing_deadline_utc(origin_utc: datetime, clock: tuple[ZoneInfo, int, int]) -> datetime:
+    tz, hour, minute = clock
+    origin_local = origin_utc.astimezone(tz)
+    deadline_local = origin_local.replace(hour=hour, minute=minute, second=0, fold=0)
+    if deadline_local.astimezone(UTC) <= origin_utc:
+        deadline_local += timedelta(days=1)
+    return deadline_local.astimezone(UTC)
+
+
 def validate_horizon_policy(
     product: ProductSpec,
     source: ForcingProfile,
     output: OutputProfile,
+    *,
+    publish_origin_utc: str | None = None,
 ) -> int:
-    """Verify spin-up floor, cron arrival margin, and remaining-horizon admission budget."""
+    """Verify spin-up, cron arrival margin, local briefing deadline, and remaining horizon."""
     if product.spinup_hours < MIN_SPINUP_HOURS:
         raise ValueError(f"spinup_hours ({product.spinup_hours}) must be >= {MIN_SPINUP_HOURS}")
-    if product.min_horizon_hours >= output.map_end_hour:
-        raise ValueError("min_horizon_hours must be strictly less than map_end_hour")
+    if not 0 < product.min_horizon_hours < output.map_end_hour or product.max_cycle_age_hours < 0:
+        raise ValueError("Expected a positive remaining horizon and non-negative cycle age")
     remaining_floor = output.map_end_hour - product.max_cycle_age_hours
     if remaining_floor < product.min_horizon_hours:
         raise ValueError(
@@ -85,6 +118,14 @@ def validate_horizon_policy(
             f"Schedule '{product.schedule_cron_utc}' triggers {cron_offset_h:.2f}h after "
             f"{product.forcing_cycle_hour_utc:02d}Z, before ready window ({required_ready_h:.2f}h)"
         )
+    clock = _briefing_clock(product)
+    if publish_origin_utc is not None:
+        origin = parse_iso_utc(publish_origin_utc)
+        cron = origin + timedelta(hours=cron_offset_h - origin_gap)
+        deadline = _briefing_deadline_utc(origin, clock)
+        margin = (deadline - cron).total_seconds() / 3600.0
+        if margin < MIN_SOLVER_DEADLINE_MARGIN_HOURS:
+            raise ValueError(f"Daily UTC cron leaves only {margin:.2f}h before briefing deadline")
     if not source.fail_closed:
         raise ValueError(f"ForcingProfile '{source.profile_id}' must enforce fail_closed=True")
     return remaining_floor
@@ -99,11 +140,12 @@ def is_cycle_live_fresh(
     """Return True iff cycle satisfies live clock, max_cycle_age, and min_horizon bounds."""
     origin_dt = parse_iso_utc(publish_origin_utc)
     now_dt = parse_iso_utc(now_utc_iso)
-    # Allow early publication during the spinup window (e.g. 23:45Z for a 00Z publish_origin)
     earliest_live_dt = origin_dt - timedelta(
         hours=product.spinup_hours, minutes=MAX_FUTURE_CLOCK_SKEW_MINUTES
     )
     if now_dt < earliest_live_dt:
+        return False
+    if now_dt > _briefing_deadline_utc(origin_dt, _briefing_clock(product)):
         return False
     age_s = (now_dt - origin_dt).total_seconds()
     if age_s > product.max_cycle_age_hours * 3600.0:
@@ -151,7 +193,7 @@ def resolve_cycle_window(
     output: OutputProfile,
     publish_origin_iso_utc: str,
 ) -> CycleWindow:
-    """Resolve forcing, WRF spin-up init, publish origin, and trailing windows in UTC."""
+    """Resolve forcing, WRF spin-up init, publish origin, and step bounds in UTC."""
     origin_iso, partition = parse_cycle_arg(publish_origin_iso_utc, product)
     origin_dt = parse_iso_utc(origin_iso)
     origin_gap_h = (origin_dt.hour - product.forcing_cycle_hour_utc) % 24

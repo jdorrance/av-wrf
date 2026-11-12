@@ -1,10 +1,8 @@
-"""Integration tests: atomic store CAS, single-flight dispatch, and synthetic provenance."""
+"""Integration tests: atomic store CAS, expiring webhook leases, and shard corruption checks."""
 
 from __future__ import annotations
 
 import json
-import shutil
-import struct
 import sys
 import tempfile
 import unittest
@@ -15,12 +13,11 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from av_wrf.codecs import crc32c_u32  # noqa: E402
 from av_wrf.contracts import BuildManifest, ReadyReceipt  # noqa: E402
-from av_wrf.core import selected_lead_hours  # noqa: E402
 from av_wrf.runner import (  # noqa: E402
     LocalFileStore,
     attempt_stage_prefix,
+    dispatch_receipt_key,
     json_bytes,
     load_build_manifest,
     load_bundle,
@@ -32,39 +29,11 @@ from av_wrf.runner import (  # noqa: E402
     reconcile_dispatch,
     sha256_hex,
 )
-
-
-def stage_fast_two_lead_cfg(src_cfg: Path, dst_cfg: Path) -> str:
-    shutil.copytree(src_cfg, dst_cfg)
-    prod_files = sorted((dst_cfg / "products").glob("*.yaml"))
-    candidates = [load_bundle(dst_cfg, p.stem) for p in prod_files]
-    best = min(
-        candidates,
-        key=lambda b: len(selected_lead_hours(b.output)) * b.domain.e_we * b.domain.e_sn,
-    )
-    (dst_cfg / "profiles" / "outputs" / "wrf-zarr-v3-2h.yaml").write_text(
-        "profile_id: wrf-zarr-v3-2h\nschema_id: wrf-zarr-v3\nmap_end_hour: 2\n"
-        "hourly_through_hour: 2\ntail_step_hours: 1\nshard_time_steps: 1\n"
-        "inner_chunk_yx: [42, 42]\nzstd_level: 3\n",
-        encoding="utf-8",
-    )
-    p_path = dst_cfg / "products" / f"{best.product.product_id}.yaml"
-    lines = []
-    for line in p_path.read_text(encoding="utf-8").splitlines():
-        if line.startswith("output_profile:"):
-            lines.append("output_profile: wrf-zarr-v3-2h")
-        elif line.startswith("min_horizon_hours:"):
-            lines.append("min_horizon_hours: 1")
-        elif line.startswith("max_cycle_age_hours:"):
-            lines.append("max_cycle_age_hours: 1")
-        else:
-            lines.append(line)
-    p_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return best.product.product_id
+from tests.integration import stage_sparse_config  # noqa: E402
 
 
 class TestLocalFileStoreAndDispatch(unittest.TestCase):
-    def test_concurrent_cas_single_flight_dispatch_and_destination_isolation(self) -> None:
+    def test_concurrent_cas_single_flight_and_expired_lease_takeover(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_p = Path(tmp)
             with self.assertRaises(FileNotFoundError):
@@ -73,12 +42,12 @@ class TestLocalFileStoreAndDispatch(unittest.TestCase):
                 load_build_manifest(tmp_p / "missing.json", "sha256:abc", allow_unpinned_dev=True)
 
             store = LocalFileStore(tmp_p / "store")
-            seed_sha = store.compare_and_swap("upstream/m/latest.json", b'{"gen":0}', None)
+            seed_tok = store.compare_and_swap("upstream/m/latest.json", b'{"gen":0}', None)
 
             def attempt_cas(worker_id: int) -> bool:
                 try:
                     store.compare_and_swap(
-                        "upstream/m/latest.json", f'{{"gen":1,"w":{worker_id}}}'.encode(), seed_sha
+                        "upstream/m/latest.json", f'{{"gen":1,"w":{worker_id}}}'.encode(), seed_tok
                     )
                     return True
                 except RuntimeError:
@@ -127,23 +96,44 @@ class TestLocalFileStoreAndDispatch(unittest.TestCase):
                     )
                 )
             self.assertEqual((res.count(True), res.count(False)), (1, 3))
-            self.assertEqual(len(calls), 1)
-            self.assertTrue(
+
+            # Simulate crashed worker leaving stale in_flight claim on destination c:
+            c_url = "https://c.example/hook"
+            c_key = dispatch_receipt_key(receipt, c_url)
+            store.compare_and_swap(
+                c_key,
+                json_bytes(
+                    {
+                        "state": "in_flight",
+                        "claim_id": "dead-worker",
+                        "claimed_at_unix_s": 1000.0,
+                        "lease_seconds": 60.0,
+                    }
+                ),
+                None,
+            )
+            # Active lease at t=1030 blocks duplicate delivery
+            self.assertFalse(
                 reconcile_dispatch(
-                    store, receipt, send_hook, destination_id="https://b.example/hook"
+                    store, receipt, send_hook, destination_id=c_url, now_unix_s=1030.0
                 )
             )
-            self.assertEqual(len(calls), 2)
+            # Expired lease at t=1065 allows clean CAS takeover and delivery
+            self.assertTrue(
+                reconcile_dispatch(
+                    store, receipt, send_hook, destination_id=c_url, now_unix_s=1065.0
+                )
+            )
 
-    def test_synthetic_provenance_fence_and_corrupt_later_shard_rejection(self) -> None:
+    def test_synthetic_provenance_fence_and_corrupt_pressure_shard_rejection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             store = LocalFileStore(tmp_path / "store")
             cfg = tmp_path / "cfg"
-            prod_id = stage_fast_two_lead_cfg(ROOT / "config", cfg)
+            prod_id = stage_sparse_config(ROOT / "config", cfg)
             b = load_bundle(cfg, prod_id)
             origin_iso = f"2026-11-12T{b.product.publish_origin_hour_utc:02d}:00:00Z"
-            manifest = BuildManifest("sha256:test", "wrf-sha", "wps-sha", (), "gcc", "openmpi")
+            manifest = BuildManifest("host-dev-unpinned", "wrf-sha", "wps-sha", (), "gcc", "mpi")
             _, lock = plan_product_cycle(
                 cfg,
                 store,
@@ -188,7 +178,7 @@ class TestLocalFileStoreAndDispatch(unittest.TestCase):
                 store,
                 product_id=prod_id,
                 publish_origin_utc=origin_iso2,
-                attempt_id="att-zstd2",
+                attempt_id="att-crc",
                 mpi_ranks=4,
                 build_manifest=manifest,
             )
@@ -197,19 +187,16 @@ class TestLocalFileStoreAndDispatch(unittest.TestCase):
                 store,
                 product_id=prod_id,
                 cycle_partition=lock2.cycle_partition,
-                attempt_id="att-zstd2",
+                attempt_id="att-crc",
                 wrfout_dir=None,
                 synthetic=True,
             )
-            stg_root = attempt_stage_prefix(prod_id, lock2.cycle_partition, "att-zstd2")
+            stg_root = attempt_stage_prefix(prod_id, lock2.cycle_partition, "att-crc")
             later_p = tmp_path / "store" / stg_root / "forecast.zarr" / "temp_2m_k/c/1/0/0"
             raw_b = bytearray(later_p.read_bytes())
-            raw_b[0:8] = b"\xff\xff\xff\xff\xff\xff\xff\xff"
-            struct.pack_into("<I", raw_b, len(raw_b) - 4, crc32c_u32(bytes(raw_b[-68:-4])))
+            raw_b[-1] ^= 0xFF
             later_p.write_bytes(bytes(raw_b))
-            pm_p = (
-                tmp_path / "store" / post_manifest_key(prod_id, lock2.cycle_partition, "att-zstd2")
-            )
+            pm_p = tmp_path / "store" / post_manifest_key(prod_id, lock2.cycle_partition, "att-crc")
             pm_doc = json.loads(pm_p.read_text(encoding="utf-8"))
             pm_doc["shard_sha256s"] = [
                 [k, sha256_hex(bytes(raw_b)) if k == "temp_2m_k/c/1/0/0" else s]
@@ -222,7 +209,7 @@ class TestLocalFileStoreAndDispatch(unittest.TestCase):
                     store,
                     product_id=prod_id,
                     cycle_partition=lock2.cycle_partition,
-                    attempt_id="att-zstd2",
+                    attempt_id="att-crc",
                     allow_synthetic=True,
                 )
 

@@ -6,8 +6,8 @@
 # - Centered at `40.35N, 44.60E` (Mount Ara / Hrazdan corridor), framing Yerevan, Aparan,
 #   Mount Aragats (`4,090 m`), Tsaghkadzor, Dilijan, Lake Sevan (`1,900 m`), Garni/Azat,
 #   Vedi, Vayots Dzor, and Mount Ararat (`5,137 m`) in 3.2x fewer columns than `armenia-3km-v1`.
-# - `dem_source: default` / `landuse_source: default` resolves stock WPS v4.7 `GEOGRID.TBL.ARW`
-#   (`topo_gmted2010_30s` + `modis_landuse_20class_30s_with_lakes`) with zero custom table edits.
+# - `dzbot_m: 50.0` keeps the lowest mass midpoint (~25.3 m valley / ~21.9 m over 5,137 m Ararat)
+#   strictly above consumer `minimumLevelAglM = 20 m`.
 # References:
 # - WPS domain sizing (>= 100x100): https://www2.mmm.ucar.edu/wrf/site/documentation/namelist.wps_best_practices.html
 # - WPS static geography downloads: https://www2.mmm.ucar.edu/wrf/users/download/get_sources_wps_geog.html
@@ -27,11 +27,11 @@ e_vert: 55
 exported_levels_k: 38
 p_top_pa: 5000.0
 auto_levels_opt: 2
-dzbot_m: 34.0
+dzbot_m: 50.0
 dzstretch_s: 1.11
 dzstretch_u: 1.06
 max_dz_m: 850.0
-min_bl_levels_2km_agl: 18
+min_bl_levels_2km_agl: 17
 terrain_elevations_m: [800.0, 4090.0, 5137.0]
 dem_source: default
 landuse_source: default

@@ -9,8 +9,8 @@
 # - Steep-slope stability: `hybrid_opt: 2, etac: 0.2` (verified fold-free up to 5,137 m Ararat),
 #   `diff_opt: 2, km_opt: 4` physical-space 3D deformation diffusion, `epssm: 0.3` acoustic
 #   off-centering, `w_damping: 1`, and 5 km implicit Rayleigh upper sponge (`damp_opt: 3`).
-# - AFWA diagnostics: `afwa_diag_opt: 1` (`AFWA_MSLP`), `afwa_severe_opt: 1` (`WSPD10MAX`), and
-#   `afwa_buoy_opt: 1` (`AFWA_CAPE` + `AFWA_CAPE_MU`, independent of Thompson graupel number).
+# - AFWA diagnostics: `afwa_diag_opt: 1` and `afwa_buoy_opt: 1` provide most-unstable CAPE.
+# - Lateral boundary `interval_seconds` lives on each `ForcingProfile` (`3600` for GFS, `10800` IFS).
 # References:
 # - WRF v4.8.0 releases: https://github.com/wrf-model/WRF/releases
 # - WRF v4.8.0 Known Problems: https://github.com/wrf-model/WRF/wiki/WRF-V4.8.0-Known-Problems
@@ -55,11 +55,7 @@ time_step_s: 15
 spec_bdy_width: 5
 spec_zone: 1
 relax_zone: 4
-interval_seconds: 3600
-nwp_diagnostics: 1
 afwa_diag_opt: 1
-afwa_severe_opt: 1
 afwa_buoy_opt: 1
 history_interval_min: 60
 bucket_mm: 100.0
-bucket_j: 1000000000.0

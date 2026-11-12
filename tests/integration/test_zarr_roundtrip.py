@@ -1,0 +1,115 @@
+"""Real zarr-python v3 reader round-trip across padded shards and sparse time windows."""
+
+from __future__ import annotations
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+import zarr
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
+
+from av_wrf.contracts import (  # noqa: E402
+    WRF_ZARR_V3_2D_NAMES,
+    WRF_ZARR_V3_3D_NAMES,
+    BuildManifest,
+)
+from av_wrf.core import resolve_cycle_window  # noqa: E402
+from av_wrf.runner import (  # noqa: E402
+    LocalFileStore,
+    load_bundle,
+    plan_product_cycle,
+    post_cycle_from_inputs,
+    publish_cycle_receipt,
+)
+from tests.integration import stage_sparse_config  # noqa: E402
+
+
+class TestZarrV3RoundTrip(unittest.TestCase):
+    def test_zarr_python_v3_reader_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tp, cfg = Path(tmp), Path(tmp) / "cfg"
+            b = load_bundle(cfg, stage_sparse_config(ROOT / "config", cfg))
+            store = LocalFileStore(tp / "store")
+            bm = BuildManifest("host-dev-unpinned", "wrf-sha", "wps-sha", (), "gcc", "openmpi")
+            orig = f"2026-11-12T{b.product.publish_origin_hour_utc:02d}:00:00Z"
+            plan_product_cycle(
+                cfg,
+                store,
+                product_id=b.product.product_id,
+                publish_origin_utc=orig,
+                attempt_id="att-zarr",
+                mpi_ranks=4,
+                build_manifest=bm,
+                bundle=b,
+            )
+            win = resolve_cycle_window(b.product, b.output, orig)
+            post_cycle_from_inputs(
+                cfg,
+                store,
+                product_id=b.product.product_id,
+                cycle_partition=win.cycle_partition,
+                attempt_id="att-zarr",
+                wrfout_dir=None,
+                synthetic=True,
+                bundle=b,
+            )
+            ready = publish_cycle_receipt(
+                cfg,
+                store,
+                product_id=b.product.product_id,
+                cycle_partition=win.cycle_partition,
+                attempt_id="att-zarr",
+                bundle=b,
+                allow_synthetic=True,
+                now_utc_iso="2026-11-12T00:15:00Z",
+            )
+            zarr_dir = (
+                tp
+                / "store"
+                / "fixtures"
+                / "synthetic"
+                / b.product.model_id
+                / win.cycle_partition
+                / "forecast.zarr"
+            )
+            grp = zarr.open_group(str(zarr_dir), mode="r")
+            self.assertEqual(ready.window_starts_utc, win.window_starts_utc)
+            nj = b.domain.e_sn - 1 - 2 * b.domain.bdy_trim_cells
+            ni = b.domain.e_we - 1 - 2 * b.domain.bdy_trim_cells
+            n_t = len(win.lead_hours)
+            for nm2 in WRF_ZARR_V3_2D_NAMES:
+                node2 = grp[nm2]
+                assert isinstance(node2, zarr.Array)
+                arr2 = np.asarray(node2[:])
+                self.assertEqual(arr2.shape, (nj, ni) if nm2 == "terrain_m" else (n_t, nj, ni))
+                self.assertTrue(bool(np.all(np.isfinite(arr2))))
+            for nm3 in WRF_ZARR_V3_3D_NAMES:
+                node3 = grp[nm3]
+                assert isinstance(node3, zarr.Array)
+                arr3 = np.asarray(node3[:])
+                self.assertEqual(arr3.shape, (n_t, b.domain.exported_levels_k, nj, ni))
+                self.assertTrue(bool(np.all(np.isfinite(arr3))))
+
+            starts, ends, precip = (
+                grp[name] for name in ("window_start_unix_s", "window_end_unix_s", "precip_mm_hr")
+            )
+            assert isinstance(starts, zarr.Array)
+            assert isinstance(ends, zarr.Array)
+            assert isinstance(precip, zarr.Array)
+            start_s = np.asarray(starts[:], dtype=np.int64)
+            end_s = np.asarray(ends[:], dtype=np.int64)
+            np.testing.assert_array_equal(start_s[1:], end_s[:-1])
+            durations_h = (end_s - start_s) / 3600
+            np.testing.assert_allclose(durations_h, (1, 1, 4))
+            precip_rate = np.asarray(precip[:, 0, 0], dtype=np.float64)
+            np.testing.assert_allclose(np.sum(durations_h * precip_rate), 6 * 0.25)
+
+
+if __name__ == "__main__":
+    unittest.main()

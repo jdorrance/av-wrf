@@ -75,24 +75,21 @@ class ScienceProfile:
     spec_bdy_width: int
     spec_zone: int
     relax_zone: int
-    interval_seconds: int
-    nwp_diagnostics: int
     afwa_diag_opt: int
-    afwa_severe_opt: int
     afwa_buoy_opt: int
     history_interval_min: int
     bucket_mm: float
-    bucket_j: float
 
 
 @dataclass(frozen=True)
 class ForcingProfile:
     profile_id: str
     provider: str
+    vtable_name: str
+    interval_seconds: int
     grid_spacing_deg: float
     pressure_level_count: int
     soil_layer_centers_cm: tuple[float, ...]
-    has_dedicated_sst: bool
     source_ready_lag_p95_hours: float
     mirrors: tuple[str, ...]
     fail_closed: bool
@@ -138,6 +135,7 @@ class ProductCheckSummary:
     y0_m: float
     primary_source: str
     candidate_source: str
+    candidate_recipe_available: bool
     lead_count: int
     bl_levels_2km: int
     remaining_horizon_floor_hours: int

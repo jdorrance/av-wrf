@@ -7,28 +7,24 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from av_wrf.contracts import GridWindMps, MixingRatioKgKg  # noqa: E402
-from av_wrf.core import (  # noqa: E402
-    lambert_xy_m_to_latlon,
-    latlon_to_lambert_xy_m,
-    mixing_ratio_to_spfh,
-    rotate_grid_to_earth,
-)
+from av_wrf.core import lambert_xy_m_to_latlon, latlon_to_lambert_xy_m  # noqa: E402
+from av_wrf.core.thermo import mixing_ratio_to_spfh_vec, rotate_grid_to_earth_vec  # noqa: E402
 
 
 def _assert_rotation_norm(ug: float, vg: float, angle_rad: float) -> None:
-    ue, ve = rotate_grid_to_earth(
-        GridWindMps(ug), GridWindMps(vg), math.cos(angle_rad), math.sin(angle_rad)
-    )
-    assert abs(math.hypot(float(ue), float(ve)) - math.hypot(ug, vg)) < 1e-9
+    u, v, cos_a, sin_a = np.array([ug, vg, math.cos(angle_rad), math.sin(angle_rad)]).reshape(4, 1)
+    ue, ve = rotate_grid_to_earth_vec(u, v, cos_a, sin_a)
+    assert abs(math.hypot(float(ue[0]), float(ve[0])) - math.hypot(ug, vg)) < 1e-9
 
 
 def _assert_spfh_bounded(r: float) -> None:
-    q = float(mixing_ratio_to_spfh(MixingRatioKgKg(r)))
+    q = float(mixing_ratio_to_spfh_vec(np.array([r]))[0])
     assert 0.0 <= q < 1.0
 
 

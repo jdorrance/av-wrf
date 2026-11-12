@@ -1,4 +1,4 @@
-"""Typed JSON decoders and immutable solver, post, publication, and diagnostics receipts."""
+"""Typed JSON decoders and immutable forcing, solver, post, publication, and diag receipts."""
 
 from __future__ import annotations
 
@@ -57,6 +57,36 @@ def req_pair_tuple(doc: Mapping[str, object], key: str) -> tuple[tuple[str, str]
             raise ValueError(f"Invalid [key, sha256] pair in '{key}'")
         pairs.append((first, second))
     return tuple(pairs)
+
+
+@dataclass(frozen=True)
+class ForcingManifest:
+    """Verified forcing inventory binding source profile, cycle, forecast hours, and SHA-256s."""
+
+    product_id: str
+    cycle_partition: str
+    forcing_profile_id: str
+    forcing_cycle_utc: str
+    vtable_name: str
+    interval_seconds: int
+    forecast_hours: tuple[int, ...]
+    file_sha256s: tuple[tuple[str, str], ...]
+
+    def to_doc(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_doc(cls, doc: Mapping[str, object]) -> ForcingManifest:
+        return cls(
+            req_str(doc, "product_id"),
+            req_str(doc, "cycle_partition"),
+            req_str(doc, "forcing_profile_id"),
+            req_str(doc, "forcing_cycle_utc"),
+            req_str(doc, "vtable_name"),
+            req_int(doc, "interval_seconds"),
+            req_int_tuple(doc, "forecast_hours"),
+            req_pair_tuple(doc, "file_sha256s"),
+        )
 
 
 @dataclass(frozen=True)

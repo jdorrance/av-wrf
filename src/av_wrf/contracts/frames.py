@@ -18,7 +18,7 @@ from av_wrf.contracts.quantities import (
 
 @dataclass(frozen=True)
 class RawWrfBaselineInput:
-    """Minimal 2D computational-grid f000 baseline fields (avoids reading 3D volumes at f000)."""
+    """Minimal 2D computational-grid baseline fields (avoids reading 3D volumes)."""
 
     valid_time_utc: str
     valid_time_unix_s: int
@@ -46,7 +46,8 @@ class RawWrfStepInput:
     q2_kgkg: CompMass2D
     u10_grid_mps: CompMass2D
     v10_grid_mps: CompMass2D
-    wspd10max_mps: CompMass2D
+    hfx_wm2: CompMass2D
+    lh_wm2: CompMass2D
     ustar_mps: CompMass2D
     pblh_m: CompMass2D
     afwa_cape_jkg: CompMass2D

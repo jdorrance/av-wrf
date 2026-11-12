@@ -9,9 +9,8 @@ from __future__ import annotations
 
 import math
 
-from av_wrf.codecs.zarr_shard import resolve_inner_chunk_yx
+from av_wrf.codecs.zarr_shard import outer_shard_yx, resolve_inner_chunk_yx
 from av_wrf.contracts import (
-    CAPE_PARCEL_DEFINITION,
     LOW_CLOUD_DEFINITION,
     MOISTURE_SOURCE_OF_TRUTH,
     TEMPERATURE_DEFINITION,
@@ -19,6 +18,7 @@ from av_wrf.contracts import (
     WRF_ZARR_V3_FIELD_NAMES,
     WRF_ZARR_V3_FIELDS,
     ZARR_FORMAT_VERSION,
+    ZARR_SCHEMA_ID,
     ZARR_SCHEMA_STATUS,
     ZARR_SCHEMA_VERSION,
     DomainProfile,
@@ -96,13 +96,16 @@ def _field_array_meta(
     output: OutputProfile,
 ) -> dict[str, object]:
     iy, ix = resolve_inner_chunk_yx(nj, ni, output)
+    outer_ny, outer_nx = outer_shard_yx(nj, ni, output)
     t_shard = min(t_len, output.shard_time_steps)
     if spec.dims == ("y", "x"):
-        shape, outer, inner = [nj, ni], [nj, ni], [iy, ix]
+        shape, outer, inner = [nj, ni], [outer_ny, outer_nx], [iy, ix]
     elif len(spec.dims) == 3:
-        shape, outer, inner = [t_len, nj, ni], [t_shard, nj, ni], [1, iy, ix]
+        shape, outer, inner = [t_len, nj, ni], [t_shard, outer_ny, outer_nx], [1, iy, ix]
     else:
-        shape, outer, inner = [t_len, k_len, nj, ni], [t_shard, k_len, nj, ni], [1, k_len, iy, ix]
+        shape = [t_len, k_len, nj, ni]
+        outer = [t_shard, k_len, outer_ny, outer_nx]
+        inner = [1, k_len, iy, ix]
     return {
         "zarr_format": ZARR_FORMAT_VERSION,
         "node_type": "array",
@@ -138,6 +141,10 @@ def build_zarr_v3_store_metadata(
     lead_hours: tuple[int, ...],
 ) -> dict[str, dict[str, object]]:
     """Build complete Zarr v3 metadata map (root group, 7 coords, and 22 sharded arrays)."""
+    if output.schema_id != ZARR_SCHEMA_ID:
+        raise ValueError(
+            f"OutputProfile.schema_id '{output.schema_id}' != locked '{ZARR_SCHEMA_ID}'"
+        )
     nj, ni = published_grid_shape(domain)
     t_len = len(lead_hours)
     k_len = domain.exported_levels_k
@@ -156,7 +163,8 @@ def build_zarr_v3_store_metadata(
                 "vertical_coordinate": "model-levels",
                 "moisture_source_of_truth": MOISTURE_SOURCE_OF_TRUTH,
                 "temperature_definition": TEMPERATURE_DEFINITION,
-                "cape_parcel_definition": CAPE_PARCEL_DEFINITION,
+                # WRF v4.8 Buoyancy selects max theta-e where pressure exceeds 500 hPa.
+                "cape_parcel_definition": "afwa-mucape-max-theta-e-pressure-gt-500hpa",
                 "low_cloud_definition": LOW_CLOUD_DEFINITION,
                 "lead_hours": list(lead_hours),
                 "crs_wkt": published_crs_wkt(domain),

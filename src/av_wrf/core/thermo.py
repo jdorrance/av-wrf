@@ -1,4 +1,4 @@
-"""Pure scalar and vectorized meteorological formulas, THM consistency, and bit-grooming.
+"""Pure vectorized meteorological formulas, THM consistency, and bit-grooming.
 
 WRF inversion uses fixed `WRF_T0_K = 300.0 K`, `r_d = 287.0`, `cp = 1004.5`, `r_v = 461.6`,
 `xlv = 2.5e6`, and `g = 9.81` (`WRF/share/module_model_constants.F`); MSLP uses a C0-continuous
@@ -7,28 +7,13 @@ Shuell plateau cap across `290.5 K`; 10 m gusts use surface air density `PSFC / 
 
 from __future__ import annotations
 
-import math
-import struct
 from array import array
-from collections.abc import Sequence
+from itertools import pairwise
 
 import numpy as np
 import numpy.typing as npt
 
-from av_wrf.contracts import (
-    CompMass3D,
-    EarthWindMps,
-    GridWindMps,
-    MixingRatioKgKg,
-    OmegaPaS,
-    Pascals,
-    ScienceProfile,
-    SpecificHumidityKgKg,
-    TempK,
-    VerticalVelocityMps,
-    WrfPerturbMoistThetaK,
-    WrfPerturbPotTempK,
-)
+from av_wrf.contracts import CompMass3D, ScienceProfile
 
 P0_PA = 100_000.0
 WRF_T0_K = 300.0
@@ -47,23 +32,11 @@ CONSUMER_KELVIN_OFFSET = 273.15
 CONSUMER_EPSILON = 0.622
 
 
-def potential_to_temp_k(theta_perturb_k: WrfPerturbPotTempK, pressure_pa: Pascals) -> TempK:
-    """Convert WRF perturbation potential temperature T = theta - 300 K to sensible T (K)."""
-    if pressure_pa <= 0.0 or not math.isfinite(pressure_pa) or not math.isfinite(theta_perturb_k):
-        raise ValueError("Pressure and theta_perturb_k must be finite with pressure > 0")
-    theta = float(theta_perturb_k) + WRF_T0_K
-    return TempK(theta * ((float(pressure_pa) / P0_PA) ** KAPPA_DRY))
-
-
-def moist_thm_to_temp_k(
-    thm_perturb_k: WrfPerturbMoistThetaK,
-    qvapor_kgkg: MixingRatioKgKg,
-    pressure_pa: Pascals,
-) -> TempK:
-    """Convert WRF THM = theta*(1 + (Rv/Rd)*qv) - 300 K to sensible air T (K)."""
-    qv = max(0.0, float(qvapor_kgkg))
-    theta = (float(thm_perturb_k) + WRF_T0_K) / (1.0 + MOIST_THETA_COEFF * qv)
-    return potential_to_temp_k(WrfPerturbPotTempK(theta - WRF_T0_K), pressure_pa)
+def potential_to_temp_vec(
+    theta_perturb_k: npt.NDArray[np.float64], pressure_pa: npt.NDArray[np.float64]
+) -> npt.NDArray[np.float64]:
+    """Vectorized WRF dry perturbation potential temperature (`theta - 300 K`) inversion."""
+    return (theta_perturb_k + WRF_T0_K) * np.power(pressure_pa / P0_PA, KAPPA_DRY)
 
 
 def verify_t_thm_consistency(
@@ -75,12 +48,14 @@ def verify_t_thm_consistency(
     science: ScienceProfile,
 ) -> None:
     """Verify wrfout dry `T` and moist `THM` invert to identical sensible T using fixed 300 K."""
-    td_v = np.frombuffer(t_dry.buf, dtype=np.float32).astype(np.float64)
-    thm_v = np.frombuffer(thm.buf, dtype=np.float32).astype(np.float64)
-    qv_raw = np.frombuffer(qv.buf, dtype=np.float32).astype(np.float64)
-    p_pa = np.frombuffer(p_pert.buf, dtype=np.float32).astype(np.float64) + np.frombuffer(
-        pb.buf, dtype=np.float32
-    ).astype(np.float64)
+    td_v = np.frombuffer(t_dry.buf, dtype=np.float32)
+    thm_v = np.frombuffer(thm.buf, dtype=np.float32)
+    qv_raw = np.frombuffer(qv.buf, dtype=np.float32)
+    p_pa = np.add(
+        np.frombuffer(p_pert.buf, dtype=np.float32),
+        np.frombuffer(pb.buf, dtype=np.float32),
+        dtype=np.float64,
+    )
     if not (
         np.all(np.isfinite(td_v))
         and np.all(np.isfinite(thm_v))
@@ -90,22 +65,25 @@ def verify_t_thm_consistency(
         raise ValueError("Non-finite value in wrfout T/THM/P/QVAPOR")
     if bool(np.any(p_pa <= 0.0)):
         raise ValueError("Non-positive pressure in wrfout T/THM consistency check")
-    theta_dry = td_v + WRF_T0_K
+    diff = np.subtract(td_v, thm_v, dtype=np.float64)
     if science.use_theta_m == 1:
-        theta_from_thm = (thm_v + WRF_T0_K) / (1.0 + MOIST_THETA_COEFF * np.maximum(0.0, qv_raw))
-    else:
-        theta_from_thm = thm_v + WRF_T0_K
-    exner = np.power(p_pa / P0_PA, KAPPA_DRY)
-    diff = np.abs((theta_dry - theta_from_thm) * exner)
+        moist = np.maximum(qv_raw, 0.0, dtype=np.float64) * MOIST_THETA_COEFF
+        diff += (np.add(td_v, WRF_T0_K, dtype=np.float64)) * moist
+        diff /= 1.0 + moist
+    np.abs(diff, out=diff)
+    # Most frames satisfy the tolerance even at the greatest possible Exner factor.
+    if float(np.max(diff)) * (float(np.max(p_pa)) / P0_PA) ** KAPPA_DRY <= 0.05:
+        return
+    diff *= np.power(p_pa / P0_PA, KAPPA_DRY)
     worst = int(np.argmax(diff))
     if float(diff[worst]) > 0.05:
         raise ValueError(f"wrfout T vs THM mismatch ({float(diff[worst]):.3f} K) at index {worst}")
 
 
-def mixing_ratio_to_spfh(qvapor_kgkg: MixingRatioKgKg) -> SpecificHumidityKgKg:
-    """Convert water vapor mixing ratio r >= 0 to specific humidity q = r / (1 + r)."""
-    r = max(0.0, float(qvapor_kgkg))
-    return SpecificHumidityKgKg(r / (1.0 + r))
+def mixing_ratio_to_spfh_vec(r_kgkg: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    """Convert dry-air mixing ratio to specific humidity."""
+    r = np.maximum(0.0, r_kgkg)
+    return r / (1.0 + r)
 
 
 def clamp_spfh_2m_vec(
@@ -123,28 +101,15 @@ def clamp_spfh_2m_vec(
     return np.where(safe_p, np.minimum(q, (r_sat / (1.0 + r_sat)) * (1.0 - 2.0**-14)), q)
 
 
-def clamp_spfh_2m_to_liquid_sat(spfh_2m_kgkg: float, t2_k: float, psfc_pa: float) -> float:
-    """Cap diagnostic 2 m specific humidity at consumer Bolton (1980) liquid saturation."""
-    res = clamp_spfh_2m_vec(
-        np.array([spfh_2m_kgkg], dtype=np.float64),
-        np.array([t2_k], dtype=np.float64),
-        np.array([psfc_pa], dtype=np.float64),
-    )
-    return float(res[0])
-
-
-def geometric_w_to_omega_pas(
-    w_mps: VerticalVelocityMps,
-    pressure_pa: Pascals,
-    temp_k: TempK,
-    spfh_kgkg: SpecificHumidityKgKg,
-) -> OmegaPaS:
-    """Convert geometric vertical velocity w (m/s) to hydrostatic omega = -rho_m * g0 * w."""
-    if pressure_pa <= 0.0 or temp_k <= 0.0:
-        raise ValueError("Pressure and temperature must be positive")
-    tv_k = float(temp_k) * (1.0 + VIRTUAL_TEMP_COEFF * max(0.0, float(spfh_kgkg)))
-    rho_moist = float(pressure_pa) / (R_DRY_J_KG_K * tv_k)
-    return OmegaPaS(-rho_moist * G0_MPS2 * float(w_mps))
+def geometric_w_to_omega_vec(
+    w_mps: npt.NDArray[np.float64],
+    pressure_pa: npt.NDArray[np.float64],
+    temp_k: npt.NDArray[np.float64],
+    spfh_kgkg: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float64]:
+    """Vectorized hydrostatic vertical velocity conversion `omega = -rho_m * g0 * w`."""
+    tv_k = temp_k * (1.0 + VIRTUAL_TEMP_COEFF * np.maximum(0.0, spfh_kgkg))
+    return -(pressure_pa / (R_DRY_J_KG_K * tv_k)) * G0_MPS2 * w_mps
 
 
 def hypsometric_mslp_vec(
@@ -169,21 +134,9 @@ def hypsometric_mslp_vec(
     return psfc_pa * np.exp((G0_MPS2 * z_m) / (R_DRY_J_KG_K * tv_mean))
 
 
-def hypsometric_mslp_pa(psfc_pa: float, terrain_m: float, t2_k: float, spfh_2m: float) -> float:
-    """Scalar wrapper delegating to `hypsometric_mslp_vec` for single-owner MSLP math."""
-    res = hypsometric_mslp_vec(
-        np.array([psfc_pa], dtype=np.float64),
-        np.array([terrain_m], dtype=np.float64),
-        np.array([t2_k], dtype=np.float64),
-        np.array([spfh_2m], dtype=np.float64),
-    )
-    return float(res[0])
-
-
 def parameterized_gust_10m_vec(
     u10_mps: npt.NDArray[np.float64],
     v10_mps: npt.NDArray[np.float64],
-    wspd10max_mps: npt.NDArray[np.float64],
     ustar_mps: npt.NDArray[np.float64],
     sensible_flux_wm2: npt.NDArray[np.float64],
     latent_flux_wm2: npt.NDArray[np.float64],
@@ -192,7 +145,7 @@ def parameterized_gust_10m_vec(
     spfh_2m: npt.NDArray[np.float64],
     psfc_pa: npt.NDArray[np.float64],
 ) -> npt.NDArray[np.float64]:
-    """Vectorized Panofsky (1977) / ECMWF IFS 10 m gust with surface air density."""
+    """Instantaneous 10 m wind plus a Panofsky-style turbulence increment."""
     q2, tk = np.maximum(0.0, spfh_2m), np.maximum(200.0, t2_k)
     tv0 = tk * (1.0 + VIRTUAL_TEMP_COEFF * q2)
     rho = np.maximum(10_000.0, psfc_pa) / (R_DRY_J_KG_K * tv0)
@@ -203,138 +156,45 @@ def parameterized_gust_10m_vec(
     eddy = IFS_GUST_COEFF * np.cbrt(
         np.power(np.maximum(0.0, ustar_mps), 3.0) + (0.5 * VON_KARMAN / 12.0) * wstar3
     )
-    return np.maximum(wspd10max_mps, np.hypot(u10_mps, v10_mps) + eddy)
+    return np.hypot(u10_mps, v10_mps) + eddy
 
 
-def parameterized_gust_10m_mps(
-    u10_mps: float,
-    v10_mps: float,
-    wspd10max_mps: float,
-    ustar_mps: float,
-    sensible_flux_wm2: float,
-    latent_flux_wm2: float,
-    pblh_m: float,
-    t2_k: float,
-    spfh_2m: float = 0.0,
-    psfc_pa: float = P0_PA,
-) -> float:
-    """Combine resolved WSPD10MAX with Panofsky (1977) / ECMWF IFS surface-density gusts."""
-    res = parameterized_gust_10m_vec(
-        np.array([u10_mps], dtype=np.float64),
-        np.array([v10_mps], dtype=np.float64),
-        np.array([wspd10max_mps], dtype=np.float64),
-        np.array([ustar_mps], dtype=np.float64),
-        np.array([sensible_flux_wm2], dtype=np.float64),
-        np.array([latent_flux_wm2], dtype=np.float64),
-        np.array([pblh_m], dtype=np.float64),
-        np.array([t2_k], dtype=np.float64),
-        np.array([spfh_2m], dtype=np.float64),
-        np.array([psfc_pa], dtype=np.float64),
-    )
-    return float(res[0])
+def max_random_cloud_pct_vec(cloud: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    """Compute Geleyn/Hogan maximum-random overlap over clipped `(level, cell)` fractions."""
+    clear: npt.NDArray[np.float64] = np.subtract(1.0, cloud[0], dtype=np.float64)
+    for prev, curr in pairwise(cloud):
+        active = prev < 0.999999
+        ratio = (1.0 - np.maximum(prev, curr)) / np.where(active, 1.0 - prev, 1.0)
+        clear *= np.where(active, ratio, 0.0)
+    np.subtract(1.0, clear, out=clear)
+    clear *= 100.0
+    return clear
 
 
-def max_random_cloud_pct(cldfra_levels: Sequence[float]) -> float:
-    """Compute column cloud cover percentage (0..100) via Geleyn/Hogan max-random overlap."""
-    if not cldfra_levels:
-        return 0.0
-    clear_prob = 1.0 - min(1.0, max(0.0, cldfra_levels[0]))
-    for idx in range(1, len(cldfra_levels)):
-        c_prev = min(1.0, max(0.0, cldfra_levels[idx - 1]))
-        c_curr = min(1.0, max(0.0, cldfra_levels[idx]))
-        if c_prev < 0.999999:
-            ratio = (1.0 - max(c_prev, c_curr)) / (1.0 - c_prev)
-            clear_prob *= min(1.0, max(0.0, ratio))
-        else:
-            clear_prob = 0.0
-    return 100.0 * (1.0 - min(1.0, max(0.0, clear_prob)))
-
-
-def rotate_grid_to_earth(
-    u_grid: GridWindMps,
-    v_grid: GridWindMps,
-    cos_alpha: float,
-    sin_alpha: float,
-) -> tuple[EarthWindMps, EarthWindMps]:
-    """Rotate grid-relative winds to Earth-relative using WRF COSALPHA and SINALPHA."""
-    ug, vg = float(u_grid), float(v_grid)
-    return (
-        EarthWindMps(ug * cos_alpha - vg * sin_alpha),
-        EarthWindMps(ug * sin_alpha + vg * cos_alpha),
-    )
-
-
-def verify_wrf_alpha_against_lambert(
-    cos_alpha: float,
-    sin_alpha: float,
-    cos_theta: float,
-    sin_theta: float,
-    tol: float = 1e-4,
-) -> None:
-    """Verify WRF's (COSALPHA, SINALPHA) matches analytical Lambert (cos(theta), -sin(theta))."""
-    if abs(cos_alpha - cos_theta) > tol or abs(sin_alpha + sin_theta) > tol:
-        raise ValueError(
-            f"WRF ({cos_alpha:.5f}, {sin_alpha:.5f}) != Lambert ({cos_theta:.5f}, {-sin_theta:.5f})"
-        )
-
-
-def window_rate_from_accum(
-    prev_val: float,
-    prev_bucket_count: int,
-    curr_val: float,
-    curr_bucket_count: int,
-    bucket_scale: float,
-    dt_seconds: float,
-    *,
-    per_hour: bool = False,
-    allow_negative: bool = False,
-) -> float:
-    """Compute mean rate across (t_prev, t_curr] from cumulative or bucketed WRF totals."""
-    if dt_seconds <= 0.0:
-        raise ValueError("Window duration dt_seconds must be positive")
-    delta = (curr_val + curr_bucket_count * bucket_scale) - (
-        prev_val + prev_bucket_count * bucket_scale
-    )
-    if not allow_negative and delta < -1e-6:
-        raise ValueError(f"Negative cumulative delta ({delta}) across window")
-    clamped = delta if allow_negative else max(0.0, delta)
-    rate_per_s = clamped / dt_seconds
-    return rate_per_s * 3600.0 if per_hour else rate_per_s
-
-
-def groom_mantissa_f32(value: float, keepbits: int) -> float:
-    """Round-to-nearest-even IEEE-754 float32 retaining `keepbits` significand bits."""
-    if not (1 <= keepbits <= 23):
-        raise ValueError("keepbits must be in 1..23 for float32")
-    if not math.isfinite(value) or value == 0.0:
-        return value
-    (bits,) = struct.unpack("<I", struct.pack("<f", value))
-    drop = 23 - keepbits
-    if drop == 0:
-        (exact,) = struct.unpack("<f", struct.pack("<I", bits))
-        return float(exact)
-    half = 1 << (drop - 1)
-    lsb = (bits >> drop) & 1
-    rounded = (bits + half - 1 + lsb) & ~((1 << drop) - 1)
-    (groomed,) = struct.unpack("<f", struct.pack("<I", rounded))
-    return float(groomed)
+def rotate_grid_to_earth_vec(
+    u: npt.NDArray[np.float64],
+    v: npt.NDArray[np.float64],
+    cos_alpha: npt.NDArray[np.float64],
+    sin_alpha: npt.NDArray[np.float64],
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """Rotate grid-relative winds using WRF COSALPHA and SINALPHA."""
+    return u * cos_alpha - v * sin_alpha, u * sin_alpha + v * cos_alpha
 
 
 def groom_f32_buf(values: npt.NDArray[np.float64], keepbits: int) -> array[float]:
-    """Batch round-to-nearest-even IEEE-754 float32 bit-grooming matching `groom_mantissa_f32`."""
+    """In-place round-to-nearest-even IEEE-754 float32 bit-grooming with single buffer copy."""
     if not (1 <= keepbits <= 23):
         raise ValueError("keepbits must be in 1..23 for float32")
-    f32 = np.ascontiguousarray(values, dtype=np.float32).ravel()
+    out = array("f", [0.0]) * values.size
+    f32 = np.frombuffer(out, dtype=np.float32).reshape(values.shape)
+    np.copyto(f32, values, casting="same_kind")
     drop = 23 - keepbits
     if drop > 0:
-        bits = f32.view(np.uint32).copy()
+        bits = f32.view(np.uint32)
         exp = (bits >> np.uint32(23)) & np.uint32(0xFF)
         active = (exp != np.uint32(0xFF)) & ((bits & np.uint32(0x7FFFFFFF)) != np.uint32(0))
-        half = np.uint32(1 << (drop - 1))
-        lsb = (bits >> np.uint32(drop)) & np.uint32(1)
+        half_m1 = np.uint32((1 << (drop - 1)) - 1)
         mask = np.uint32(0xFFFFFFFF ^ ((1 << drop) - 1))
-        rounded = (bits + half - np.uint32(1) + lsb) & mask
-        f32 = np.where(active, rounded, bits).astype(np.uint32, copy=False).view(np.float32)
-    out = array("f")
-    out.frombytes(np.ascontiguousarray(f32, dtype=np.float32).tobytes())
+        rounded = (bits + half_m1 + ((bits >> np.uint32(drop)) & np.uint32(1))) & mask
+        np.copyto(bits, rounded, where=active)
     return out

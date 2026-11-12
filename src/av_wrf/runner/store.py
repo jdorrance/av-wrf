@@ -1,23 +1,45 @@
-"""ObjectStore protocol, key builders, atomic link-install writes, and flock CAS."""
+"""ObjectStore protocol, key builders, streaming hashes, exclusive cycle lock, and CAS."""
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import fcntl
 import hashlib
 import json
 import os
 import shutil
+import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Protocol
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
+from weakref import WeakValueDictionary
+
+_INPROC_LOCKS_GUARD = threading.Lock()
+_INPROC_LOCKS: WeakValueDictionary[Path, threading.Lock] = WeakValueDictionary()
+
+
+def _inproc_lock_for(path: Path) -> threading.Lock:
+    with _INPROC_LOCKS_GUARD:
+        lk = _INPROC_LOCKS.get(path)
+        if lk is None:
+            lk = threading.Lock()
+            _INPROC_LOCKS[path] = lk
+        return lk
 
 
 def sha256_hex(payload: bytes) -> str:
-    """Return lowercase SHA-256 hex digest of payload."""
+    """Return lowercase SHA-256 hex digest of in-memory payload."""
     return hashlib.sha256(payload).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    """Stream file and return lowercase SHA-256 hex digest."""
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def json_bytes(obj: object) -> bytes:
@@ -56,13 +78,19 @@ def synthetic_cycle_prefix(model_id: str, cycle_partition: str) -> str:
 
 
 class ObjectStore(Protocol):
-    """Minimal immutable-put, store-native copy, cleanup, and CAS object storage boundary."""
+    """Minimal immutable-put, copy, cycle-lock, and opaque-token CAS object storage boundary."""
 
     def get_bytes(self, key: str) -> bytes | None: ...
+    def get_with_token(self, key: str) -> tuple[bytes | None, str | None]: ...
     def put_if_absent(self, key: str, payload: bytes) -> str: ...
     def copy_if_absent(self, src_key: str, dst_key: str, expected_sha256: str) -> str: ...
     def delete_prefix(self, prefix: str) -> None: ...
-    def compare_and_swap(self, key: str, payload: bytes, expected_sha256: str | None) -> str: ...
+    def compare_and_swap(self, key: str, payload: bytes, expected_token: str | None) -> str: ...
+    def cycle_lock(self, prefix: str) -> AbstractContextManager[None]: ...
+
+
+class CASConflict(RuntimeError):
+    """The current object token differs from the expected token."""
 
 
 def put_idempotent(
@@ -73,16 +101,12 @@ def put_idempotent(
     equiv: Callable[[bytes, bytes], bool] | None = None,
 ) -> str:
     """Write payload if absent; succeed on retry iff existing matches SHA-256 or equiv()."""
-    digest = sha256_hex(payload)
     try:
         return store.put_if_absent(key, payload)
     except FileExistsError:
         existing = store.get_bytes(key)
-        if existing is not None:
-            if sha256_hex(existing) == digest:
-                return digest
-            if equiv is not None and equiv(existing, payload):
-                return sha256_hex(existing)
+        if existing is not None and (existing == payload or (equiv and equiv(existing, payload))):
+            return sha256_hex(existing)
         raise
 
 
@@ -94,8 +118,12 @@ def _install_temp_exclusively(tmp_path: Path, dst_path: Path, key: str) -> None:
         raise FileExistsError(f"Immutable object already exists: {key}") from exc
 
 
+def _cas_token_for_bytes(payload: bytes) -> str:
+    return f"etag:{sha256_hex(payload)}"
+
+
 class LocalFileStore:
-    """Filesystem ObjectStore enforcing atomic exclusive puts, hardlinks, and flock CAS."""
+    """Filesystem ObjectStore enforcing atomic exclusive puts, hardlinks, cycle lock, and CAS."""
 
     def __init__(self, root_dir: Path) -> None:
         self._root = root_dir.resolve()
@@ -113,6 +141,12 @@ class LocalFileStore:
     def get_bytes(self, key: str) -> bytes | None:
         path = self._resolve(key)
         return path.read_bytes() if path.is_file() else None
+
+    def get_with_token(self, key: str) -> tuple[bytes | None, str | None]:
+        raw = self.get_bytes(key)
+        if raw is None:
+            return None, None
+        return raw, _cas_token_for_bytes(raw)
 
     def put_if_absent(self, key: str, payload: bytes) -> str:
         path = self._resolve(key)
@@ -133,12 +167,12 @@ class LocalFileStore:
         tmp = dst.parent / f".{dst.name}.{uuid.uuid4().hex}.tmp"
         try:
             shutil.copy2(src, tmp)
-            if sha256_hex(tmp.read_bytes()) != sha:
+            if sha256_file(tmp) != sha:
                 raise ValueError(f"Staged source SHA-256 mismatch on {src_key}")
             try:
                 _install_temp_exclusively(tmp, dst, dst_key)
             except FileExistsError:
-                if sha256_hex(dst.read_bytes()) != sha:
+                if sha256_file(dst) != sha:
                     raise
         finally:
             tmp.unlink(missing_ok=True)
@@ -147,7 +181,7 @@ class LocalFileStore:
         src = self._resolve(src_key)
         dst = self._resolve(dst_key)
         if dst.is_file():
-            if sha256_hex(dst.read_bytes()) == expected_sha256:
+            if sha256_file(dst) == expected_sha256:
                 return expected_sha256
             raise FileExistsError(f"Immutable destination differs from expected SHA-256: {dst_key}")
         if not src.is_file():
@@ -156,7 +190,7 @@ class LocalFileStore:
         try:
             os.link(src, dst)
         except FileExistsError:
-            if sha256_hex(dst.read_bytes()) != expected_sha256:
+            if sha256_file(dst) != expected_sha256:
                 raise
         except OSError as exc:
             if exc.errno != errno.EXDEV:
@@ -171,18 +205,38 @@ class LocalFileStore:
         elif target.is_file():
             target.unlink()
 
-    def compare_and_swap(self, key: str, payload: bytes, expected_sha256: str | None) -> str:
+    @contextlib.contextmanager
+    def cycle_lock(self, prefix: str) -> Iterator[None]:
+        """Hold exclusive thread + OS flock on `<prefix>/.publish.lock` through promotion."""
+        dir_path = self._resolve(prefix)
+        dir_path.mkdir(parents=True, exist_ok=True)
+        lock_file = dir_path / ".publish.lock"
+        thread_lock = _inproc_lock_for(lock_file)
+        with thread_lock, lock_file.open("a+b") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def compare_and_swap(self, key: str, payload: bytes, expected_token: str | None) -> str:
         path = self._resolve(key)
         path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = path.parent / f".{path.name}.cas.lock"
-        with lock_path.open("a+b") as lock_handle:
+        thread_lock = _inproc_lock_for(lock_path)
+        with thread_lock, lock_path.open("a+b") as lock_handle:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
             try:
                 current = path.read_bytes() if path.is_file() else None
-                actual = sha256_hex(current) if current is not None else None
-                if actual != expected_sha256:
-                    raise RuntimeError(
-                        f"CAS conflict on {key}: expected {expected_sha256}, found {actual}"
+                if current is None:
+                    matched = expected_token is None
+                    actual_tok: str | None = None
+                else:
+                    actual_tok = _cas_token_for_bytes(current)
+                    matched = expected_token in (actual_tok, actual_tok.removeprefix("etag:"))
+                if not matched:
+                    raise CASConflict(
+                        f"CAS conflict on {key}: expected {expected_token}, found {actual_tok}"
                     )
                 tmp = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
                 try:
@@ -194,15 +248,17 @@ class LocalFileStore:
                     tmp.unlink(missing_ok=True)
             finally:
                 fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-        return sha256_hex(payload)
+        return _cas_token_for_bytes(payload)
 
 
 def open_store(store_uri: str) -> ObjectStore:
-    """Open an ObjectStore from a file:// URI (S3/R2 obstore wiring lands in Phase 2)."""
+    """Open an explicit local path or file:// URI."""
+    if not store_uri.strip():
+        raise ValueError("Store path or URI is required")
     parsed = urlparse(store_uri)
     if parsed.scheme in ("", "file"):
-        raw_path = parsed.path if parsed.scheme == "file" else store_uri
+        if parsed.scheme == "file" and (parsed.netloc not in ("", "localhost") or not parsed.path):
+            raise ValueError("Use a local path or a file:// URI with a local filesystem path")
+        raw_path = unquote(parsed.path) if parsed.scheme == "file" else store_uri
         return LocalFileStore(Path(raw_path))
-    raise ValueError(
-        f"Unsupported scheme '{parsed.scheme}://' in Phase 1; use file:// until Phase 2"
-    )
+    raise ValueError(f"Unsupported store scheme '{parsed.scheme}://'; use file://")

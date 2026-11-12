@@ -33,7 +33,6 @@ def _synthetic_base_3d(
     p_pb = array("f")
     z_phb = array("f", [(1200.0 + faces_agl[0]) * 9.81]) * n2
     for k in range(nz):
-        # Strictly < 88_000 Pa surface pressure and strictly decreasing upward
         p_pb.extend(array("f", [87_800.0 * (0.97**k)]) * n2)
         z_phb.extend(array("f", [(1200.0 + faces_agl[k + 1]) * 9.81]) * n2)
     pb = CompMass3D(Slab3DF32(nz=nz, ny=ny, nx=nx, buf=p_pb))
@@ -55,9 +54,13 @@ def synthetic_thm_from_dry_theta(theta_pert_k: float, qv_kgkg: float) -> float:
 
 
 def build_synthetic_wrf_baseline(
-    domain: DomainProfile, valid_time_utc: str, valid_time_unix_s: int
+    domain: DomainProfile,
+    valid_time_utc: str,
+    valid_time_unix_s: int,
+    *,
+    lead_hour: int = 0,
 ) -> RawWrfBaselineInput:
-    """Build lightweight 2D synthetic f000 baseline without allocating 3D volumes."""
+    """Build lightweight 2D synthetic accumulator baseline without allocating 3D volumes."""
     ny, nx = domain.e_sn - 1, domain.e_we - 1
     n2 = ny * nx
 
@@ -70,17 +73,20 @@ def build_synthetic_wrf_baseline(
         valid_time_unix_s=valid_time_unix_s,
         terrain_m=c2(1200.0),
         psfc_pa=c2(88_000.0),
-        achfx_j_m2=c2(0.0),
-        aclhf_j_m2=c2(0.0),
+        achfx_j_m2=c2(float(lead_hour) * 240.0 * 3600.0),
+        aclhf_j_m2=c2(float(lead_hour) * 80.0 * 3600.0),
         rainc_mm=c2(0.0),
         i_rainc=zeros,
-        rainnc_mm=c2(0.0),
+        rainnc_mm=c2(float(lead_hour) * 0.25),
         i_rainnc=zeros,
     )
 
 
 def build_synthetic_wrf_step(
-    domain: DomainProfile, valid_time_utc: str, valid_time_unix_s: int, lead_hour: int
+    domain: DomainProfile,
+    valid_time_utc: str,
+    valid_time_unix_s: int,
+    lead_hour: int,
 ) -> RawWrfStepInput:
     """Build a physically consistent computational-grid WRF step for local smoke runs."""
     ny, nx, nz = domain.e_sn - 1, domain.e_we - 1, domain.e_vert - 1
@@ -108,7 +114,8 @@ def build_synthetic_wrf_step(
         q2_kgkg=c2(0.007),
         u10_grid_mps=c2(4.5),
         v10_grid_mps=c2(1.5),
-        wspd10max_mps=c2(6.0),
+        hfx_wm2=c2(240.0),
+        lh_wm2=c2(80.0),
         ustar_mps=c2(0.42),
         pblh_m=c2(1900.0),
         afwa_cape_jkg=c2(320.0),

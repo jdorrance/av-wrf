@@ -1,4 +1,4 @@
-"""Unit tests for av_wrf.core.grid loading configured domain YAMLs dynamically."""
+"""Unit tests for av_wrf.core.grid: offset central meridian bbox, dateline, and crop-destagger."""
 
 from __future__ import annotations
 
@@ -27,11 +27,10 @@ from av_wrf.contracts import (  # noqa: E402
 from av_wrf.core import (  # noqa: E402
     computational_latlon_bounds,
     crop_bucket_2d,
+    crop_destagger_x_3d,
+    crop_destagger_y_3d,
+    crop_destagger_z_3d,
     crop_sponge_2d,
-    crop_sponge_3d,
-    destagger_x_3d,
-    destagger_y_3d,
-    destagger_z_3d,
     lambert_xy_m_to_latlon,
     latlon_to_lambert_xy_m,
     published_crs_wkt,
@@ -74,8 +73,6 @@ class TestGrid(unittest.TestCase):
                 std_parallel_2_deg=sp2,
                 radius_m=r_m,
             )
-            self.assertGreater(x_m, 0.0)
-            self.assertGreater(y_m, 0.0)
             rec_lat, rec_lon = lambert_xy_m_to_latlon(
                 x_m,
                 y_m,
@@ -103,16 +100,23 @@ class TestGrid(unittest.TestCase):
             self.assertLess(abs(x_m - px), 0.05)
             self.assertLess(abs(y_m - py), 0.05)
 
-    def test_published_lambert_metadata_and_bounds_for_all_domains(self) -> None:
+    def test_published_lambert_metadata_offset_meridian_and_antimeridian_bounds(self) -> None:
         for base_dom in _load_configured_domains():
             validate_domain_profile(base_dom)
-            w, s, e, n = computational_latlon_bounds(base_dom)
-            self.assertLess(w, base_dom.center_lon_deg)
-            self.assertGreater(e, base_dom.center_lon_deg)
-            self.assertLess(s, base_dom.center_lat_deg)
-            self.assertGreater(n, base_dom.center_lat_deg)
+            dom = dataclasses.replace(base_dom, center_lon_deg=base_dom.central_meridian_deg + 4.0)
+            w, s, e, n = computational_latlon_bounds(dom)
+            self.assertLess(w, dom.center_lon_deg)
+            self.assertGreater(e, dom.center_lon_deg)
+            self.assertLess(s, dom.center_lat_deg)
+            self.assertGreater(n, dom.center_lat_deg)
 
-            dom = dataclasses.replace(base_dom, center_lon_deg=base_dom.central_meridian_deg + 1.25)
+            # Antimeridian-crossing domain (centered at 179E) yields bounded span < 20 deg
+            anti_dom = dataclasses.replace(
+                base_dom, center_lon_deg=179.0, central_meridian_deg=179.0
+            )
+            aw, _, ae, _ = computational_latlon_bounds(anti_dom)
+            self.assertTrue(0.0 < (ae - aw) < 20.0)
+
             meta = published_lambert_grid_metadata(dom)
             nj, ni = published_grid_shape(dom)
             self.assertEqual((meta["height"], meta["width"]), (nj, ni))
@@ -126,8 +130,8 @@ class TestGrid(unittest.TestCase):
                 origin_lat_deg=dom.center_lat_deg,
                 central_meridian_deg=dom.central_meridian_deg,
                 std_parallel_1_deg=dom.std_parallel_1_deg,
-                std_parallel_2_deg=dom.std_parallel_2_deg,
                 radius_m=dom.earth_radius_m,
+                std_parallel_2_deg=dom.std_parallel_2_deg,
             )
             self.assertAlmostEqual(clat, dom.center_lat_deg, places=9)
             self.assertAlmostEqual(clon, dom.center_lon_deg, places=9)
@@ -135,29 +139,32 @@ class TestGrid(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_domain_profile(dataclasses.replace(_load_configured_domains()[0], e_we=100))
 
-    def test_destagger_3d_and_sponge_crop_float32_and_int32_slabs(self) -> None:
+    def test_crop_and_destagger_use_faces_adjacent_to_exported_mass_cells(self) -> None:
         slab = CompMass2D(
             Slab2DF32.from_values(5, 6, [float(r * 10 + c) for r in range(5) for c in range(6)])
         )
         cropped = crop_sponge_2d(slab, trim=1)
         self.assertEqual((cropped.ny, cropped.nx), (3, 4))
-        self.assertAlmostEqual(cropped.at(0, 0), 11.0, places=5)
-
         bkt = CompBucket2D(
             Slab2DI32.from_values(5, 6, [r * 10 + c for r in range(5) for c in range(6)])
         )
-        bkt_c = crop_bucket_2d(bkt, trim=1)
-        self.assertEqual((bkt_c.ny, bkt_c.nx, bkt_c.at(0, 0)), (3, 4, 11))
+        self.assertEqual(crop_bucket_2d(bkt, trim=1).at(0, 0), 11)
 
-        u_stag = CompStagX3D(Slab3DF32.from_values(2, 3, 4, [float(i) for i in range(24)]))
-        v_stag = CompStagY3D(Slab3DF32.from_values(2, 4, 3, [float(i) for i in range(24)]))
-        w_stag = CompStagZ3D(Slab3DF32.from_values(3, 3, 3, [float(i) for i in range(27)]))
-        self.assertEqual((destagger_x_3d(u_stag).nz, destagger_x_3d(u_stag).nx), (2, 3))
-        self.assertEqual((destagger_y_3d(v_stag).ny, destagger_y_3d(v_stag).nx), (3, 3))
-        w_mass = destagger_z_3d(w_stag)
-        self.assertEqual((w_mass.nz, w_mass.ny, w_mass.nx), (2, 3, 3))
-        vol_cropped = crop_sponge_3d(w_mass, trim=1, exported_k=1)
-        self.assertEqual((vol_cropped.nz, vol_cropped.ny, vol_cropped.nx), (1, 1, 1))
+        u_stag = CompStagX3D(Slab3DF32.from_values(3, 4, 6, [float(i) for i in range(72)]))
+        v_stag = CompStagY3D(Slab3DF32.from_values(3, 5, 5, [float(i) for i in range(75)]))
+        w_stag = CompStagZ3D(Slab3DF32.from_values(4, 4, 5, [float(i) for i in range(80)]))
+        self.assertEqual(
+            list(crop_destagger_x_3d(u_stag, 1, 2).buf),
+            [7.5, 8.5, 9.5, 13.5, 14.5, 15.5, 31.5, 32.5, 33.5, 37.5, 38.5, 39.5],
+        )
+        self.assertEqual(
+            list(crop_destagger_y_3d(v_stag, 1, 2).buf),
+            [8.5, 9.5, 10.5, 13.5, 14.5, 15.5, 33.5, 34.5, 35.5, 38.5, 39.5, 40.5],
+        )
+        self.assertEqual(
+            list(crop_destagger_z_3d(w_stag, 1, 2).buf),
+            [16.0, 17.0, 18.0, 21.0, 22.0, 23.0, 36.0, 37.0, 38.0, 41.0, 42.0, 43.0],
+        )
 
 
 if __name__ == "__main__":

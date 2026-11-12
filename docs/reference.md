@@ -14,6 +14,7 @@ Source: [`src/av_wrf/cli/main.py`](../src/av_wrf/cli/main.py).
 - `av-wrf plan`: Resolve cycle timestamps and persist an immutable run.lock.json.
 - `av-wrf geog`: Preflight static DEM/land-use tiles and build geo_em.d01.nc.
 - `av-wrf prep`: Write Fortran namelist.wps + namelist.input and forcing_subset.json recipe.
+- `av-wrf forcing-manifest`: Verify local GRIB2 inputs and record the forcing inventory.
 - `av-wrf solve`: Execute WPS ungrib/metgrid + MPI real/wrf and bind solver_receipt.json.
 - `av-wrf post`: Stage wrfout frames into attempt-scoped sharded wrf-zarr-v3 arrays.
 - `av-wrf publish`: Verify full RunLock horizon, promote Zarr store, and CAS latest.json.
@@ -23,8 +24,8 @@ Source: [`src/av_wrf/cli/main.py`](../src/av_wrf/cli/main.py).
 
 Source: [`config/products/`](../config/README.md).
 
-- `wrf-armenia-3km`: published grid `180 x 148` (`x0M = -268500.0`, `y0M = -220500.0`), primary `noaa-gfs-0p25-v1` (candidate `ecmwf-ifs-0p1-v1`), `40` leads, `21` BL levels (`0-2 km` AGL), remaining-horizon floor `42 h`, `time_step = 15 s`.
-- `wrf-armenia-pilot-3km`: published grid `84 x 84` (`x0M = -124500.0`, `y0M = -124500.0`), primary `noaa-gfs-0p25-v1` (candidate `ecmwf-ifs-0p1-v1`), `16` leads, `21` BL levels (`0-2 km` AGL), remaining-horizon floor `10 h`, `time_step = 15 s`.
+- `wrf-armenia-3km`: published grid `180 x 148` (`x0M = -268500.0`, `y0M = -220500.0`), primary `noaa-gfs-0p25-v1` (candidate `ecmwf-ifs-0p1-v1`, no solve recipe), `40` leads, `17` BL levels (`0-2 km` AGL), remaining-horizon floor `42 h`, `time_step = 15 s`.
+- `wrf-armenia-pilot-3km`: published grid `84 x 84` (`x0M = -124500.0`, `y0M = -124500.0`), primary `noaa-gfs-0p25-v1` (candidate `ecmwf-ifs-0p1-v1`, no solve recipe), `16` leads, `17` BL levels (`0-2 km` AGL), remaining-horizon floor `10 h`, `time_step = 15 s`.
 
 ## Wire Schema `wrf-zarr-v3` (v1, `provisional-phase-1`)
 

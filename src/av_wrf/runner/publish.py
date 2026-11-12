@@ -1,4 +1,4 @@
-"""Strict full-horizon `publish` promotion, synthetic fixture fence, and recoverable CAS."""
+"""Strict full-horizon `publish` promotion with exclusive cycle lock and stage retention."""
 
 from __future__ import annotations
 
@@ -26,80 +26,17 @@ from av_wrf.runner.publish_verify import validate_post_manifest, verify_staged_o
 from av_wrf.runner.solver import verify_solver_receipt
 from av_wrf.runner.stages import load_run_lock
 from av_wrf.runner.store import (
+    CASConflict,
     ObjectStore,
     attempt_stage_prefix,
     json_bytes,
     post_manifest_key,
     published_cycle_prefix,
     put_idempotent,
-    sha256_hex,
     synthetic_cycle_prefix,
 )
 
 MAX_CAS_RETRIES = 8
-
-
-def _acquire_promotion_owner(
-    store: ObjectStore, pub_root: str, attempt_id: str
-) -> tuple[str, bool]:
-    owner_key = f"{pub_root}/_promotion_owner.json"
-    next_bytes = json_bytes({"attempt_id": attempt_id})
-    for _ in range(MAX_CAS_RETRIES):
-        cur = store.get_bytes(owner_key)
-        prev_sha = sha256_hex(cur) if cur is not None else None
-        prev_attempt = json.loads(cur.decode("utf-8")).get("attempt_id") if cur else None
-        try:
-            sha = store.compare_and_swap(owner_key, next_bytes, prev_sha)
-            return sha, (prev_attempt is not None and prev_attempt != attempt_id)
-        except RuntimeError:
-            continue
-    raise RuntimeError(f"Failed to acquire promotion ownership on {pub_root}")
-
-
-def _copy_one_staged_item(
-    stage_store: ObjectStore, dst_store: ObjectStore, src_k: str, dst_k: str, sha: str
-) -> None:
-    if stage_store is dst_store:
-        dst_store.copy_if_absent(src_k, dst_k, sha)
-        return
-    raw = stage_store.get_bytes(src_k)
-    if raw is None or sha256_hex(raw) != sha:
-        raise ValueError(f"Missing staged object during cross-store copy: {src_k}")
-    put_idempotent(dst_store, dst_k, raw)
-
-
-def _promote_verified_objects(
-    stage_store: ObjectStore,
-    dst_store: ObjectStore,
-    stage_root: str,
-    pub_root: str,
-    pm: StagedPostManifest,
-    attempt_id: str,
-) -> None:
-    _, had_prior_owner = _acquire_promotion_owner(dst_store, pub_root, attempt_id)
-    if dst_store.get_bytes(f"{pub_root}/_ready.json") is not None:
-        return
-    staged_zarr, pub_zarr = f"{stage_root}/{pm.zarr_relpath}", f"{pub_root}/{pm.zarr_relpath}"
-    if had_prior_owner:
-        dst_store.delete_prefix(pub_zarr)
-        dst_store.delete_prefix(f"{pub_root}/_diagnostics.json")
-    all_items = [
-        *(
-            (f"{staged_zarr}/{k}", f"{pub_zarr}/{k}", s)
-            for k, s in (*pm.meta_sha256s, *pm.shard_sha256s)
-        ),
-        (f"{stage_root}/_diagnostics.json", f"{pub_root}/_diagnostics.json", pm.diagnostics_sha256),
-    ]
-    for idx, (src_k, dst_k, sha) in enumerate(all_items):
-        try:
-            _copy_one_staged_item(stage_store, dst_store, src_k, dst_k, sha)
-        except FileExistsError:
-            if dst_store.get_bytes(f"{pub_root}/_ready.json") is not None:
-                raise
-            dst_store.delete_prefix(pub_zarr)
-            dst_store.delete_prefix(f"{pub_root}/_diagnostics.json")
-            for r_src, r_dst, r_sha in all_items[: idx + 1]:
-                _copy_one_staged_item(stage_store, dst_store, r_src, r_dst, r_sha)
 
 
 def _advance_latest_pointer_with_retry(
@@ -118,8 +55,7 @@ def _advance_latest_pointer_with_retry(
         }
     )
     for _ in range(MAX_CAS_RETRIES):
-        current_raw = store.get_bytes(latest_key)
-        expected_sha = sha256_hex(current_raw) if current_raw is not None else None
+        current_raw, expected_tok = store.get_with_token(latest_key)
         if current_raw is not None:
             cur_doc = json.loads(current_raw.decode("utf-8"))
             if (
@@ -128,22 +64,17 @@ def _advance_latest_pointer_with_retry(
             ):
                 return
         try:
-            store.compare_and_swap(latest_key, next_payload, expected_sha)
+            store.compare_and_swap(latest_key, next_payload, expected_tok)
             return
-        except RuntimeError:
+        except CASConflict:
             continue
     raise RuntimeError(f"Failed to advance {latest_key} after {MAX_CAS_RETRIES} CAS attempts")
 
 
 def _check_existing_published_ready(
-    stage_store: ObjectStore,
     dst_store: ObjectStore,
     ready_key: str,
-    stage_root: str,
     lock: RunLock,
-    b: LoadedBundle,
-    is_synthetic: bool,
-    now_iso: str,
 ) -> ReadyReceipt | None:
     existing_ready = dst_store.get_bytes(ready_key)
     if existing_ready is None:
@@ -152,13 +83,16 @@ def _check_existing_published_ready(
     if not isinstance(existing_doc, dict):
         raise ValueError("Corrupt _ready.json in published store")
     committed = ReadyReceipt.from_doc(existing_doc)
-    if committed.attempt_id != lock.attempt_id or committed.config_sha256 != lock.config_sha256:
+    if (
+        committed.attempt_id != lock.attempt_id
+        or committed.config_sha256 != lock.config_sha256
+        or committed.model_id != lock.model_id
+        or committed.cycle_partition != lock.cycle_partition
+        or committed.publish_origin_utc != lock.publish_origin_utc
+    ):
         raise FileExistsError(
             f"Cycle {lock.cycle_partition} already published by {committed.attempt_id}"
         )
-    if not is_synthetic:
-        _advance_latest_pointer_with_retry(dst_store, committed, b, now_iso)
-    stage_store.delete_prefix(stage_root)
     return committed
 
 
@@ -192,6 +126,49 @@ def _build_ready_receipt(
     )
 
 
+def _promote_under_cycle_lock(
+    stage_store: ObjectStore,
+    dst_store: ObjectStore,
+    stage_root: str,
+    pub_root: str,
+    pm: StagedPostManifest,
+    b: LoadedBundle,
+    window: CycleWindow,
+    lock: RunLock,
+    is_synth: bool,
+) -> ReadyReceipt:
+    ready_key = f"{pub_root}/_ready.json"
+    staged_zarr, pub_zarr = f"{stage_root}/{pm.zarr_relpath}", f"{pub_root}/{pm.zarr_relpath}"
+    with dst_store.cycle_lock(pub_root):
+        already = _check_existing_published_ready(dst_store, ready_key, lock)
+        if already is not None:
+            return already
+        owner_key = f"{pub_root}/_promotion_owner.json"
+        owner_doc = json_bytes({"attempt_id": lock.attempt_id})
+        prior_owner, owner_tok = dst_store.get_with_token(owner_key)
+        if prior_owner != owner_doc:
+            if prior_owner is not None:
+                dst_store.delete_prefix(pub_zarr)
+                dst_store.delete_prefix(f"{pub_root}/_diagnostics.json")
+            dst_store.compare_and_swap(owner_key, owner_doc, owner_tok)
+
+        def push_verified(rel_key: str, sha: str, payload: bytes) -> None:
+            dst_key = f"{pub_zarr}/{rel_key}"
+            if stage_store is dst_store:
+                dst_store.copy_if_absent(f"{staged_zarr}/{rel_key}", dst_key, sha)
+            else:
+                put_idempotent(dst_store, dst_key, payload)
+
+        diag_raw = verify_staged_objects(
+            stage_store, stage_root, pm, b, window, lock, on_verified_object=push_verified
+        )
+        put_idempotent(dst_store, f"{pub_root}/_diagnostics.json", diag_raw)
+        receipt = _build_ready_receipt(lock, pm, b, window, is_synth)
+        put_idempotent(dst_store, ready_key, json_bytes(receipt.to_doc()))
+        dst_store.delete_prefix(owner_key)
+    return receipt
+
+
 def publish_cycle_receipt(
     config_root: Path,
     store: ObjectStore,
@@ -202,9 +179,10 @@ def publish_cycle_receipt(
     bundle: LoadedBundle | None = None,
     stage_store: ObjectStore | None = None,
     allow_synthetic: bool = False,
+    prune_stage: bool = False,
     now_utc_iso: str | None = None,
 ) -> ReadyReceipt:
-    """Verify RunLock provenance, ZEP-0002 shards & coords, recoverably promote, and CAS latest."""
+    """Verify RunLock provenance, ZEP-0002 shards & coords, lock cycle, promote, and CAS latest."""
     stg = store if stage_store is None else stage_store
     now_iso = format_iso_utc(datetime.now(UTC)) if now_utc_iso is None else now_utc_iso
     b = load_bundle(config_root, product_id) if bundle is None else bundle
@@ -217,10 +195,10 @@ def publish_cycle_receipt(
         live_r = f"{published_cycle_prefix(lock.model_id, lock.cycle_partition)}/_ready.json"
         fix_r = f"{synthetic_cycle_prefix(lock.model_id, lock.cycle_partition)}/_ready.json"
         chk = fix_r if allow_synthetic and store.get_bytes(fix_r) else live_r
-        already = _check_existing_published_ready(
-            stg, store, chk, stage_root, lock, b, chk == fix_r, now_iso
-        )
+        already = _check_existing_published_ready(store, chk, lock)
         if already is not None:
+            if chk == live_r:
+                _advance_latest_pointer_with_retry(store, already, b, now_iso)
             return already
         raise FileNotFoundError("Missing post_manifest.json; run `av-wrf post` before `publish`")
 
@@ -236,20 +214,13 @@ def publish_cycle_receipt(
         if is_synth
         else published_cycle_prefix(lock.model_id, lock.cycle_partition)
     )
-    ready_key = f"{pub_root}/_ready.json"
-    already = _check_existing_published_ready(
-        stg, store, ready_key, stage_root, lock, b, is_synth, now_iso
+    receipt = _promote_under_cycle_lock(
+        stg, store, stage_root, pub_root, pm, b, window, lock, is_synth
     )
-    if already is not None:
-        return already
-    verify_staged_objects(stg, stage_root, pm, b, window)
-    _promote_verified_objects(stg, store, stage_root, pub_root, pm, lock.attempt_id)
-    receipt = _build_ready_receipt(lock, pm, b, window, is_synth)
-    put_idempotent(store, ready_key, json_bytes(receipt.to_doc()))
-    store.delete_prefix(f"{pub_root}/_promotion_owner.json")
     if not is_synth:
         _advance_latest_pointer_with_retry(store, receipt, b, now_iso)
-    stg.delete_prefix(stage_root)
+    if prune_stage:
+        stg.delete_prefix(stage_root)
     return receipt
 
 

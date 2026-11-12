@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from av_wrf.contracts.quantities import PubBucket2D, PubMass2D
 from av_wrf.contracts.receipts import (
     DiagnosticsReceipt,
+    ForcingManifest,
     ReadyReceipt,
     SolverReceipt,
     StagedPostManifest,
@@ -25,7 +26,10 @@ def parse_iso_utc(iso_str: str) -> datetime:
     cleaned = iso_str.strip()
     if not cleaned:
         raise ValueError("Empty UTC timestamp string")
-    dt = datetime.fromisoformat(cleaned[:-1] + "+00:00" if cleaned.endswith("Z") else cleaned)
+    try:
+        dt = datetime.fromisoformat(cleaned[:-1] + "Z" if cleaned.endswith("z") else cleaned)
+    except ValueError as exc:
+        raise ValueError(f"Invalid ISO-8601 timestamp {iso_str!r}; pass explicit Z/offset") from exc
     if dt.tzinfo is None or dt.utcoffset() is None:
         raise ValueError(
             f"Timezone-naive timestamp is forbidden; pass explicit Z/offset: {iso_str}"
@@ -138,22 +142,12 @@ class RunLock:
         )
 
 
-@dataclass(frozen=True)
-class CheckpointManifest:
-    attempt_id: str
-    valid_time_utc: str
-    oci_digest: str
-    mpi_ranks: int
-    wrfrst_sha256s: tuple[tuple[str, str], ...]
-    accum_baseline_sha256: str
-
-
 __all__ = [
     "AccumBaseline",
     "BuildManifest",
-    "CheckpointManifest",
     "CycleWindow",
     "DiagnosticsReceipt",
+    "ForcingManifest",
     "ReadyReceipt",
     "RunLock",
     "SolverReceipt",

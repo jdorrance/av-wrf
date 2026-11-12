@@ -1,29 +1,32 @@
-# Container Build (`docker/`)
+# Container build
 
-Multi-stage `Dockerfile` providing two targets on `linux/arm64` (native on Apple
-Silicon via OrbStack or Docker Desktop) with zero region IDs baked into the image:
-
-1. **`runtime`** (final stage, default `docker build .`): lean Python 3.12
-   producer (`check`, `plan`, `prep`, `post`, `publish`, `reconcile`).
-2. **`solver`** (`--target solver`): compiles pinned
-   [Jasper 1.900.29](https://github.com/jasper-software/jasper),
-   [WRF v4.8.0](https://github.com/wrf-model/WRF/releases) (`-DUSE_MPI=ON`,
-   `ARW` `EM_REAL`), and [WPS v4.7.0](https://github.com/wrf-model/WPS/releases)
-   (`-DWRF_DIR=/opt/av-wrf`, `-DUSE_MPI=ON`) via CMake + Ninja, verifies all
-   five binaries (`wrf.exe`, `real.exe`, `geogrid.exe`, `metgrid.exe`,
-   `ungrib.exe`) and shared libraries via `ldd`, and writes
-   `/opt/av-wrf/build-manifest.json` including SHA-256 digests of any
-   `docker/patches/*.patch` files.
+The default image runs the Python producer. The `solver` target adds Linux
+WRF-ARW, WPS, Open MPI and ecCodes.
 
 ```sh
-# Fast default producer image:
-docker buildx build --platform linux/arm64 -f docker/Dockerfile -t av-wrf:runtime .
-
-# Full MPI WRF v4.8.0 + WPS v4.7.0 solver image (smoke check runs `av-wrf check`):
-docker buildx build --platform linux/arm64 --target solver --build-arg JOBS=12 -f docker/Dockerfile -t av-wrf:solver .
-docker run --rm av-wrf:solver
+docker buildx build --load -f docker/Dockerfile -t av-wrf:runtime .
+docker buildx build --load --platform linux/arm64 --target solver \
+  -f docker/Dockerfile -t av-wrf:solver .
+docker run --rm av-wrf:solver check
 ```
 
-Mount static WPS geography at `/opt/av-wrf/geog` (`geog_data_path` in domain
-profiles). Solver patches in [`patches/`](patches/README.md) are locked in
-[`manifest.lock`](../manifest.lock).
+Both targets install Python dependencies from `uv.lock`. The solver uses
+[WRF](https://github.com/wrf-model/WRF/releases) and
+[WPS](https://github.com/wrf-model/WPS/releases) with their classic GNU builds.
+The WPS classic build keeps GRIB2 decoding on the tested path.
+[WPS ungrib build issue](https://github.com/wrf-model/WPS/issues/279)
+
+[`build-wrf.sh`](build-wrf.sh) and [`build-wps.sh`](build-wps.sh) compile in separate layers.
+[`package-solver.sh`](package-solver.sh) installs the five runtime executables,
+their data tables, the JasPer shared library and a build manifest. The final
+solver stage verifies dynamic linkage.
+
+Mount WPS geography at the configured `geog_data_path`. Run `geog`, pass its
+`geo_em.d01.nc` to `plan` and `solve`, and use `forcing-manifest` to seal the
+local GRIB2 files after acquisition. Set `AV_WRF_OCI_DIGEST` to the solver
+image digest for both `plan` and `solve`. Set `AV_WRF_STORE_URI` to a mounted
+durable store for live runs. Solver patches in
+[patches/](patches/README.md) are locked in [manifest.lock](../manifest.lock).
+
+Set `AV_WRF_MPI_LAUNCHER='srun --mpi=pmix -n'` to use a compatible Slurm
+installation. The runner appends the locked rank count and solver executable.

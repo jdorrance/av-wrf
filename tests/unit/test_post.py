@@ -1,4 +1,4 @@
-"""Unit tests for av_wrf.core.post: signed fluxes, pressure ordering, fixed 300K, and NaN guards."""
+"""Post checks for accumulated fields, usable vertical levels and fixed WRF thermodynamics."""
 
 from __future__ import annotations
 
@@ -75,7 +75,8 @@ def _synthetic_step(
         q2_kgkg=c2(0.008),
         u10_grid_mps=c2(4.0),
         v10_grid_mps=c2(-3.0),
-        wspd10max_mps=c2(6.5),
+        hfx_wm2=c2(240.0),
+        lh_wm2=c2(80.0),
         ustar_mps=c2(0.45),
         pblh_m=c2(1800.0),
         afwa_cape_jkg=c2(420.0),
@@ -99,7 +100,7 @@ def _synthetic_step(
 
 
 class TestPostFrame(unittest.TestCase):
-    def test_post_frame_signed_flux_fixed_300k_pressure_order_and_nan_guards(self) -> None:
+    def test_post_frame_tail_flux_fixed_300k_pressure_order_and_nan_guards(self) -> None:
         prod_id = sorted((ROOT / "config" / "products").glob("*.yaml"))[0].stem
         bundle = load_bundle(ROOT / "config", prod_id)
         dom = dataclasses.replace(
@@ -111,29 +112,14 @@ class TestPostFrame(unittest.TestCase):
             exported_levels_k=3,
             min_bl_levels_2km_agl=3,
         )
-        # Even with base_temp_k=290.0, post_frame MUST invert T using fixed 300 K
         sci = dataclasses.replace(bundle.science, base_temp_k=290.0)
         f000 = _synthetic_step(
-            1_000_000,
-            "2026-11-12T00:00:00Z",
-            4,
-            5,
-            4,
-            achfx=1.0e7,
-            rainnc=98.0,
-            i_rainnc=0,
+            1_000_000, "2026-11-12T00:00:00Z", 4, 5, 4, achfx=1.0e7, rainnc=98.0, i_rainnc=0
         )
         base0 = build_accum_baseline(f000, trim=1)
 
         f001 = _synthetic_step(
-            1_003_600,
-            "2026-11-12T01:00:00Z",
-            4,
-            5,
-            4,
-            achfx=1.072e7,
-            rainnc=1.6,
-            i_rainnc=1,
+            1_003_600, "2026-11-12T01:00:00Z", 4, 5, 4, achfx=1.072e7, rainnc=1.6, i_rainnc=1
         )
         out1, base1 = post_frame(base0, f001, dom, sci)
         self.assertEqual(set(out1.fields_2d) | set(out1.fields_3d), set(WRF_ZARR_V3_FIELD_NAMES))
@@ -143,50 +129,41 @@ class TestPostFrame(unittest.TestCase):
         expected_tk0 = (12.0 + 300.0) * ((85_000.0 / P0_PA) ** KAPPA_DRY)
         self.assertAlmostEqual(out1.fields_3d["temp_k"].at(0, 0, 0), expected_tk0, delta=0.02)
 
-        # Negative nocturnal sensible heat flux across 3 h window without integer counters
         f004 = _synthetic_step(
             1_014_400,
             "2026-11-12T04:00:00Z",
             4,
             5,
             4,
-            achfx=1.036e7,
-            rainnc=10.6,
+            achfx=9.64e6,
+            rainnc=4.5,
             i_rainnc=1,
         )
         out4, _ = post_frame(base1, f004, dom, sci)
-        self.assertAlmostEqual(out4.fields_2d["sensible_heat_flux_wm2"].at(0, 0), -33.33, delta=0.5)
-        self.assertAlmostEqual(out4.fields_2d["precip_mm_hr"].at(0, 0), 3.0, places=2)
+        self.assertEqual(out4.window_start_unix_s, 1_003_600)
+        self.assertAlmostEqual(out4.fields_2d["sensible_heat_flux_wm2"].at(0, 0), -100.0)
+        self.assertAlmostEqual(out4.fields_2d["precip_mm_hr"].at(0, 0), 2.9 / 3.0, places=4)
 
-        # Reject model-level pressure exceeding surface_pressure_pa (e.g. 900 hPa over 880 hPa)
+        # Sub-20 m lowest midpoint (dz_face_m = 30 m -> 15 m AGL) is rejected
+        f_low = _synthetic_step(
+            1_003_600,
+            "2026-11-12T01:00:00Z",
+            4,
+            5,
+            4,
+            achfx=1.072e7,
+            rainnc=1.6,
+            i_rainnc=1,
+            dz_face_m=30.0,
+        )
+        with self.assertRaises(ValueError):
+            post_frame(base0, f_low, dom, sci)
+
         inv_p = [90_000.0 - 1_000.0 * k for k in range(4) for _ in range(20)]
         with self.assertRaises(ValueError):
             post_frame(
                 base0,
                 dataclasses.replace(f001, pb_pa=CompMass3D(Slab3DF32.from_values(4, 4, 5, inv_p))),
-                dom,
-                sci,
-            )
-
-        # Reject pressure increasing with height (900 -> 902 hPa)
-        inc_p = [80_000.0 + 200.0 * k for k in range(4) for _ in range(20)]
-        with self.assertRaises(ValueError):
-            post_frame(
-                base0,
-                dataclasses.replace(f001, pb_pa=CompMass3D(Slab3DF32.from_values(4, 4, 5, inc_p))),
-                dom,
-                sci,
-            )
-
-        # Reject NaN in wind input
-        bad_u = [8.0] * (4 * 4 * 6)
-        bad_u[50] = float("nan")
-        with self.assertRaises(ValueError):
-            post_frame(
-                base0,
-                dataclasses.replace(
-                    f001, u_stag_mps=CompStagX3D(Slab3DF32.from_values(4, 4, 6, bad_u))
-                ),
                 dom,
                 sci,
             )

@@ -1,4 +1,4 @@
-"""Unit tests for av_wrf.core.schedule: horizon policy, UTC parsing, and live freshness gate."""
+"""Unit tests for av_wrf.core.schedule: local briefing deadline, cron margin, and freshness."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from av_wrf.runner import load_bundle  # noqa: E402
 
 
 class TestSchedule(unittest.TestCase):
-    def test_all_shipped_products_horizon_cron_margin_freshness_and_cycle_parsing(self) -> None:
+    def test_all_shipped_products_horizon_deadline_freshness_and_cycle_parsing(self) -> None:
         cfg_root = ROOT / "config"
         prod_paths = sorted((cfg_root / "products").glob("*.yaml"))
         self.assertGreaterEqual(len(prod_paths), 1)
@@ -36,9 +36,21 @@ class TestSchedule(unittest.TestCase):
             floor = validate_horizon_policy(prod, src, out)
             self.assertGreaterEqual(floor, prod.min_horizon_hours)
 
+            # Invalid IANA timezone or unreachable local_deadline_hhmm is rejected
+            with self.assertRaises(ValueError):
+                validate_horizon_policy(
+                    dataclasses.replace(prod, region_tz="Invalid/Zone"), src, out
+                )
+            with self.assertRaises(ValueError):
+                validate_horizon_policy(
+                    dataclasses.replace(prod, local_deadline_hhmm="04:05"),
+                    src,
+                    out,
+                    publish_origin_utc=f"2026-11-12T{prod.publish_origin_hour_utc:02d}:00:00Z",
+                )
+
             iso_arg = f"2026-11-12T{prod.publish_origin_hour_utc:02d}:00:00Z"
             self.assertTrue(is_cycle_live_fresh(prod, out, iso_arg, "2026-11-12T04:00:00Z"))
-            # Expired 2020 backfill is NOT live-fresh in November 2026
             self.assertFalse(
                 is_cycle_live_fresh(
                     prod,
@@ -47,7 +59,6 @@ class TestSchedule(unittest.TestCase):
                     "2026-11-12T04:00:00Z",
                 )
             )
-            # Far-future clock-skewed cycle is rejected for live pointer advancement
             self.assertFalse(is_cycle_live_fresh(prod, out, iso_arg, "2026-11-10T00:00:00Z"))
 
             with self.assertRaises(ValueError):
@@ -61,6 +72,7 @@ class TestSchedule(unittest.TestCase):
 
             part_arg = f"20261112/{prod.publish_origin_hour_utc:02d}"
             self.assertEqual(parse_cycle_arg(iso_arg, prod), (iso_arg, part_arg))
+            self.assertEqual(parse_cycle_arg(iso_arg[:-1] + "z", prod), (iso_arg, part_arg))
             self.assertEqual(parse_cycle_arg(part_arg, prod), (iso_arg, part_arg))
 
             win = resolve_cycle_window(prod, out, part_arg)
@@ -78,6 +90,21 @@ class TestSchedule(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             parse_iso_utc("2026-11-12T00:00:00")
+        with self.assertRaisesRegex(ValueError, "Invalid ISO-8601 timestamp.*explicit Z/offset"):
+            parse_iso_utc("2026-11-12T00:00:00xyz")
+
+    def test_briefing_cutoff_follows_local_dst(self) -> None:
+        cfg = ROOT / "config"
+        b = load_bundle(cfg, next((cfg / "products").glob("*.yaml")).stem)
+        product = dataclasses.replace(
+            b.product, region_tz="America/New_York", local_deadline_hhmm="00:30"
+        )
+        for date, deadline_hour in (("2026-11-12", "05"), ("2026-07-12", "04")):
+            origin = f"{date}T00:00:00Z"
+            deadline = f"{date}T{deadline_hour}:30:00Z"
+            after = f"{date}T{deadline_hour}:30:01Z"
+            self.assertTrue(is_cycle_live_fresh(product, b.output, origin, deadline))
+            self.assertFalse(is_cycle_live_fresh(product, b.output, origin, after))
 
 
 if __name__ == "__main__":

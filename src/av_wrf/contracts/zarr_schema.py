@@ -3,8 +3,6 @@
 Assumptions & Provenance Declarations (required by windy-av-layer methods.ts):
 - `MOISTURE_SOURCE_OF_TRUTH = "spfh_kgkg"`: model-level RH is omitted because consumer
   `native-fields.ts` derives dewpoint directly from `(spfhKgKg, pressureHpa)`.
-- `CAPE_PARCEL_DEFINITION`: WRF `AFWA_CAPE` (`phys/module_diag_afwa.F`) lifts the most-unstable
-  parcel in the lowest ~300 hPa AGL using virtual temperature without entrainment.
 - `LOW_CLOUD_DEFINITION`: terrain-following sigma `p >= 0.8 * PSFC` (ECMWF LCC convention) so
   high-elevation plateaus (`PSFC < 800 hPa`) do not spuriously report 0% low cloud.
 """
@@ -19,13 +17,13 @@ ZARR_SCHEMA_STATUS = "provisional-phase-1"
 ZARR_FORMAT_VERSION = 3
 MOISTURE_SOURCE_OF_TRUTH = "spfh_kgkg"
 TEMPERATURE_DEFINITION = "sensible-air-temperature-k"
+# Locked provisional catalog label. The Zarr group records the native WRF parcel method.
 CAPE_PARCEL_DEFINITION = "afwa-mucape-lowest-300hpa-virtual-temp-undiluted"
 LOW_CLOUD_DEFINITION = "ecmwf-sigma-ge-0p8-max-random-overlap"
 WRF_SPHERE_RADIUS_M = 6_370_000.0
 MAX_EXPORTED_LEVELS = 40
 CONSUMER_MAX_PROFILE_GAP_M = 1_000.0
 BL_CEILING_AGL_M = 2_000.0
-MAX_ADMITTED_CFL = 1.2
 DEFAULT_SHARD_TIME_STEP = 1
 DEFAULT_INNER_SPATIAL_CHUNK: tuple[int, int] = (64, 64)
 DEFAULT_ZSTD_LEVEL = 3
@@ -121,7 +119,6 @@ __all__ = [
     "DEFAULT_SHARD_TIME_STEP",
     "DEFAULT_ZSTD_LEVEL",
     "LOW_CLOUD_DEFINITION",
-    "MAX_ADMITTED_CFL",
     "MAX_EXPORTED_LEVELS",
     "MOISTURE_SOURCE_OF_TRUTH",
     "TEMPERATURE_DEFINITION",

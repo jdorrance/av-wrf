@@ -1,19 +1,18 @@
 # `av_wrf.core` (`L1`)
 
 Pure deterministic spherical Lambert geometry, schedule/horizon math, vertical
-level checks, WRF v4.8 namelists, soil interpolation, `post_frame` physics, and
+level checks, WRF v4.8 namelists, `post_frame` physics, and
 soaring column metrics.
 
 ```python
 from av_wrf.core import (
-    geometric_w_to_omega_pas,
+    post_frame,
     published_lambert_grid_metadata,
     resolve_cycle_window,
-    rotate_grid_to_earth,
 )
 ```
 
-- **Allowed imports:** `av_wrf.contracts` and Python math/datetime/struct stdlib
+- **Allowed imports:** `av_wrf.contracts`, NumPy and Python math/datetime/struct stdlib
   (`core.*` peers may import `core.grid`, `core.thermo`, and `core.vertical`).
 - **Forbidden:** file/network I/O, `os`, `sys`, `subprocess`, `netCDF4`, `zarr`,
   `random`, and wall-clock calls (`datetime.now`, `time.time`).

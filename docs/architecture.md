@@ -1,21 +1,23 @@
 # Architecture
 
 `av-wrf` resolves a declarative product in `config/` into an immutable
-`RunLock`, writes Fortran namelists plus a regional forcing cutout recipe during
-`prep`, runs `WPS` and `WRF-ARW` inside a pinned Linux container, stages
-`Times`-indexed native model-level shards under an attempt prefix, verifies the
-complete `RunLock` horizon before promoting `forecast.zarr`, `_diagnostics.json`,
-and `_ready.json`, advances `latest.json` via compare-and-swap, and dispatches a
-consumer webhook.
+`RunLock`, writes Fortran namelists plus a source-cadence forcing cutout recipe
+during `prep`, verifies `forcing_manifest.json` and runs `WPS` + `WRF-ARW` inside
+a pinned Linux container, stages `Times`-indexed native model-level shards with
+`[64, 64]` inner chunks under an attempt prefix, verifies the complete `RunLock`
+horizon under an exclusive per-cycle lock before promoting `forecast.zarr`,
+`_diagnostics.json`, and `_ready.json`, advances `latest.json` via opaque-token
+compare-and-swap, and dispatches a consumer webhook with expiring leases.
 
 ```mermaid
 flowchart LR
-  cfg["config/ YAML"] --> plan["plan -> run.lock.json"]
+  cfg["config/ YAML"] --> geog["geog -> geo_em.d01.nc"]
+  geog --> plan["plan -> run.lock.json"]
   plan --> prep["prep -> namelists + forcing_subset.json"]
-  prep --> geog["geog -> geo_em.d01.nc"]
-  geog --> solve["solve -> met_em + wrfinput + wrfout"]
+  prep --> forcing["forcing-manifest -> verified local GRIB2 inventory"]
+  forcing --> solve["solve -> met_em + validated wrfinput + wrfout"]
   solve --> post["post -> attempt staged/forecast.zarr"]
-  post --> pub["publish -> verify horizon + _ready.json + CAS"]
+  post --> pub["publish -> cycle_lock + verify horizon + _ready.json + CAS"]
   pub --> av["windy-av-layer ModelLevelFrame"]
 ```
 
@@ -30,33 +32,46 @@ flowchart TB
   cli --> verify["L3b: av_wrf.verify<br/>archiver, obs, scorecards"]
   runner --> codecs["L2: av_wrf.codecs<br/>wrf_nc, zarr_shard, zarr_v3"]
   verify --> codecs
-  codecs --> core["L1: av_wrf.core<br/>grid, thermo, schedule, vertical, namelist, forcing, post, metrics"]
+  codecs --> core["L1: av_wrf.core<br/>grid, thermo, schedule, vertical, namelist, post, metrics"]
   core --> contracts["L0: av_wrf.contracts<br/>frozen schemas, RunLock, slabs, NewTypes"]
 ```
 
 ## Codemap
 
 - [`src/av_wrf/contracts/`](../src/av_wrf/contracts/README.md): `ProductSpec`,
-  `DomainProfile`, `ScienceProfile`, `ForcingProfile`, `OutputProfile`,
-  `CycleWindow`, `RunLock`, `ReadyReceipt`, `DiagnosticsReceipt`,
+  `DomainProfile`, `ScienceProfile`, `ForcingProfile` (`vtable_name`,
+  `interval_seconds`), `OutputProfile`, `CycleWindow`, `RunLock`,
+  `ForcingManifest`, `SolverReceipt`, `ReadyReceipt`, `DiagnosticsReceipt`,
   `WRF_ZARR_V3_FIELDS`, `Slab2DF32`/`Slab2DI32`/`Slab3DF32`, and nominal types.
 - [`src/av_wrf/core/`](../src/av_wrf/core/README.md): pure deterministic modules
   (`grid.py`, `thermo.py`, `schedule.py`, `vertical.py`, `namelist.py`,
-  `forcing.py`, `post.py`, `metrics.py`). Peers depend only on `contracts`,
-  `core.grid`, and `core.thermo`.
-- [`src/av_wrf/codecs/`](../src/av_wrf/codecs/README.md): `wrf_nc.py` indexes
-  `wrfout` by `Times` and validates shapes plus `T`/`THM` agreement;
-  `zarr_shard.py` encodes multi-step ZEP-0002 `zstd`+`crc32c` shards;
-  `zarr_v3.py` builds 30-node `wrf-zarr-v3` metadata.
+  `post.py`, `metrics.py`). These modules perform pure array and scalar math.
+- [`src/av_wrf/codecs/`](../src/av_wrf/codecs/README.md): `wrf_nc.py` and
+  `wrf_nc_grid.py` reject NetCDF masks/fills, slice `0:k_exp` hyperslabs, verify
+  `ZNW` and `XLAT`/`XLONG`, and require `AFWA_CAPE_MU`.
+  `zarr_shard.py` and `zarr_v3.py` encode ZEP-0002
+  padded outer shards with exact `[64, 64]` inner spatial chunks.
 - [`src/av_wrf/runner/`](../src/av_wrf/runner/README.md): `store.py`
-  (`ObjectStore`, `LocalFileStore`, `put_idempotent`), `stages.py` (`check`,
-  `plan`, `prep`), `post.py` (attempt staging & weighted diagnostics),
-  `publish.py` (full-horizon admission & CAS promotion), `solver.py`,
-  `mirrors.py`, and `dispatch.py` (fail-closed webhook).
+  (`ObjectStore`, `LocalFileStore`, `cycle_lock`, `get_with_token`,
+  `sha256_file`), `stages.py` (`check`, `plan`, `prep`), `mirrors.py`
+  (`write_forcing_manifest`, `verify_forcing_manifest`), `post.py`,
+  `publish.py` + `publish_verify.py` (exclusive cycle-locked promotion, paired
+  pressure checks, stage retention), `solver.py` + `solver_exec.py`, and
+  `dispatch.py` (expiring-lease webhook delivery).
+- A storage adapter must provide opaque conditional-write tokens and exclusive
+  cycle ownership through the ready commit. The implemented backend uses a
+  shared filesystem. A remote adapter needs equivalent fencing or a consumer
+  contract for committing an attempt-specific payload.
+- Local promotion provides atomic visibility to concurrent processes. It does
+  not issue persistence barriers for host power loss.
+- WRF boundary forcing enters through the GRIB recipe. A direct native model
+  needs its own reader and grid mapping into published fields before reusing
+  the Zarr and promotion path.
 - [`src/av_wrf/verify/`](../src/av_wrf/verify/README.md): `archiver.py`,
   `observations.py`, and `scorecard.py` for mature-lead evaluation.
 - [`src/av_wrf/cli/`](../src/av_wrf/cli/README.md): `env.py` (`RuntimeEnv`) and
-  `main.py` (`av-wrf` subcommands).
+  `main.py` (`av-wrf` subcommands with lazy store handles and `--store-uri` /
+  `--prune-stage`).
 
 ## Boundary invariants and deliberate absences
 

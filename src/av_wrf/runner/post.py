@@ -8,6 +8,8 @@ from collections.abc import Iterable, Sequence
 from datetime import timedelta
 from pathlib import Path
 
+import numpy as np
+
 from av_wrf.codecs import (
     RawWrfBaselineInput,
     RawWrfStepInput,
@@ -19,7 +21,7 @@ from av_wrf.codecs import (
     encode_coord_chunks,
     read_wrfout_baseline_nc,
     read_wrfout_step_nc,
-    select_cycle_wrfout_windows,
+    select_cycle_wrfout_slices,
     zarr_shard_relpath,
 )
 from av_wrf.contracts import (
@@ -56,8 +58,6 @@ from av_wrf.runner.store import (
 
 type _StreamResult = tuple[
     list[tuple[str, str]],
-    tuple[int, ...],
-    tuple[str, ...],
     tuple[float, float, float, float],
     list[float],
 ]
@@ -87,34 +87,17 @@ def _flush_shard_batch(
 
 
 def _frame_window_totals(
-    frame: NormalizedWrfFrame, prev_psfc: Sequence[float]
+    frame: NormalizedWrfFrame,
+    prev_psfc: Sequence[float],
 ) -> tuple[float, float, float, float, float, Sequence[float]]:
     dt_h = float(frame.window_end_unix_s - frame.window_start_unix_s) / 3600.0
     ps_b = frame.fields_2d["surface_pressure_pa"].buf
     dps = round(pressure_tendency_abs_hpa_hr(prev_psfc, ps_b, dt_h), 4)
-    sh_b = frame.fields_2d["sensible_heat_flux_wm2"].buf
-    lh_b = frame.fields_2d["latent_heat_flux_wm2"].buf
-    pr_b = frame.fields_2d["precip_mm_hr"].buf
-    sh_wh = (sum(sh_b) / len(sh_b)) * dt_h
-    lh_wh = (sum(lh_b) / len(lh_b)) * dt_h
-    return sh_wh, lh_wh, (sum(pr_b) / len(pr_b)) * dt_h, dt_h, dps, ps_b
-
-
-def _derive_step_lead_hour(origin_iso: str, valid_iso: str, expected_iso: str) -> int:
-    if valid_iso != expected_iso:
-        raise ValueError(f"Frame valid_time_utc {valid_iso} != scheduled {expected_iso}")
-    delta_s = int((parse_iso_utc(valid_iso) - parse_iso_utc(origin_iso)).total_seconds())
-    if delta_s <= 0 or delta_s % 3600 != 0:
-        raise ValueError(f"Frame valid_time_utc {valid_iso} is not a positive whole-hour lead")
-    return delta_s // 3600
-
-
-def _put_terrain_shard(
-    store: ObjectStore, zarr_stage: str, frame: NormalizedWrfFrame, b: LoadedBundle
-) -> tuple[str, str]:
-    rel_t = zarr_shard_relpath("terrain_m", b.output)
-    raw_t = encode_2d_shard_bytes([frame.fields_2d["terrain_m"]], b.output)
-    return rel_t, put_idempotent(store, f"{zarr_stage}/{rel_t}", raw_t)
+    sh_m, lh_m, pr_m = (
+        float(np.mean(np.frombuffer(frame.fields_2d[key].buf, np.float32), dtype=np.float64))
+        for key in ("sensible_heat_flux_wm2", "latent_heat_flux_wm2", "precip_mm_hr")
+    )
+    return sh_m * dt_h, lh_m * dt_h, pr_m * dt_h, dt_h, dps, ps_b
 
 
 def _stream_staged_frames(
@@ -125,34 +108,38 @@ def _stream_staged_frames(
     window: CycleWindow,
     b: LoadedBundle,
 ) -> _StreamResult:
-    if f000_step.valid_time_utc != window.publish_origin_utc:
+    origin_s = int(parse_iso_utc(window.publish_origin_utc).timestamp())
+    if (f000_step.valid_time_utc, f000_step.valid_time_unix_s) != (
+        window.publish_origin_utc,
+        origin_s,
+    ):
         raise ValueError("f000 valid_time_utc does not match publish_origin_utc")
     n_exp = len(window.lead_hours)
+    valid_s = tuple(origin_s + h * 3600 for h in window.lead_hours)
+    starts_s = (origin_s, *valid_s[:-1])
     base = build_accum_baseline(f000_step, b.domain.bdy_trim_cells)
     digests: list[tuple[str, str]] = []
-    leads_seen, valid_s, starts_s, valid_iso, dps_series = [], [], [], [], []
+    dps_series: list[float] = []
     sh_wh, lh_wh, total_h, pr_tot, max_cfl = 0.0, 0.0, 0.0, 0.0, 0.0
     prev_psfc: Sequence[float] = crop_sponge_2d(f000_step.psfc_pa, b.domain.bdy_trim_cells).buf
-    outer_t = min(n_exp, b.output.shard_time_steps)
-    batch: list[NormalizedWrfFrame] = []
-    batch_start, seen = 0, 0
+    outer_t, batch, batch_start, seen = min(n_exp, b.output.shard_time_steps), [], 0, 0
     for raw_step in lead_steps:
         if seen >= n_exp:
             raise ValueError(f"Received more than {n_exp} lead steps")
-        lead_h = _derive_step_lead_hour(
-            window.publish_origin_utc, raw_step.valid_time_utc, window.valid_times_utc[seen]
-        )
-        leads_seen.append(lead_h)
+        expected_time = window.valid_times_utc[seen]
+        if (raw_step.valid_time_utc, raw_step.valid_time_unix_s) != (expected_time, valid_s[seen]):
+            raise ValueError(f"WRF step timestamp does not match scheduled {expected_time}")
         frame, base = post_frame(base, raw_step, b.domain, b.science)
+        if (frame.window_start_unix_s, frame.window_end_unix_s) != (starts_s[seen], valid_s[seen]):
+            raise ValueError(f"Unexpected accumulation window for {expected_time}")
         max_cfl = max(max_cfl, validate_frame_columns(frame, b.domain))
         if seen == 0:
-            digests.append(_put_terrain_shard(store, zarr_stage, frame, b))
+            rel_t = zarr_shard_relpath("terrain_m", b.output)
+            raw_t = encode_2d_shard_bytes([frame.fields_2d["terrain_m"]], b.output)
+            digests.append((rel_t, put_idempotent(store, f"{zarr_stage}/{rel_t}", raw_t)))
         d_sh, d_lh, d_pr, dt_h, dps, prev_psfc = _frame_window_totals(frame, prev_psfc)
         sh_wh, lh_wh, pr_tot, total_h = sh_wh + d_sh, lh_wh + d_lh, pr_tot + d_pr, total_h + dt_h
         dps_series.append(dps)
-        valid_iso.append(frame.valid_time_utc)
-        valid_s.append(frame.window_end_unix_s)
-        starts_s.append(frame.window_start_unix_s)
         batch.append(frame)
         seen += 1
         if len(batch) == outer_t or seen == n_exp:
@@ -161,37 +148,32 @@ def _stream_staged_frames(
             batch_start = seen
     if seen != n_exp:
         raise ValueError(f"Expected {n_exp} lead steps, received {seen}")
-    leads_out, valid_t = tuple(leads_seen), tuple(valid_s)
-    coords = encode_coord_chunks(b.domain, leads_out, valid_t, tuple(starts_s), valid_t)
+    coords = encode_coord_chunks(b.domain, window.lead_hours, valid_s, starts_s, valid_s)
     for c_rel, c_bytes in sorted(coords.items()):
         digests.append((c_rel, put_idempotent(store, f"{zarr_stage}/{c_rel}", c_bytes)))
     stats = (sh_wh / total_h, lh_wh / total_h, pr_tot, max_cfl)
-    return digests, leads_out, tuple(valid_iso), stats, dps_series
+    return digests, stats, dps_series
 
 
 def _same_diagnostics_physics(existing_raw: bytes, candidate_raw: bytes) -> bool:
-    old = DiagnosticsReceipt.from_doc(json.loads(existing_raw.decode("utf-8")))
-    new = DiagnosticsReceipt.from_doc(json.loads(candidate_raw.decode("utf-8")))
-    return (
-        old.max_cfl == new.max_cfl
-        and old.initial_dps_dt_hpa_hr == new.initial_dps_dt_hpa_hr
-        and old.mean_sensible_flux_wm2 == new.mean_sensible_flux_wm2
-        and old.mean_latent_flux_wm2 == new.mean_latent_flux_wm2
-        and old.total_precip_mm == new.total_precip_mm
-    )
+    o = DiagnosticsReceipt.from_doc(json.loads(existing_raw.decode("utf-8"))).to_doc()
+    n = DiagnosticsReceipt.from_doc(json.loads(candidate_raw.decode("utf-8"))).to_doc()
+    o.pop("stage_seconds", None)
+    n.pop("stage_seconds", None)
+    return o == n
 
 
 def _stage_diagnostics_and_manifest(
     store: ObjectStore,
     stage_root: str,
     lk: RunLock,
-    zarr_rel: str,
+    window: CycleWindow,
     meta_digests: list[tuple[str, str]],
     streamed: _StreamResult,
     elapsed_s: float,
     execution_mode: str,
 ) -> None:
-    shard_digests, leads_out, valid_iso, (sh_m, lh_m, pr_tot, max_cfl), dps = streamed
+    shard_digests, (sh_m, lh_m, pr_tot, max_cfl), dps = streamed
     diag = DiagnosticsReceipt(
         lk.model_id,
         lk.cycle_partition,
@@ -209,17 +191,17 @@ def _stage_diagnostics_and_manifest(
         json_bytes(diag.to_doc()),
         equiv=_same_diagnostics_physics,
     )
-    manifest = StagedPostManifest(
-        zarr_rel,
-        leads_out,
-        valid_iso,
+    pm = StagedPostManifest(
+        "forecast.zarr",
+        window.lead_hours,
+        window.valid_times_utc,
         tuple(meta_digests),
         tuple(shard_digests),
         diag_sha,
-        execution_mode,
+        execution_mode=execution_mode,
     )
     pm_key = post_manifest_key(lk.product_id, lk.cycle_partition, lk.attempt_id)
-    put_idempotent(store, pm_key, json_bytes(manifest.to_doc()))
+    put_idempotent(store, pm_key, json_bytes(pm.to_doc()))
 
 
 def post_cycle_store(
@@ -244,9 +226,8 @@ def post_cycle_store(
     if lk.config_sha256 != b.config_sha256:
         raise ValueError("Config bundle SHA-256 drifted from frozen RunLock")
     window = resolve_cycle_window(b.product, b.output, lk.publish_origin_utc)
-    zarr_rel = "forecast.zarr"
     stage_root = attempt_stage_prefix(product_id, cycle_partition, attempt_id)
-    zarr_stage = f"{stage_root}/{zarr_rel}"
+    zarr_stage = f"{stage_root}/forecast.zarr"
     meta_map = build_zarr_v3_store_metadata(b.domain, b.output, window.lead_hours)
     meta_digests = [
         (rel, put_idempotent(store, f"{zarr_stage}/{rel}", json_bytes(doc)))
@@ -255,53 +236,62 @@ def post_cycle_store(
     streamed = _stream_staged_frames(store, zarr_stage, f000_step, lead_steps, window, b)
     elapsed_s = round(max(1e-4, time.perf_counter() - t0), 4)
     _stage_diagnostics_and_manifest(
-        store, stage_root, lk, zarr_rel, meta_digests, streamed, elapsed_s, execution_mode
+        store, stage_root, lk, window, meta_digests, streamed, elapsed_s, execution_mode
     )
     return zarr_stage
+
+
+def _build_synthetic_steps(
+    b: LoadedBundle, lk: RunLock, window: CycleWindow
+) -> tuple[RawWrfBaselineInput, Iterable[RawWrfStepInput]]:
+    orig_dt = parse_iso_utc(lk.publish_origin_utc)
+    f000 = build_synthetic_wrf_baseline(b.domain, lk.publish_origin_utc, int(orig_dt.timestamp()))
+
+    def gen() -> Iterable[RawWrfStepInput]:
+        for h in window.lead_hours:
+            vt_dt = orig_dt + timedelta(hours=h)
+            yield build_synthetic_wrf_step(
+                b.domain, format_iso_utc(vt_dt), int(vt_dt.timestamp()), h
+            )
+
+    return f000, gen()
 
 
 def _open_cycle_inputs(
     store: ObjectStore,
     b: LoadedBundle,
     lk: RunLock,
-    window: CycleWindow,
+    win: CycleWindow,
     wrfout_dir: Path | None,
     synthetic: bool,
 ) -> tuple[str, RawWrfBaselineInput | RawWrfStepInput, Iterable[RawWrfStepInput]]:
     if synthetic:
-        orig_dt = parse_iso_utc(lk.publish_origin_utc)
-        f000 = build_synthetic_wrf_baseline(
-            b.domain, lk.publish_origin_utc, int(orig_dt.timestamp())
-        )
-        steps = (
-            build_synthetic_wrf_step(
-                b.domain,
-                format_iso_utc(orig_dt + timedelta(hours=h)),
-                int((orig_dt + timedelta(hours=h)).timestamp()),
-                h,
-            )
-            for h in window.lead_hours
-        )
-        return "synthetic", f000, steps
+        f000_s, steps_s = _build_synthetic_steps(b, lk, win)
+        return "synthetic", f000_s, steps_s
     if wrfout_dir is None:
         raise ValueError("Pass --wrfout-dir <dir> or --synthetic to `av-wrf post`")
-    verify_solver_receipt(store, lk, wrfout_dir)
-    (f0_p, f0_i), lead_windows = select_cycle_wrfout_windows(
-        wrfout_dir, window.publish_origin_utc, window.valid_times_utc
+    (f0_p, f0_i), leads = select_cycle_wrfout_slices(
+        wrfout_dir, win.publish_origin_utc, win.valid_times_utc
+    )
+    verify_solver_receipt(
+        store, lk, wrfout_dir, selected_wrfouts={f0_p, *(path for path, _ in leads)}
     )
     f000_nc = read_wrfout_baseline_nc(
-        f0_p, b.domain, time_index=f0_i, expected_valid_utc=window.publish_origin_utc
+        f0_p,
+        b.domain,
+        time_index=f0_i,
+        expected_valid_utc=win.publish_origin_utc,
+        science=b.science,
     )
     steps_nc = (
         read_wrfout_step_nc(
-            win[-1][0],
+            path,
             b.domain,
             b.science,
-            time_index=win[-1][1],
+            time_index=index,
             expected_valid_utc=vt,
-            window_slices=win,
         )
-        for win, vt in zip(lead_windows, window.valid_times_utc, strict=True)
+        for (path, index), vt in zip(leads, win.valid_times_utc, strict=True)
     )
     return "solver", f000_nc, steps_nc
 
@@ -320,18 +310,18 @@ def post_cycle_from_inputs(
     """Stream `post_cycle_store` one lead at a time from `wrfout_d01_*` or synthetic steps."""
     b = load_bundle(config_root, product_id) if bundle is None else bundle
     lk = load_run_lock(store, product_id, cycle_partition, attempt_id)
-    window = resolve_cycle_window(b.product, b.output, lk.publish_origin_utc)
-    mode, f000, steps = _open_cycle_inputs(store, b, lk, window, wrfout_dir, synthetic)
-    prefix = post_cycle_store(
+    win = resolve_cycle_window(b.product, b.output, lk.publish_origin_utc)
+    mode, f0, st = _open_cycle_inputs(store, b, lk, win, wrfout_dir, synthetic)
+    pfx = post_cycle_store(
         config_root,
         store,
         product_id=product_id,
         cycle_partition=cycle_partition,
         attempt_id=attempt_id,
-        f000_step=f000,
-        lead_steps=steps,
+        f000_step=f0,
+        lead_steps=st,
         bundle=b,
         lock=lk,
         execution_mode=mode,
     )
-    return prefix, len(window.lead_hours)
+    return pfx, len(win.lead_hours)

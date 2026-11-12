@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from array import array
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
 
+import numpy as np
+
 from av_wrf.codecs.wrf_nc_grid import (
+    extract_clean_f32_nc,
+    extract_clean_i32_nc,
     parse_wrf_timestamp,
     select_cycle_wrfout_slices,
-    select_cycle_wrfout_windows,
-    slice_nc_var,
+    validate_wrfinput_nc,
     verify_local_wrf_nc,
     verify_wrfout_grid_against_domain,
 )
@@ -32,44 +35,39 @@ from av_wrf.contracts import (
 from av_wrf.core import verify_t_thm_consistency
 
 
-def _f32_buf_from_slice(sliced: object, expected_shape: tuple[int, ...]) -> array[float]:
-    import numpy as np
-
-    arr = np.asarray(sliced)
-    if arr.shape != expected_shape or not bool(np.all(np.isfinite(arr))):
-        raise ValueError(f"Invalid shape or non-finite float in wrfout slice ({arr.shape})")
+def _f32_buf(arr: np.ndarray[tuple[int, ...], np.dtype[np.float32]]) -> array[float]:
     buf = array("f")
-    buf.frombytes(np.ascontiguousarray(arr, dtype=np.float32).tobytes())
+    buf.frombytes(memoryview(arr).cast("B"))
     return buf
 
 
-def _i32_buf_from_slice(sliced: object, expected_shape: tuple[int, ...]) -> array[int]:
-    import numpy as np
-
-    arr = np.asarray(sliced)
-    if arr.shape != expected_shape:
-        raise ValueError(f"WRF int variable shape {arr.shape} != expected {expected_shape}")
+def _i32_buf(arr: np.ndarray[tuple[int, ...], np.dtype[np.int32]]) -> array[int]:
     buf = array("i")
-    buf.frombytes(np.ascontiguousarray(arr, dtype=np.int32).tobytes())
+    buf.frombytes(memoryview(arr).cast("B"))
     return buf
 
 
-def _r2_nc(v: Mapping[str, object], nm: str, t: int, ny: int, nx: int) -> CompMass2D:
-    return CompMass2D(Slab2DF32(ny, nx, _f32_buf_from_slice(slice_nc_var(v, nm, t), (ny, nx))))
+def _r2_nc(v: Mapping[str, object], p: Path, nm: str, t: int, ny: int, nx: int) -> CompMass2D:
+    return CompMass2D(Slab2DF32(ny, nx, _f32_buf(extract_clean_f32_nc(v, p, nm, t, (ny, nx)))))
 
 
-def _ri_nc(v: Mapping[str, object], nm: str, t: int, ny: int, nx: int) -> CompBucket2D:
-    return CompBucket2D(Slab2DI32(ny, nx, _i32_buf_from_slice(slice_nc_var(v, nm, t), (ny, nx))))
+def _ri_nc(v: Mapping[str, object], p: Path, nm: str, t: int, ny: int, nx: int) -> CompBucket2D:
+    return CompBucket2D(Slab2DI32(ny, nx, _i32_buf(extract_clean_i32_nc(v, p, nm, t, (ny, nx)))))
 
 
-def _r3_nc(v: Mapping[str, object], nm: str, t: int, nz: int, ny: int, nx: int) -> CompMass3D:
-    b = _f32_buf_from_slice(slice_nc_var(v, nm, t), (nz, ny, nx))
-    return CompMass3D(Slab3DF32(nz, ny, nx, b))
+def _r3_nc(
+    v: Mapping[str, object], p: Path, nm: str, t: int, nz: int, ny: int, nx: int, *, crop: bool
+) -> CompMass3D:
+    z_stop = nz if crop else None
+    arr = extract_clean_f32_nc(v, p, nm, t, (nz, ny, nx), z_stop=z_stop)
+    return CompMass3D(Slab3DF32(nz, ny, nx, _f32_buf(arr)))
 
 
-def _rz_nc(v: Mapping[str, object], nm: str, t: int, nz: int, ny: int, nx: int) -> CompStagZ3D:
-    b = _f32_buf_from_slice(slice_nc_var(v, nm, t), (nz + 1, ny, nx))
-    return CompStagZ3D(Slab3DF32(nz + 1, ny, nx, b))
+def _rz_nc(
+    v: Mapping[str, object], p: Path, nm: str, t: int, nz_faces: int, ny: int, nx: int
+) -> CompStagZ3D:
+    arr = extract_clean_f32_nc(v, p, nm, t, (nz_faces, ny, nx), z_stop=nz_faces)
+    return CompStagZ3D(Slab3DF32(nz_faces, ny, nx, _f32_buf(arr)))
 
 
 def read_wrfout_baseline_nc(
@@ -78,21 +76,22 @@ def read_wrfout_baseline_nc(
     *,
     time_index: int = 0,
     expected_valid_utc: str | None = None,
+    science: ScienceProfile | None = None,
 ) -> RawWrfBaselineInput:
-    """Read minimal 2D f000 baseline fields + verify grid without loading 3D volumes."""
+    """Read minimal 2D accumulator baseline fields + verify grid without loading 3D volumes."""
     verify_local_wrf_nc(nc_path)
     import netCDF4
 
     ny, nx = domain.e_sn - 1, domain.e_we - 1
     with netCDF4.Dataset(str(nc_path), mode="r") as ds:
-        verify_wrfout_grid_against_domain(ds, domain, nc_path, time_index)
+        verify_wrfout_grid_against_domain(ds, domain, nc_path, time_index, science=science)
         raw_t = bytes(ds.variables["Times"][time_index].tobytes()).decode("ascii")
         iso_utc, unix_s = parse_wrf_timestamp(raw_t)
         if expected_valid_utc is not None and iso_utc != expected_valid_utc:
             raise ValueError(f"wrfout Times {iso_utc} != expected {expected_valid_utc}")
         v = ds.variables
         s2 = {
-            k: _r2_nc(v, k, time_index, ny, nx)
+            k: _r2_nc(v, nc_path, k, time_index, ny, nx)
             for k in ("HGT", "PSFC", "ACHFX", "ACLHF", "RAINC", "RAINNC")
         }
         return RawWrfBaselineInput(
@@ -103,35 +102,18 @@ def read_wrfout_baseline_nc(
             s2["ACHFX"],
             s2["ACLHF"],
             s2["RAINC"],
-            _ri_nc(v, "I_RAINC", time_index, ny, nx),
+            _ri_nc(v, nc_path, "I_RAINC", time_index, ny, nx),
             s2["RAINNC"],
-            _ri_nc(v, "I_RAINNC", time_index, ny, nx),
+            _ri_nc(v, nc_path, "I_RAINNC", time_index, ny, nx),
         )
 
 
-def _window_max_wspd10(
-    base_wspd: CompMass2D, extra_slices: Sequence[tuple[Path, int]], ny: int, nx: int
-) -> CompMass2D:
-    if not extra_slices:
-        return base_wspd
-    import netCDF4
-    import numpy as np
-
-    acc = np.frombuffer(base_wspd.buf, dtype=np.float32).reshape(ny, nx).copy()
-    for path_i, t_i in extra_slices:
-        verify_local_wrf_nc(path_i)
-        with netCDF4.Dataset(str(path_i), mode="r") as ds_i:
-            cur = np.asarray(slice_nc_var(ds_i.variables, "WSPD10MAX", t_i), dtype=np.float32)
-            if cur.shape != (ny, nx) or not bool(np.all(np.isfinite(cur))):
-                raise ValueError(f"Invalid WSPD10MAX slice in {path_i}")
-            acc = np.maximum(acc, cur)
-    buf = array("f")
-    buf.frombytes(np.ascontiguousarray(acc, dtype=np.float32).tobytes())
-    return CompMass2D(Slab2DF32(ny, nx, buf))
-
-
 def _read_3d_fields(
-    v: Mapping[str, object], nc_path: Path, t_i: int, dims: tuple[int, int, int], sc: ScienceProfile
+    v: Mapping[str, object],
+    nc_path: Path,
+    t_i: int,
+    dims: tuple[int, int, int, int],
+    sc: ScienceProfile,
 ) -> tuple[
     CompMass3D,
     CompMass3D,
@@ -144,39 +126,46 @@ def _read_3d_fields(
     CompStagY3D,
     CompStagZ3D,
 ]:
-    ny, nx, nz = dims
-    p_pert, pb = _r3_nc(v, "P", t_i, nz, ny, nx), _r3_nc(v, "PB", t_i, nz, ny, nx)
-    t_dry, qv = _r3_nc(v, "T", t_i, nz, ny, nx), _r3_nc(v, "QVAPOR", t_i, nz, ny, nx)
+    ny, nx, k_exp, nz_full = dims
+    p_pert = _r3_nc(v, nc_path, "P", t_i, k_exp, ny, nx, crop=True)
+    pb = _r3_nc(v, nc_path, "PB", t_i, k_exp, ny, nx, crop=True)
+    t_dry = _r3_nc(v, nc_path, "T", t_i, k_exp, ny, nx, crop=True)
+    qv = _r3_nc(v, nc_path, "QVAPOR", t_i, k_exp, ny, nx, crop=True)
     if "THM" not in v:
         raise ValueError(f"Missing required WRF v4 'THM' variable in {nc_path}")
-    verify_t_thm_consistency(t_dry, _r3_nc(v, "THM", t_i, nz, ny, nx), p_pert, pb, qv, sc)
-    u_b = _f32_buf_from_slice(slice_nc_var(v, "U", t_i), (nz, ny, nx + 1))
-    v_b = _f32_buf_from_slice(slice_nc_var(v, "V", t_i), (nz, ny + 1, nx))
+    thm = _r3_nc(v, nc_path, "THM", t_i, k_exp, ny, nx, crop=True)
+    verify_t_thm_consistency(t_dry, thm, p_pert, pb, qv, sc)
+    u_arr = extract_clean_f32_nc(v, nc_path, "U", t_i, (k_exp, ny, nx + 1), z_stop=k_exp)
+    v_arr = extract_clean_f32_nc(v, nc_path, "V", t_i, (k_exp, ny + 1, nx), z_stop=k_exp)
     return (
         p_pert,
         pb,
         t_dry,
         qv,
-        _r3_nc(v, "CLDFRA", t_i, nz, ny, nx),
-        _rz_nc(v, "PH", t_i, nz, ny, nx),
-        _rz_nc(v, "PHB", t_i, nz, ny, nx),
-        CompStagX3D(Slab3DF32(nz, ny, nx + 1, u_b)),
-        CompStagY3D(Slab3DF32(nz, ny + 1, nx, v_b)),
-        _rz_nc(v, "W", t_i, nz, ny, nx),
+        _r3_nc(v, nc_path, "CLDFRA", t_i, nz_full, ny, nx, crop=False),
+        _rz_nc(v, nc_path, "PH", t_i, k_exp + 1, ny, nx),
+        _rz_nc(v, nc_path, "PHB", t_i, k_exp + 1, ny, nx),
+        CompStagX3D(Slab3DF32(k_exp, ny, nx + 1, _f32_buf(u_arr))),
+        CompStagY3D(Slab3DF32(k_exp, ny + 1, nx, _f32_buf(v_arr))),
+        _rz_nc(v, nc_path, "W", t_i, k_exp + 1, ny, nx),
     )
 
 
 def _read_2d_fields(
     v: Mapping[str, object],
+    nc_path: Path,
     t_i: int,
     ny: int,
     nx: int,
-    extra_gust_slices: Sequence[tuple[Path, int]],
 ) -> tuple[dict[str, CompMass2D], CompMass2D | None, CompBucket2D, CompBucket2D]:
-    cape_k = "AFWA_CAPE_MU" if "AFWA_CAPE_MU" in v else "AFWA_CAPE"
-    afwa_mslp = _r2_nc(v, "AFWA_MSLP", t_i, ny, nx) if "AFWA_MSLP" in v else None
+    if "AFWA_CAPE_MU" not in v:
+        raise ValueError(
+            f"Missing required 'AFWA_CAPE_MU' in {nc_path} (enable afwa_buoy_opt=1; "
+            "silent fallback to surface AFWA_CAPE is forbidden)"
+        )
+    afwa_mslp = _r2_nc(v, nc_path, "AFWA_MSLP", t_i, ny, nx) if "AFWA_MSLP" in v else None
     s2 = {
-        k: _r2_nc(v, k, t_i, ny, nx)
+        k: _r2_nc(v, nc_path, k, t_i, ny, nx)
         for k in (
             "HGT",
             "COSALPHA",
@@ -186,17 +175,23 @@ def _read_2d_fields(
             "Q2",
             "U10",
             "V10",
+            "HFX",
+            "LH",
             "UST",
             "PBLH",
             "ACHFX",
             "ACLHF",
             "RAINC",
             "RAINNC",
+            "AFWA_CAPE_MU",
         )
     }
-    s2["CAPE"] = _r2_nc(v, cape_k, t_i, ny, nx)
-    s2["WMAX"] = _window_max_wspd10(_r2_nc(v, "WSPD10MAX", t_i, ny, nx), extra_gust_slices, ny, nx)
-    return s2, afwa_mslp, _ri_nc(v, "I_RAINC", t_i, ny, nx), _ri_nc(v, "I_RAINNC", t_i, ny, nx)
+    return (
+        s2,
+        afwa_mslp,
+        _ri_nc(v, nc_path, "I_RAINC", t_i, ny, nx),
+        _ri_nc(v, nc_path, "I_RAINNC", t_i, ny, nx),
+    )
 
 
 def _assemble_step_from_vars(
@@ -204,13 +199,12 @@ def _assemble_step_from_vars(
     nc_path: Path,
     stamp: tuple[str, int],
     t_i: int,
-    dims: tuple[int, int, int],
+    dims: tuple[int, int, int, int],
     science: ScienceProfile,
-    extra_gust_slices: Sequence[tuple[Path, int]] = (),
 ) -> RawWrfStepInput:
-    ny, nx, _ = dims
+    ny, nx, _, _ = dims
     p_p, pb, t_d, qv, cld, ph, phb, u_s, v_s, w_s = _read_3d_fields(v, nc_path, t_i, dims, science)
-    s2, afwa_mslp, i_rc, i_rn = _read_2d_fields(v, t_i, ny, nx, extra_gust_slices)
+    s2, afwa_mslp, i_rc, i_rn = _read_2d_fields(v, nc_path, t_i, ny, nx)
     return RawWrfStepInput(
         stamp[0],
         stamp[1],
@@ -222,10 +216,11 @@ def _assemble_step_from_vars(
         s2["Q2"],
         s2["U10"],
         s2["V10"],
-        s2["WMAX"],
+        s2["HFX"],
+        s2["LH"],
         s2["UST"],
         s2["PBLH"],
-        s2["CAPE"],
+        s2["AFWA_CAPE_MU"],
         s2["ACHFX"],
         s2["ACLHF"],
         s2["RAINC"],
@@ -253,23 +248,19 @@ def read_wrfout_step_nc(
     *,
     time_index: int = 0,
     expected_valid_utc: str | None = None,
-    window_slices: Sequence[tuple[Path, int]] = (),
 ) -> RawWrfStepInput:
-    """Read and validate one computational-grid time slice from a local wrfout NetCDF4 file."""
+    """Read one computational-grid wrfout time, using `0:k_exp` hyperslabs for native fields."""
     verify_local_wrf_nc(nc_path)
     import netCDF4
 
-    dims = (domain.e_sn - 1, domain.e_we - 1, domain.e_vert - 1)
-    extra = [s for s in window_slices if s != (nc_path, time_index)]
+    dims = (domain.e_sn - 1, domain.e_we - 1, domain.exported_levels_k, domain.e_vert - 1)
     with netCDF4.Dataset(str(nc_path), mode="r") as ds:
-        verify_wrfout_grid_against_domain(ds, domain, nc_path, time_index)
+        verify_wrfout_grid_against_domain(ds, domain, nc_path, time_index, science=science)
         raw_t = bytes(ds.variables["Times"][time_index].tobytes()).decode("ascii")
         stamp = parse_wrf_timestamp(raw_t)
         if expected_valid_utc is not None and stamp[0] != expected_valid_utc:
             raise ValueError(f"wrfout Times {stamp[0]} != expected {expected_valid_utc}")
-        return _assemble_step_from_vars(
-            ds.variables, nc_path, stamp, time_index, dims, science, extra
-        )
+        return _assemble_step_from_vars(ds.variables, nc_path, stamp, time_index, dims, science)
 
 
 __all__ = [
@@ -278,7 +269,7 @@ __all__ = [
     "read_wrfout_baseline_nc",
     "read_wrfout_step_nc",
     "select_cycle_wrfout_slices",
-    "select_cycle_wrfout_windows",
+    "validate_wrfinput_nc",
     "verify_local_wrf_nc",
     "verify_wrfout_grid_against_domain",
 ]

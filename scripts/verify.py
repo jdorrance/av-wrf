@@ -1,4 +1,4 @@
-"""Fail-closed verification gate (`uv run verify` or `python3 scripts/verify.py --stdlib-only`)."""
+"""Run the repository's complete verification suite."""
 
 from __future__ import annotations
 
@@ -26,39 +26,19 @@ def _run_step(label: str, cmd: list[str]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run repository verification gates.")
-    parser.add_argument(
-        "--stdlib-only",
-        action="store_true",
-        help="Run stdlib AST/reference/unittest gates only when uv venv is unavailable.",
-    )
-    args = parser.parse_args(argv)
-
-    py = sys.executable
-    _run_step("repo-boundaries-and-locks", [py, "scripts/check_repo.py"])
-    _run_step("reference-and-markdown-links", [py, "scripts/generate_reference.py", "--check"])
-
-    if args.stdlib_only:
-        _run_step(
-            "unittest-suite",
-            [py, "-m", "unittest", "discover", "-s", "tests", "-t", "."],
-        )
-        if shutil.which("git") and (ROOT / ".git").exists():
-            _run_step("git-whitespace-check", ["git", "diff", "--check"])
-        print(
-            "verify (--stdlib-only): structure, reference, and unittest passed "
-            f"[SKIPPED external tools: {', '.join(REQUIRED_EXTERNAL_TOOLS)}]"
-        )
-        return 0
+    argparse.ArgumentParser(description=__doc__).parse_args(argv)
 
     missing = [tool for tool in REQUIRED_EXTERNAL_TOOLS if shutil.which(tool) is None]
     if missing:
         print(
             f"FAIL verify: missing required tools: {', '.join(missing)}. "
-            "Run `uv sync && uv run verify` (or pass `--stdlib-only` for bare-OS checks)."
+            "Run `uv sync --locked && uv run verify`."
         )
         return 1
 
+    py = sys.executable
+    _run_step("repo-boundaries-and-locks", [py, "scripts/check_repo.py"])
+    _run_step("reference-and-markdown-links", [py, "scripts/generate_reference.py", "--check"])
     _run_step("tach-module-dag", ["tach", "check"])
     _run_step("import-linter", ["lint-imports"])
     _run_step("ruff-lint", ["ruff", "check"])

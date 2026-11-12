@@ -1,24 +1,7 @@
 """Pure float64 spherical Lambert Conformal projection, destaggering, and sponge cropping.
 
-Assumptions & Grid Geometry Alignment:
-1. Spherical datum: WPS/WRF uses a sphere of radius `R = 6,370,000 m` (`reradius` in
-   `module_model_constants.F`), distinct from GFS/RRFS GRIB2 shape 6 (`6,371,229 m`). Both
-   `published_crs_wkt` and `LambertConformalGrid.earthRadiusM` bind `6,370,000 m` explicitly.
-2. Arakawa-C destaggering: `wrfout` `U`, `V`, `W`, and `PH+PHB` are un-coupled physical fields.
-   Horizontal `0.5 * (f[i] + f[i+1])` is 2nd-order in uniform projected spacing `dx, dy`, and
-   vertical `0.5 * (f[k] + f[k+1])` is exact in `eta` because WRF defines mass levels as the
-   arithmetic midpoint of full `eta_w` faces (Skamarock et al. 2019 NCAR/TN-556+STR Sec. 3.2.1).
-3. Map scale `m(lat) = |n * rho| / (R * cos(lat))` matches `windy-av-layer` `geometry.ts` and
-   determines the minimum physical ground spacing `dx / m_max` for RK3 CFL checks (Sec. 3.3.4).
-
-References:
-- WPS spherical Lambert:
-  https://github.com/wrf-model/WPS/blob/master/geogrid/src/module_map_utils.F
-- WPS domain sizing guidance (>= 100x100):
-  https://www2.mmm.ucar.edu/wrf/site/documentation/namelist.wps_best_practices.html
-- WRF v4 Technical Note (Sec. 2.3 & 3.2):
-  https://www2.mmm.ucar.edu/wrf/users/docs/technote/v4_technote.pdf
-- Consumer LambertConformalGrid: windy-av-layer/packages/contracts/src/geometry.ts
+WPS Lambert projection: https://github.com/wrf-model/WPS/blob/v4.7.0/geogrid/src/module_map_utils.F
+WRF staggering: https://www2.mmm.ucar.edu/wrf/users/docs/technote/v4_technote.pdf (Sec. 3.2)
 """
 
 from __future__ import annotations
@@ -32,7 +15,6 @@ import numpy.typing as npt
 from av_wrf.contracts import (
     CompBucket2D,
     CompMass2D,
-    CompMass3D,
     CompStagX3D,
     CompStagY3D,
     CompStagZ3D,
@@ -50,7 +32,7 @@ MIN_DOMAIN_MASS_CELLS = 100
 
 def _to_f32_array(arr: npt.NDArray[np.float32]) -> array[float]:
     out = array("f")
-    out.frombytes(np.ascontiguousarray(arr, dtype=np.float32).tobytes())
+    out.frombytes(memoryview(np.ascontiguousarray(arr, dtype=np.float32)).cast("B"))
     return out
 
 
@@ -70,24 +52,19 @@ def _wrap_lon_rad(delta_rad: float) -> float:
 
 
 def _cone_constants(
-    std_lat1_deg: float,
-    std_lat2_deg: float,
-    origin_lat_deg: float,
-    radius_m: float,
+    std_lat1_deg: float, std_lat2_deg: float, origin_lat_deg: float, radius_m: float
 ) -> tuple[float, float, float]:
-    phi1 = math.radians(std_lat1_deg)
-    phi2 = math.radians(std_lat2_deg)
+    phi1, phi2 = math.radians(std_lat1_deg), math.radians(std_lat2_deg)
     phi0 = math.radians(origin_lat_deg)
-    t1 = math.tan(0.25 * math.pi + 0.5 * phi1)
-    t2 = math.tan(0.25 * math.pi + 0.5 * phi2)
+    t1, t2 = math.tan(0.25 * math.pi + 0.5 * phi1), math.tan(0.25 * math.pi + 0.5 * phi2)
     t0 = math.tan(0.25 * math.pi + 0.5 * phi0)
-    if abs(phi1 - phi2) < 1e-12:
-        n = math.sin(phi1)
-    else:
-        n = math.log(math.cos(phi1) / math.cos(phi2)) / math.log(t2 / t1)
+    n = (
+        math.sin(phi1)
+        if abs(phi1 - phi2) < 1e-12
+        else math.log(math.cos(phi1) / math.cos(phi2)) / math.log(t2 / t1)
+    )
     f_const = (math.cos(phi1) * (t1**n)) / n
-    rho0 = radius_m * f_const / (t0**n)
-    return n, f_const, rho0
+    return n, f_const, radius_m * f_const / (t0**n)
 
 
 def latlon_to_lambert_xy_m(
@@ -105,9 +82,8 @@ def latlon_to_lambert_xy_m(
         std_parallel_1_deg, std_parallel_2_deg, origin_lat_deg, radius_m
     )
     phi = math.radians(lat_deg)
-    dlon = _wrap_lon_rad(math.radians(lon_deg - central_meridian_deg))
+    theta = n * _wrap_lon_rad(math.radians(lon_deg - central_meridian_deg))
     rho = radius_m * f_const / (math.tan(0.25 * math.pi + 0.5 * phi) ** n)
-    theta = n * dlon
     return rho * math.sin(theta), rho0 - rho * math.cos(theta)
 
 
@@ -125,10 +101,8 @@ def lambert_xy_m_to_latlon(
     n, f_const, rho0 = _cone_constants(
         std_parallel_1_deg, std_parallel_2_deg, origin_lat_deg, radius_m
     )
-    sign_n = 1.0 if n >= 0.0 else -1.0
-    dy = rho0 - y_m
-    rho = sign_n * math.hypot(x_m, dy)
-    theta = math.atan2(sign_n * x_m, sign_n * dy)
+    sign_n, dy = (1.0 if n >= 0.0 else -1.0), rho0 - y_m
+    rho, theta = sign_n * math.hypot(x_m, dy), math.atan2(sign_n * x_m, sign_n * dy)
     lat_rad = 2.0 * math.atan(math.pow(radius_m * f_const / rho, 1.0 / n)) - 0.5 * math.pi
     lon_rad = _wrap_lon_rad(math.radians(central_meridian_deg) + theta / n)
     return math.degrees(lat_rad), math.degrees(lon_rad)
@@ -170,32 +144,38 @@ def lambert_map_scale(
 
 def published_grid_shape(domain: DomainProfile) -> tuple[int, int]:
     """Return (nj, ni) mass-point dimensions after cropping bdy_trim_cells on each edge."""
-    comp_nj, comp_ni = domain.e_sn - 1, domain.e_we - 1
-    trim = 2 * domain.bdy_trim_cells
+    comp_nj, comp_ni, trim = domain.e_sn - 1, domain.e_we - 1, 2 * domain.bdy_trim_cells
     if domain.bdy_trim_cells < 1 or comp_nj <= trim or comp_ni <= trim:
         raise ValueError("Published grid dimensions must remain positive after sponge trim")
     return comp_nj - trim, comp_ni - trim
 
 
+def _domain_center_xy_m(d: DomainProfile) -> tuple[float, float]:
+    return latlon_to_lambert_xy_m(
+        d.center_lat_deg,
+        d.center_lon_deg,
+        origin_lat_deg=d.center_lat_deg,
+        central_meridian_deg=d.central_meridian_deg,
+        std_parallel_1_deg=d.std_parallel_1_deg,
+        std_parallel_2_deg=d.std_parallel_2_deg,
+        radius_m=d.earth_radius_m,
+    )
+
+
+def computational_grid_origin_xy_m(domain: DomainProfile) -> tuple[float, float]:
+    """Return (x0_comp_m, y0_comp_m) of computational mass cell (j=0, i=0) in Lambert meters."""
+    cx_m, cy_m = _domain_center_xy_m(domain)
+    return (
+        cx_m - 0.5 * (domain.e_we - 2) * domain.dx_m,
+        cy_m - 0.5 * (domain.e_sn - 2) * domain.dy_m,
+    )
+
+
 def published_grid_origin_xy_m(domain: DomainProfile) -> tuple[float, float]:
     """Return (x0M, y0M) of Published Grid cell (j=0, i=0) relative to projection origin."""
     published_grid_shape(domain)
-    comp_nj, comp_ni = domain.e_sn - 1, domain.e_we - 1
-    cx_m, cy_m = latlon_to_lambert_xy_m(
-        domain.center_lat_deg,
-        domain.center_lon_deg,
-        origin_lat_deg=domain.center_lat_deg,
-        central_meridian_deg=domain.central_meridian_deg,
-        std_parallel_1_deg=domain.std_parallel_1_deg,
-        std_parallel_2_deg=domain.std_parallel_2_deg,
-        radius_m=domain.earth_radius_m,
-    )
-    x0_comp = cx_m - 0.5 * (comp_ni - 1) * domain.dx_m
-    y0_comp = cy_m - 0.5 * (comp_nj - 1) * domain.dy_m
-    return (
-        x0_comp + domain.bdy_trim_cells * domain.dx_m,
-        y0_comp + domain.bdy_trim_cells * domain.dy_m,
-    )
+    x0_c, y0_c = computational_grid_origin_xy_m(domain)
+    return x0_c + domain.bdy_trim_cells * domain.dx_m, y0_c + domain.bdy_trim_cells * domain.dy_m
 
 
 def published_crs_wkt(domain: DomainProfile) -> str:
@@ -214,9 +194,7 @@ def published_crs_wkt(domain: DomainProfile) -> str:
     )
 
 
-def published_lambert_grid_metadata(
-    domain: DomainProfile,
-) -> dict[str, int | float | str | bool]:
+def published_lambert_grid_metadata(domain: DomainProfile) -> dict[str, int | float | str | bool]:
     """Build exact windy-av-layer LambertConformalGrid descriptor for Published Grid."""
     nj, ni = published_grid_shape(domain)
     x0_m, y0_m = published_grid_origin_xy_m(domain)
@@ -240,13 +218,29 @@ def published_lambert_grid_metadata(
 def computational_latlon_bounds(
     domain: DomainProfile, *, halo_deg: float = 1.0, snap_deg: float = 0.25
 ) -> tuple[float, float, float, float]:
-    """Return snapped (west, south, east, north) forcing cutout bounds for domain."""
-    half_x = 0.5 * max(1, domain.e_we - 1) * domain.dx_m
-    half_y = 0.5 * max(1, domain.e_sn - 1) * domain.dy_m
-    pts = [(sx * half_x, sy * half_y) for sx in (-1.0, 0.0, 1.0) for sy in (-1.0, 0.0, 1.0)]
-    lats: list[float] = []
-    lons: list[float] = []
-    for x_m, y_m in pts:
+    """Return snapped forcing bounds, with longitude unwrapped across the dateline."""
+    if not math.isfinite(halo_deg) or not math.isfinite(snap_deg) or halo_deg < 0 or snap_deg <= 0:
+        raise ValueError("Forcing halo must be nonnegative and snap spacing must be positive")
+    cx_m, cy_m = _domain_center_xy_m(domain)
+    hx, hy = (
+        0.5 * max(1, domain.e_we - 1) * domain.dx_m,
+        0.5 * max(1, domain.e_sn - 1) * domain.dy_m,
+    )
+    x_min, x_max, y_min, y_max = cx_m - hx, cx_m + hx, cy_m - hy, cy_m + hy
+    _, _, cone_y = _cone_constants(
+        domain.std_parallel_1_deg,
+        domain.std_parallel_2_deg,
+        domain.center_lat_deg,
+        domain.earth_radius_m,
+    )
+    if x_min <= 0.0 <= x_max and y_min <= cone_y <= y_max:
+        raise ValueError("A regional Lambert cutout cannot contain the projection pole")
+    # Latitude is monotonic with distance from the cone apex. Extrema occur at a corner
+    # or at the point on the rectangle nearest the apex. Longitudes are radial lines.
+    points = [(x, y) for x in (x_min, x_max) for y in (y_min, y_max)]
+    points.append((min(x_max, max(x_min, 0.0)), min(y_max, max(y_min, cone_y))))
+    lats, lons_u = [], []
+    for x_m, y_m in points:
         lat, lon = lambert_xy_m_to_latlon(
             x_m,
             y_m,
@@ -257,85 +251,72 @@ def computational_latlon_bounds(
             radius_m=domain.earth_radius_m,
         )
         lats.append(lat)
-        lons.append(lon)
-    w = math.floor((min(lons) - halo_deg) / snap_deg) * snap_deg
-    s = math.floor((min(lats) - halo_deg) / snap_deg) * snap_deg
-    e = math.ceil((max(lons) + halo_deg) / snap_deg) * snap_deg
-    n = math.ceil((max(lats) + halo_deg) / snap_deg) * snap_deg
+        lons_u.append(
+            domain.center_lon_deg
+            + math.degrees(_wrap_lon_rad(math.radians(lon - domain.center_lon_deg)))
+        )
+    w = math.floor((min(lons_u) - halo_deg) / snap_deg) * snap_deg
+    s = max(-90.0, math.floor((min(lats) - halo_deg) / snap_deg) * snap_deg)
+    e = math.ceil((max(lons_u) + halo_deg) / snap_deg) * snap_deg
+    n = min(90.0, math.ceil((max(lats) + halo_deg) / snap_deg) * snap_deg)
+    if w < -180.0 and e <= 180.0:
+        w, e = w + 360.0, e + 360.0
     return (round(w, 4), round(s, 4), round(e, 4), round(n, 4))
 
 
-def destagger_x_3d(stag_u: CompStagX3D) -> CompMass3D:
-    """Destagger (nz, ny, nx+1) Arakawa-C U faces onto (nz, ny, nx) mass points."""
-    nz, ny, nx1 = stag_u.nz, stag_u.ny, stag_u.nx
-    if nx1 < 2:
-        raise ValueError("Staggered X axis requires >= 2 columns")
-    arr = np.frombuffer(stag_u.buf, dtype=np.float32).reshape(nz, ny, nx1)
-    mid = (0.5 * (arr[:, :, :-1].astype(np.float64) + arr[:, :, 1:].astype(np.float64))).astype(
-        np.float32
-    )
-    return CompMass3D(Slab3DF32(nz=nz, ny=ny, nx=nx1 - 1, buf=_to_f32_array(mid)))
+def _avg_axis(arr: npt.NDArray[np.float32], axis: int) -> array[float]:
+    sl0, sl1 = [slice(None)] * 3, [slice(None)] * 3
+    sl0[axis], sl1[axis] = slice(None, -1), slice(1, None)
+    mid = np.add(arr[tuple(sl0)], arr[tuple(sl1)], dtype=np.float64)
+    mid *= 0.5
+    return _to_f32_array(mid.astype(np.float32))
 
 
-def destagger_y_3d(stag_v: CompStagY3D) -> CompMass3D:
-    """Destagger (nz, ny+1, nx) Arakawa-C V faces onto (nz, ny, nx) mass points."""
-    nz, ny1, nx = stag_v.nz, stag_v.ny, stag_v.nx
-    if ny1 < 2:
-        raise ValueError("Staggered Y axis requires >= 2 rows")
-    arr = np.frombuffer(stag_v.buf, dtype=np.float32).reshape(nz, ny1, nx)
-    mid = (0.5 * (arr[:, :-1, :].astype(np.float64) + arr[:, 1:, :].astype(np.float64))).astype(
-        np.float32
-    )
-    return CompMass3D(Slab3DF32(nz=nz, ny=ny1 - 1, nx=nx, buf=_to_f32_array(mid)))
+def _crop_destagger(
+    buf: array[float], dims: tuple[int, int, int], trim: int, k_exp: int, axis: int
+) -> PubMass3D:
+    nz, ny, nx = dims
+    ny_m, nx_m, kz = ny - int(axis == 1), nx - int(axis == 2), k_exp + int(axis == 0)
+    if k_exp < 1 or nz < kz or trim < 1 or ny_m <= 2 * trim or nx_m <= 2 * trim:
+        raise ValueError("Invalid sponge trim or exported_k for staggered 3D volume")
+    sub = np.frombuffer(buf, np.float32).reshape(nz, ny, nx)[:kz, trim:-trim, trim:-trim]
+    return PubMass3D(Slab3DF32(k_exp, ny_m - 2 * trim, nx_m - 2 * trim, _avg_axis(sub, axis)))
 
 
-def destagger_z_3d(stag_z: CompStagZ3D) -> CompMass3D:
-    """Destagger (nz+1, ny, nx) Arakawa-C vertical faces onto (nz, ny, nx) mass levels."""
-    nz1, ny, nx = stag_z.nz, stag_z.ny, stag_z.nx
-    if nz1 < 2:
-        raise ValueError("Staggered Z axis requires >= 2 levels")
-    arr = np.frombuffer(stag_z.buf, dtype=np.float32).reshape(nz1, ny, nx)
-    mid = (0.5 * (arr[:-1, :, :].astype(np.float64) + arr[1:, :, :].astype(np.float64))).astype(
-        np.float32
-    )
-    return CompMass3D(Slab3DF32(nz=nz1 - 1, ny=ny, nx=nx, buf=_to_f32_array(mid)))
+def crop_destagger_x_3d(stag_u: CompStagX3D, trim: int, exported_k: int) -> PubMass3D:
+    """Crop lateral sponge and upper levels first, then average X-staggered U faces."""
+    return _crop_destagger(stag_u.buf, (stag_u.nz, stag_u.ny, stag_u.nx), trim, exported_k, 2)
+
+
+def crop_destagger_y_3d(stag_v: CompStagY3D, trim: int, exported_k: int) -> PubMass3D:
+    """Crop lateral sponge and upper levels first, then average Y-staggered V faces."""
+    return _crop_destagger(stag_v.buf, (stag_v.nz, stag_v.ny, stag_v.nx), trim, exported_k, 1)
+
+
+def crop_destagger_z_3d(stag_z: CompStagZ3D, trim: int, exported_k: int) -> PubMass3D:
+    """Crop lateral sponge and upper levels first, then average Z-staggered faces."""
+    return _crop_destagger(stag_z.buf, (stag_z.nz, stag_z.ny, stag_z.nx), trim, exported_k, 0)
 
 
 def crop_sponge_2d(slab: CompMass2D, trim: int) -> PubMass2D:
     """Crop lateral relaxation cells on all four edges of a contiguous 2D float32 mass slab."""
+    sub = _crop_sponge_2d_view(slab, trim)
+    ny, nx = sub.shape
+    return PubMass2D(Slab2DF32(ny, nx, _to_f32_array(sub)))
+
+
+def _crop_sponge_2d_view(slab: CompMass2D, trim: int) -> npt.NDArray[np.float32]:
     if trim < 1 or slab.ny <= 2 * trim or slab.nx <= 2 * trim:
         raise ValueError("Invalid sponge trim for 2D computational slab")
-    arr = np.frombuffer(slab.buf, dtype=np.float32).reshape(slab.ny, slab.nx)
-    cropped = arr[trim : slab.ny - trim, trim : slab.nx - trim]
-    return PubMass2D(
-        Slab2DF32(ny=slab.ny - 2 * trim, nx=slab.nx - 2 * trim, buf=_to_f32_array(cropped))
-    )
+    arr = np.frombuffer(slab.buf, np.float32).reshape(slab.ny, slab.nx)
+    return arr[trim:-trim, trim:-trim]
 
 
 def crop_bucket_2d(slab: CompBucket2D, trim: int) -> PubBucket2D:
     """Crop lateral relaxation cells on all four edges of a 2D int32 bucket counter slab."""
     if trim < 1 or slab.ny <= 2 * trim or slab.nx <= 2 * trim:
         raise ValueError("Invalid sponge trim for 2D computational int32 bucket slab")
-    arr = np.frombuffer(slab.buf, dtype=np.int32).reshape(slab.ny, slab.nx)
-    cropped = arr[trim : slab.ny - trim, trim : slab.nx - trim]
+    arr = np.frombuffer(slab.buf, np.int32).reshape(slab.ny, slab.nx)
     out = array("i")
-    out.frombytes(np.ascontiguousarray(cropped, dtype=np.int32).tobytes())
-    return PubBucket2D(Slab2DI32(ny=slab.ny - 2 * trim, nx=slab.nx - 2 * trim, buf=out))
-
-
-def crop_sponge_3d(volume: CompMass3D, trim: int, exported_k: int) -> PubMass3D:
-    """Select lowest exported_k mass levels and crop lateral sponge cells."""
-    if exported_k < 1 or volume.nz < exported_k:
-        raise ValueError("Volume has fewer vertical levels than exported_k")
-    if trim < 1 or volume.ny <= 2 * trim or volume.nx <= 2 * trim:
-        raise ValueError("Invalid sponge trim for 3D computational volume")
-    arr = np.frombuffer(volume.buf, dtype=np.float32).reshape(volume.nz, volume.ny, volume.nx)
-    cropped = arr[:exported_k, trim : volume.ny - trim, trim : volume.nx - trim]
-    return PubMass3D(
-        Slab3DF32(
-            nz=exported_k,
-            ny=volume.ny - 2 * trim,
-            nx=volume.nx - 2 * trim,
-            buf=_to_f32_array(cropped),
-        )
-    )
+    out.frombytes(memoryview(np.ascontiguousarray(arr[trim:-trim, trim:-trim])).cast("B"))
+    return PubBucket2D(Slab2DI32(slab.ny - 2 * trim, slab.nx - 2 * trim, out))

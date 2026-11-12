@@ -1,4 +1,4 @@
-"""Contract tests verifying wrf-zarr-v3 sync, 30-node Zarr v3 metadata, and ZEP-0002 guards."""
+"""Contract tests verifying wrf-zarr-v3 sync, [64, 64] edge-padded shards, and ZEP-0002 guards."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from av_wrf.codecs import (  # noqa: E402
     encode_2d_shard_bytes,
     encode_3d_shard_bytes,
     expected_shard_keys,
+    outer_shard_yx,
     resolve_inner_chunk_yx,
     synthetic_thm_from_dry_theta,
     verify_shard_index,
@@ -91,32 +92,36 @@ class TestVendorZarrContract(unittest.TestCase):
             self.assertEqual(spec.time_support, expected["timeSupport"])
             self.assertEqual(spec.keepbits, expected["keepbits"])
 
-    def test_zep0002_multitile_partial_shard_and_prime_chunk_explosion_guard(self) -> None:
+    def test_zep0002_exact_64x64_partial_edge_tiles_and_tile_cap_guard(self) -> None:
         self.assertEqual(crc32c_u32(b"123456789"), 0xE3069283)
 
         prod_id = sorted((ROOT / "config" / "products").glob("*.yaml"))[0].stem
         base_out = load_bundle(ROOT / "config", prod_id).output
-        out = dataclasses.replace(base_out, inner_chunk_yx=(5, 7), shard_time_steps=3)
-        # Prime 149 x 181 grid resize must fail closed instead of creating 26,969 1x1 chunks
+        # Prime 149 x 181 grid now uses exact [64, 64] inner chunks inside a [192, 192] outer shard!
+        self.assertEqual(resolve_inner_chunk_yx(149, 181, base_out), (64, 64))
+        self.assertEqual(outer_shard_yx(149, 181, base_out), (192, 192))
+        # Pathological 1x1 inner chunk exceeding 64-tile cap is rejected
         with self.assertRaises(ValueError):
-            resolve_inner_chunk_yx(149, 181, base_out)
+            resolve_inner_chunk_yx(100, 100, dataclasses.replace(base_out, inner_chunk_yx=(4, 4)))
 
-        f0 = PubMass2D(Slab2DF32.from_values(10, 14, [float(i) for i in range(140)]))
-        f1 = PubMass2D(Slab2DF32.from_values(10, 14, [float(i) + 500.0 for i in range(140)]))
+        out = dataclasses.replace(base_out, inner_chunk_yx=(6, 8), shard_time_steps=3)
+        # Non-divisible 10 x 13 grid padded to 12 x 16 (2 x 2 = 4 spatial tiles per frame)
+        f0 = PubMass2D(Slab2DF32.from_values(10, 13, [float(i) for i in range(130)]))
+        f1 = PubMass2D(Slab2DF32.from_values(10, 13, [float(i) + 500.0 for i in range(130)]))
         shard2d = encode_2d_shard_bytes([f0, f1], out, shard_time_steps=3)
         dec2d = decode_shard_f32(
-            shard2d, shard_time_steps=3, n_frames=2, nz=1, ny=10, nx=14, output=out
+            shard2d, shard_time_steps=3, n_frames=2, nz=1, ny=10, nx=13, output=out
         )
-        self.assertEqual(list(dec2d[:140]), list(f0.buf))
-        self.assertEqual(list(dec2d[140:280]), list(f1.buf))
-        self.assertTrue(all(math.isnan(v) for v in dec2d[280:]))
+        self.assertEqual(list(dec2d[:130]), list(f0.buf))
+        self.assertEqual(list(dec2d[130:260]), list(f1.buf))
+        self.assertTrue(all(math.isnan(v) for v in dec2d[260:]))
         with self.assertRaises(ValueError):
-            verify_shard_index(shard2d, shard_time_steps=3, n_frames=3, ny=10, nx=14, output=out)
+            verify_shard_index(shard2d, shard_time_steps=3, n_frames=3, ny=10, nx=13, output=out)
 
-        v0 = PubMass3D(Slab3DF32.from_values(2, 10, 14, [float(i) * 0.5 for i in range(280)]))
-        v1 = PubMass3D(Slab3DF32.from_values(2, 10, 14, [float(i) * 1.5 for i in range(280)]))
+        v0 = PubMass3D(Slab3DF32.from_values(2, 10, 13, [float(i) * 0.5 for i in range(260)]))
+        v1 = PubMass3D(Slab3DF32.from_values(2, 10, 13, [float(i) * 1.5 for i in range(260)]))
         shard3d = encode_3d_shard_bytes([v0, v1], out, shard_time_steps=2)
-        dec3d = decode_shard_f32(shard3d, shard_time_steps=2, nz=2, ny=10, nx=14, output=out)
+        dec3d = decode_shard_f32(shard3d, shard_time_steps=2, nz=2, ny=10, nx=13, output=out)
         self.assertEqual(list(dec3d), [*v0.buf, *v1.buf])
 
         idx_len = 8 * 16
@@ -125,9 +130,9 @@ class TestVendorZarrContract(unittest.TestCase):
         struct.pack_into("<QQ", bad_idx, 0, 4, 8)
         forged = body + bytes(bad_idx) + struct.pack("<I", crc32c_u32(bytes(bad_idx)))
         with self.assertRaises(ValueError):
-            verify_shard_index(forged, shard_time_steps=2, n_frames=2, ny=10, nx=14, output=out)
+            verify_shard_index(forged, shard_time_steps=2, n_frames=2, ny=10, nx=13, output=out)
 
-    def test_complete_zarr_v3_hierarchy_and_cli_check(self) -> None:
+    def test_complete_zarr_v3_hierarchy_exact_64x64_chunks_and_cli_check(self) -> None:
         cfg_dir = ROOT / "config"
         for p_path in sorted((cfg_dir / "products").glob("*.yaml")):
             b = load_bundle(cfg_dir, p_path.stem)
@@ -137,8 +142,16 @@ class TestVendorZarrContract(unittest.TestCase):
             nj, ni = published_grid_shape(b.domain)
             temp_meta = docs["temp_k/zarr.json"]
             self.assertEqual(temp_meta["shape"], [len(leads), b.domain.exported_levels_k, nj, ni])
+            codecs = temp_meta["codecs"]
+            assert isinstance(codecs, list)
+            shard_cfg = codecs[0]["configuration"]
+            self.assertEqual(shard_cfg["chunk_shape"], [1, b.domain.exported_levels_k, 64, 64])
             self.assertEqual(zarr_shard_relpath("terrain_m", b.output), "terrain_m/c/0/0")
             self.assertIn("terrain_m/c/0/0", expected_shard_keys(b.output, len(leads)))
+            with self.assertRaises(ValueError):
+                build_zarr_v3_store_metadata(
+                    b.domain, dataclasses.replace(b.output, schema_id="bad-schema"), leads
+                )
 
         self.assertEqual(cli_main(["check", "--config-dir", str(ROOT / "config")]), 0)
         prod_id = sorted((ROOT / "config" / "products").glob("*.yaml"))[0].stem

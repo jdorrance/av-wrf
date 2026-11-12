@@ -1,28 +1,4 @@
-"""Pure WRF v4.8 / WPS v4.7 namelist validation, compilation, and Fortran rendering.
-
-Assumptions & Solver Physics Guardrails:
-1. Map-projected RK3 CFL constraint (`Skamarock et al. 2019 NCAR/TN-556+STR Sec. 3.3.4`):
-   `time_step_s <= 6 * min(dx_m, dy_m) / (1000 * m_max)` evaluated across the computational
-   domain's north/center/south latitudes so map-factor distortion (`m > 1`) cannot violate CFL.
-2. Topographic radiation (`slope_rad=1, topo_shading=1, shadlen=25000`): 3 km slope aspect and
-   25 km cast shadows enter Noah-MP `ACHFX`/`ACLHF`/`T2` directly; downstream consumer must NOT
-   apply an additional slope-irradiance multiplier on top of WRF surface heat fluxes.
-3. Surface-layer `T2` coupling (`sf_sfclay_physics=1`): Revised MM5 diagnoses `T2` along the
-   Monin-Obukhov log profile between `TSK` and `temp_k[0]`, providing resolved superadiabatic
-   surface excess so consumer parcel ascent needs `parcelSurfaceDeltaTC = 0 K`.
-4. WRF v4.8 Registry & Known-Problem guards: emits `nwp_diagnostics` under `&time_control`,
-   renders `shinhong_scu_mixing` as a Fortran logical (`.false.`), enables `afwa_buoy_opt=1`
-   so `AFWA_CAPE` and `AFWA_CAPE_MU` execute under Thompson `mp_physics=8`, and rejects
-   `opt_runsrf=5`, `gwd_if_nonhyd=True` with `gwd_opt=1`, and `shinhong_scu_mixing=True`
-   with `shinhong_nonlocal_flux=True`.
-
-References:
-- WRF v4.8 Registry: https://github.com/wrf-model/WRF/blob/v4.8.0/Registry/Registry.EM_COMMON
-- WRF AFWA Registry: https://github.com/wrf-model/WRF/blob/v4.8.0/Registry/registry.afwa
-- WRF v4.8 Known Problems: https://github.com/wrf-model/WRF/wiki/WRF-V4.8.0-Known-Problems
-- WRF v4 Technical Note (Sec. 3.3.4):
-  https://www2.mmm.ucar.edu/wrf/users/docs/technote/v4_technote.pdf
-"""
+"""Compile WRF v4.8 and WPS v4.7 Fortran namelists from validated profiles."""
 
 from __future__ import annotations
 
@@ -46,7 +22,12 @@ NON_NAMELIST_METADATA_FIELDS: frozenset[str] = frozenset(
 )
 
 
-def _max_domain_map_scale(domain: DomainProfile) -> float:
+def _validate_dynamics(science: ScienceProfile, domain: DomainProfile) -> None:
+    if science.spec_bdy_width != science.spec_zone + science.relax_zone:
+        raise ValueError("spec_bdy_width must equal spec_zone + relax_zone")
+    if domain.bdy_trim_cells <= science.spec_bdy_width:
+        raise ValueError("bdy_trim_cells must exceed spec_bdy_width")
+    # https://www2.mmm.ucar.edu/wrf/users/docs/technote/v4_technote.pdf
     half_span_deg = math.degrees(
         0.5 * max(1, domain.e_sn - 1) * abs(domain.dy_m) / domain.earth_radius_m
     )
@@ -55,7 +36,7 @@ def _max_domain_map_scale(domain: DomainProfile) -> float:
         domain.center_lat_deg,
         min(89.0, domain.center_lat_deg + half_span_deg),
     )
-    return max(
+    m_max = max(
         lambert_map_scale(
             lat,
             std_parallel_1_deg=domain.std_parallel_1_deg,
@@ -65,11 +46,21 @@ def _max_domain_map_scale(domain: DomainProfile) -> float:
         )
         for lat in sample_lats
     )
+    min_phys_dx_km = (min(abs(domain.dx_m), abs(domain.dy_m)) / m_max) / 1000.0
+    max_dt_s = 6.0 * min_phys_dx_km
+    if not 0 < science.time_step_s <= max_dt_s:
+        raise ValueError(
+            f"time_step_s ({science.time_step_s}) exceeds 6*dx_phys ({max_dt_s:.2f}s, "
+            f"m_max={m_max:.4f})"
+        )
 
 
 def validate_science_profile(science: ScienceProfile, domain: DomainProfile) -> None:
     """Enforce domain sizing policy and WRF v4.8 physics, CFL, AFWA, and sponge invariants."""
     validate_domain_profile(domain)
+    if (science.wrf_version, science.wps_version) != ("4.8.0", "4.7.0"):
+        raise ValueError("Supported namelist versions are WRF 4.8.0 and WPS 4.7.0")
+    # https://github.com/wrf-model/WRF/wiki/WRF-V4.8.0-Known-Problems
     if science.sf_surface_physics == 4 and science.opt_runsrf == 5:
         raise ValueError("WRF v4.8 Noah-MP forbids opt_runsrf=5 due to runtime/restart bug")
     if science.gwd_opt == 1 and science.gwd_if_nonhyd:
@@ -78,27 +69,13 @@ def validate_science_profile(science: ScienceProfile, domain: DomainProfile) -> 
         raise ValueError("WRF v4.8 forbids shinhong_scu_mixing=True with shinhong_nonlocal_flux")
     if science.use_theta_m not in (0, 1) or not (250.0 <= science.base_temp_k <= 320.0):
         raise ValueError("Invalid use_theta_m or base_temp_k")
-    if (
-        science.afwa_diag_opt != 1
-        or science.afwa_severe_opt != 1
-        or science.afwa_buoy_opt != 1
-        or science.nwp_diagnostics != 1
-    ):
-        raise ValueError("nwp_diagnostics=1 and afwa_{diag,severe,buoy}_opt=1 are required")
-    if science.bucket_mm <= 0.0 or science.bucket_j <= 0.0 or science.history_interval_min < 1:
-        raise ValueError("Accumulator buckets and history_interval_min must be positive")
-    m_max = _max_domain_map_scale(domain)
-    min_phys_dx_km = (min(abs(domain.dx_m), abs(domain.dy_m)) / m_max) / 1000.0
-    max_dt_s = 6.0 * min_phys_dx_km
-    if science.time_step_s <= 0 or science.time_step_s > max_dt_s:
-        raise ValueError(
-            f"time_step_s ({science.time_step_s}) exceeds 6*dx_phys ({max_dt_s:.2f}s, "
-            f"m_max={m_max:.4f})"
-        )
-    if science.spec_bdy_width != science.spec_zone + science.relax_zone:
-        raise ValueError("spec_bdy_width must equal spec_zone + relax_zone")
-    if domain.bdy_trim_cells <= science.spec_bdy_width:
-        raise ValueError("bdy_trim_cells must exceed spec_bdy_width")
+    if science.afwa_diag_opt != 1 or science.afwa_buoy_opt != 1:
+        raise ValueError("afwa_diag_opt=1 and afwa_buoy_opt=1 are required")
+    if not (science.bucket_mm > 0 and science.history_interval_min > 0):
+        raise ValueError("bucket_mm and history_interval_min must be positive")
+    if 60 % science.history_interval_min:
+        raise ValueError("history_interval_min must divide the hourly publication cadence")
+    _validate_dynamics(science, domain)
 
 
 def _physics_and_dynamics_sections(
@@ -122,7 +99,6 @@ def _physics_and_dynamics_sections(
             "shinhong_scu_mixing": science.shinhong_scu_mixing,
             "shinhong_nonlocal_flux": science.shinhong_nonlocal_flux,
             "bucket_mm": science.bucket_mm,
-            "bucket_J": science.bucket_j,
         },
         "noah_mp": {"opt_runsrf": science.opt_runsrf, "opt_runsub": science.opt_runsub},
         "dynamics": {
@@ -144,7 +120,6 @@ def _physics_and_dynamics_sections(
         },
         "afwa": {
             "afwa_diag_opt": science.afwa_diag_opt,
-            "afwa_severe_opt": science.afwa_severe_opt,
             "afwa_buoy_opt": science.afwa_buoy_opt,
         },
     }
@@ -164,14 +139,13 @@ def compile_wrf_namelist_sections(
     soil_levels = (
         len(forcing.soil_layer_centers_cm) if metgrid_soil_levels is None else metgrid_soil_levels
     )
-    if mg_levels < 2 or soil_levels < 1:
-        raise ValueError("num_metgrid_levels and num_metgrid_soil_levels must be positive")
+    if mg_levels < 2 or soil_levels < 1 or forcing.interval_seconds < 1:
+        raise ValueError("metgrid levels and forcing interval_seconds must be positive")
     return {
         "time_control": {
-            "interval_seconds": science.interval_seconds,
+            "interval_seconds": forcing.interval_seconds,
             "history_interval": science.history_interval_min,
             "frames_per_outfile": 1,
-            "nwp_diagnostics": science.nwp_diagnostics,
         },
         "domains": {
             "time_step": science.time_step_s,
@@ -204,37 +178,27 @@ def compile_wrf_namelist_sections(
             "spec_zone": science.spec_zone,
             "relax_zone": science.relax_zone,
         },
+        # MPI WRF requires this group even when no I/O ranks are reserved.
+        # https://github.com/wrf-model/WRF/blob/v4.8.0/frame/module_io_quilt_old.F#L2474-L2480
+        "namelist_quilt": {"nio_tasks_per_group": 0, "nio_groups": 1},
     }
 
 
-def compile_wps_namelist_sections(
-    domain: DomainProfile,
-    science: ScienceProfile,
-    lock: RunLock,
-    *,
-    interval_seconds: int | None = None,
-) -> NamelistSections:
-    """Compile WPS v4.7 namelist.wps sections bracketing RunLock integration window."""
-    start_dt = parse_iso_utc(lock.wrf_init_utc)
-    step_s = science.interval_seconds if interval_seconds is None else interval_seconds
-    if step_s < 1:
-        raise ValueError("WPS interval_seconds must be positive")
-    raw_s = (lock.spinup_hours + max(lock.lead_hours)) * 3600
-    bracket_s = ((raw_s + step_s - 1) // step_s) * step_s
-    end_dt = start_dt + timedelta(seconds=bracket_s)
-    fmt = "%Y-%m-%d_%H:%M:%S"
-    geog_res = (
-        domain.dem_source
-        if domain.dem_source == domain.landuse_source
-        else f"{domain.dem_source}+{domain.landuse_source}"
+def _build_geog_data_res(domain: DomainProfile) -> str:
+    # GEOGRID tries resolution names in this order for each field in GEOGRID.TBL.
+    # https://www2.mmm.ucar.edu/wrf/site/documentation/users_guide/wps.html
+    custom = dict.fromkeys(
+        src for src in (domain.landuse_source, domain.dem_source) if src != "default"
     )
+    return "+".join((*custom, "default"))
+
+
+def compile_geogrid_namelist_sections(domain: DomainProfile) -> NamelistSections:
+    """Compile static geography sections for a validated domain."""
     return {
         "share": {
             "wrf_core": "ARW",
             "max_dom": 1,
-            "start_date": start_dt.strftime(fmt),
-            "end_date": end_dt.strftime(fmt),
-            "interval_seconds": step_s,
             "io_form_geogrid": 2,
         },
         "geogrid": {
@@ -244,7 +208,7 @@ def compile_wps_namelist_sections(
             "j_parent_start": 1,
             "e_we": domain.e_we,
             "e_sn": domain.e_sn,
-            "geog_data_res": geog_res,
+            "geog_data_res": _build_geog_data_res(domain),
             "geog_data_path": domain.geog_data_path,
             "dx": domain.dx_m,
             "dy": domain.dy_m,
@@ -255,9 +219,50 @@ def compile_wps_namelist_sections(
             "truelat2": domain.std_parallel_2_deg,
             "stand_lon": domain.central_meridian_deg,
         },
-        "ungrib": {"out_format": "WPS", "prefix": "FILE"},
-        "metgrid": {"fg_name": "FILE", "io_form_metgrid": 2},
     }
+
+
+def _forcing_bracket_duration_s(lock: RunLock, interval_s: int) -> int:
+    if interval_s <= 0 or interval_s % 3600:
+        raise ValueError("Forcing interval must be a positive whole-hour multiple")
+    total_s = (lock.spinup_hours + max(lock.lead_hours)) * 3600
+    return ((total_s + interval_s - 1) // interval_s) * interval_s
+
+
+def required_forcing_forecast_hours(lock: RunLock, source: ForcingProfile) -> tuple[int, ...]:
+    """Return source-native forecast hours, including the final WRF boundary bracket."""
+    step_s = source.interval_seconds
+    duration_s = _forcing_bracket_duration_s(lock, step_s)
+    cycle = parse_iso_utc(lock.forcing_cycle_utc)
+    init = parse_iso_utc(lock.wrf_init_utc)
+    offset_s = (init - cycle).total_seconds()
+    if offset_s < 0 or offset_s % step_s:
+        raise ValueError("WRF init must align to a source-native forcing time")
+    return tuple(
+        range(int(offset_s) // 3600, (int(offset_s) + duration_s) // 3600 + 1, step_s // 3600)
+    )
+
+
+def compile_wps_namelist_sections(
+    domain: DomainProfile, science: ScienceProfile, lock: RunLock, forcing: ForcingProfile
+) -> NamelistSections:
+    """Compile WPS sections with boundary inputs through the final bracketing time."""
+    validate_science_profile(science, domain)
+    start_dt = parse_iso_utc(lock.wrf_init_utc)
+    interval_s = forcing.interval_seconds
+    end_dt = start_dt + timedelta(seconds=_forcing_bracket_duration_s(lock, interval_s))
+    fmt = "%Y-%m-%d_%H:%M:%S"
+    out = compile_geogrid_namelist_sections(domain)
+    out["share"].update(
+        {
+            "start_date": start_dt.strftime(fmt),
+            "end_date": end_dt.strftime(fmt),
+            "interval_seconds": interval_s,
+        }
+    )
+    out["ungrib"] = {"out_format": "WPS", "prefix": "FILE"}
+    out["metgrid"] = {"fg_name": "FILE", "io_form_metgrid": 2}
+    return out
 
 
 def compile_wrf_run_namelist(
@@ -268,6 +273,7 @@ def compile_wrf_run_namelist(
     *,
     metgrid_levels: int | None = None,
     metgrid_soil_levels: int | None = None,
+    for_real: bool = False,
 ) -> NamelistSections:
     """Attach RunLock UTC calendar and history_begin_h onto WRF namelist.input sections."""
     base = compile_wrf_namelist_sections(
@@ -279,7 +285,14 @@ def compile_wrf_run_namelist(
     )
     start_dt = parse_iso_utc(lock.wrf_init_utc)
     total_hours = lock.spinup_hours + max(lock.lead_hours)
-    end_dt = start_dt + timedelta(hours=total_hours)
+    # real.exe reads end_* rather than run_hours to determine how many met_em files to open.
+    # https://github.com/wrf-model/WRF/blob/v4.8.0/run/README.namelist
+    end_s = (
+        _forcing_bracket_duration_s(lock, forcing.interval_seconds)
+        if for_real
+        else (total_hours * 3600)
+    )
+    end_dt = start_dt + timedelta(seconds=end_s)
     tc: dict[str, NamelistScalar] = {
         "run_days": 0,
         "run_hours": total_hours,

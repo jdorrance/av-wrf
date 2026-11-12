@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import re
 from collections.abc import Mapping
 
 from av_wrf.contracts.config import (
@@ -47,7 +49,10 @@ def _req_float(raw: Mapping[str, object], key: str) -> float:
     val = raw[key]
     if isinstance(val, bool) or not isinstance(val, (int, float)):
         raise TypeError(f"Expected float for '{key}', got {type(val).__name__}")
-    return float(val)
+    result = float(val)
+    if not math.isfinite(result):
+        raise ValueError(f"Expected finite float for '{key}'")
+    return result
 
 
 def _req_seq(raw: Mapping[str, object], key: str) -> list[object]:
@@ -61,7 +66,10 @@ def _req_float_tuple(raw: Mapping[str, object], key: str) -> tuple[float, ...]:
     items = _req_seq(raw, key)
     if any(isinstance(x, bool) or not isinstance(x, (int, float)) for x in items):
         raise TypeError(f"Expected numeric sequence for '{key}'")
-    return tuple(float(x) for x in items if isinstance(x, (int, float)))
+    values = tuple(float(x) for x in items if isinstance(x, (int, float)))
+    if not all(map(math.isfinite, values)):
+        raise ValueError(f"Expected finite numbers for '{key}'")
+    return values
 
 
 def _req_int_pair(raw: Mapping[str, object], key: str) -> tuple[int, int]:
@@ -159,14 +167,10 @@ def parse_science_profile(raw: Mapping[str, object]) -> ScienceProfile:
         _req_int(raw, "spec_bdy_width"),
         _req_int(raw, "spec_zone"),
         _req_int(raw, "relax_zone"),
-        _req_int(raw, "interval_seconds"),
-        _req_int(raw, "nwp_diagnostics"),
         _req_int(raw, "afwa_diag_opt"),
-        _req_int(raw, "afwa_severe_opt"),
         _req_int(raw, "afwa_buoy_opt"),
         _req_int(raw, "history_interval_min"),
         _req_float(raw, "bucket_mm"),
-        _req_float(raw, "bucket_j"),
     )
 
 
@@ -175,14 +179,19 @@ def parse_forcing_profile(raw: Mapping[str, object]) -> ForcingProfile:
     prof = ForcingProfile(
         _req_str(raw, "profile_id"),
         _req_str(raw, "provider"),
+        _req_str(raw, "vtable_name"),
+        _req_int(raw, "interval_seconds"),
         _req_float(raw, "grid_spacing_deg"),
         _req_int(raw, "pressure_level_count"),
         _req_float_tuple(raw, "soil_layer_centers_cm"),
-        _req_bool(raw, "has_dedicated_sst"),
         _req_float(raw, "source_ready_lag_p95_hours"),
         _req_str_tuple(raw, "mirrors"),
         _req_bool(raw, "fail_closed"),
     )
+    if not re.fullmatch(r"Vtable\.[A-Za-z0-9][A-Za-z0-9_.-]*", prof.vtable_name):
+        raise ValueError("ForcingProfile.vtable_name must be a single WPS Vtable filename")
+    if prof.interval_seconds < 3600 or prof.interval_seconds % 3600 != 0:
+        raise ValueError("ForcingProfile.interval_seconds must be a positive multiple of 3600")
     if prof.pressure_level_count < 10 or prof.source_ready_lag_p95_hours <= 0.0:
         raise ValueError("ForcingProfile requires >= 10 pressure levels and positive lag")
     return prof

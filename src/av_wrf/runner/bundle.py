@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
+from av_wrf.codecs import build_zarr_v3_store_metadata
 from av_wrf.contracts import (
+    ZARR_SCHEMA_ID,
     DomainProfile,
     ForcingProfile,
     OutputProfile,
@@ -21,11 +24,13 @@ from av_wrf.contracts import (
     parse_science_profile,
 )
 from av_wrf.core import (
+    compile_wrf_namelist_sections,
     estimate_auto_levels_agl_m,
     selected_lead_hours,
     validate_horizon_policy,
     validate_vertical_column,
 )
+from av_wrf.runner.mirrors import validate_source_recipe
 
 
 @dataclass(frozen=True)
@@ -54,7 +59,10 @@ class _StrictYamlLoader(yaml.SafeLoader):
 
 def parse_declarative_yaml(path: Path) -> dict[str, object]:
     """Parse declarative YAML via PyYAML while forbidding tabs, templating, anchors, and dupes."""
-    raw_text = path.read_text(encoding="utf-8")
+    return _parse_yaml_text(path, path.read_text(encoding="utf-8"))
+
+
+def _parse_yaml_text(path: Path, raw_text: str) -> dict[str, object]:
     for lineno, raw_line in enumerate(raw_text.splitlines(), start=1):
         if "\t" in raw_line:
             raise ValueError(f"{path}:{lineno}: tabs are forbidden in declarative YAML")
@@ -78,40 +86,69 @@ def parse_declarative_yaml(path: Path) -> dict[str, object]:
     return out
 
 
+def _require_segment(value: str, label: str) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value):
+        raise ValueError(f"{label} must be a single safe path segment")
+
+
 def load_bundle(config_root: Path, product_id: str) -> LoadedBundle:
-    """Load and SHA-256 hash a ProductSpec and all four referenced profile YAMLs."""
-    p_path = config_root / "products" / f"{product_id}.yaml"
-    product = parse_product_spec(parse_declarative_yaml(p_path))
-    d_path = config_root / "profiles" / "domains" / f"{product.domain_profile}.yaml"
-    s_path = config_root / "profiles" / "science" / f"{product.science_profile}.yaml"
-    src1_path = config_root / "profiles" / "sources" / f"{product.primary_source_profile}.yaml"
-    src2_path = config_root / "profiles" / "sources" / f"{product.candidate_source_profile}.yaml"
-    o_path = config_root / "profiles" / "outputs" / f"{product.output_profile}.yaml"
-
+    """Load and hash the same bytes for the product and each referenced profile."""
     hasher = hashlib.sha256()
-    for path in (p_path, d_path, s_path, src1_path, src2_path, o_path):
-        hasher.update(path.read_bytes())
 
+    def read(folder: str, ident: str, key: str = "profile_id") -> dict[str, object]:
+        _require_segment(ident, key)
+        path = config_root / folder / f"{ident}.yaml"
+        data = path.read_bytes()
+        hasher.update(data)
+        doc = _parse_yaml_text(path, data.decode("utf-8"))
+        if doc.get(key) != ident:
+            raise ValueError(f"{path}: {key} must match the filename")
+        return doc
+
+    product = parse_product_spec(read("products", product_id, "product_id"))
+    _require_segment(product.model_id, "model_id")
     return LoadedBundle(
         product=product,
-        domain=parse_domain_profile(parse_declarative_yaml(d_path)),
-        science=parse_science_profile(parse_declarative_yaml(s_path)),
-        primary_source=parse_forcing_profile(parse_declarative_yaml(src1_path)),
-        candidate_source=parse_forcing_profile(parse_declarative_yaml(src2_path)),
-        output=parse_output_profile(parse_declarative_yaml(o_path)),
+        domain=parse_domain_profile(read("profiles/domains", product.domain_profile)),
+        science=parse_science_profile(read("profiles/science", product.science_profile)),
+        primary_source=parse_forcing_profile(
+            read("profiles/sources", product.primary_source_profile)
+        ),
+        candidate_source=parse_forcing_profile(
+            read("profiles/sources", product.candidate_source_profile)
+        ),
+        output=parse_output_profile(read("profiles/outputs", product.output_profile)),
         config_sha256=hasher.hexdigest(),
     )
 
 
-def validate_bundle(b: LoadedBundle) -> tuple[int, int, tuple[int, ...]]:
-    """Validate horizon SLA, fail-closed candidate source, and vertical BL stretch."""
-    remaining_floor = validate_horizon_policy(b.product, b.primary_source, b.output)
+def validate_bundle(
+    b: LoadedBundle, *, publish_origin_utc: str | None = None
+) -> tuple[int, int, tuple[int, ...]]:
+    """Validate horizon SLA, candidate source, vertical BL stretch, and Zarr v3 store schema."""
+    if b.output.schema_id != ZARR_SCHEMA_ID:
+        raise ValueError(
+            f"OutputProfile.schema_id '{b.output.schema_id}' != locked '{ZARR_SCHEMA_ID}'"
+        )
+    validate_source_recipe(b.primary_source)
+    remaining_floor = validate_horizon_policy(
+        b.product, b.primary_source, b.output, publish_origin_utc=publish_origin_utc
+    )
+    compile_wrf_namelist_sections(b.domain, b.science, b.primary_source)
     if not b.candidate_source.fail_closed:
         raise ValueError("Candidate ForcingProfile must enforce fail_closed=True")
     bl_counts = [
         validate_vertical_column(
-            estimate_auto_levels_agl_m(b.domain, elev_m, etac=b.science.etac), b.domain
+            estimate_auto_levels_agl_m(
+                b.domain,
+                elev_m,
+                etac=b.science.etac,
+                base_temp_k=b.science.base_temp_k,
+            ),
+            b.domain,
         )
         for elev_m in b.domain.terrain_elevations_m
     ]
-    return remaining_floor, min(bl_counts), selected_lead_hours(b.output)
+    leads = selected_lead_hours(b.output)
+    build_zarr_v3_store_metadata(b.domain, b.output, leads)
+    return remaining_floor, min(bl_counts), leads

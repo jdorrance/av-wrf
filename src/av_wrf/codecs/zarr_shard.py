@@ -1,5 +1,9 @@
 """ZEP-0002 sharding_indexed binary encoder/decoder, tile-cap guard, and coordinate chunks.
 
+Uses exact configured `inner_chunk_yx` (canonical `[64, 64]`) on all grids by padding outer shard
+shapes `(ceil(ny / iy) * iy, ceil(nx / ix) * ix)` and filling partial edge pixels with `NaN`,
+matching Zarr v3 / ZEP-0002 `zarr.open_group` semantics across composite and prime grid sizes.
+
 References:
 - ZEP-0002 sharding binary layout: https://zarr.dev/zeps/accepted/ZEP0002.html
 - Zarr v3 codecs (`bytes`, `zstd`, `crc32c`): https://zarr.readthedocs.io/en/stable/api/zarr/codecs/
@@ -26,8 +30,6 @@ from av_wrf.core import published_grid_origin_xy_m, published_grid_shape
 
 EMPTY_CHUNK_SENTINEL = 0xFFFFFFFFFFFFFFFF
 MAX_SPATIAL_TILES_PER_FRAME = 64
-MIN_LARGE_GRID_AXIS = 24
-MIN_LARGE_GRID_CHUNK = 8
 
 
 def _make_crc32c_table() -> tuple[int, ...]:
@@ -51,63 +53,63 @@ def crc32c_u32(payload: bytes) -> int:
     return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
 
 
-def divisor_chunk(full_len: int, target: int) -> int:
-    """Pick largest chunk size <= min(full_len, target) that evenly divides full_len."""
-    cap = min(full_len, max(1, target))
-    for candidate in range(cap, 0, -1):
-        if full_len % candidate == 0:
-            return candidate
-    return 1
-
-
 def resolve_inner_chunk_yx(ny: int, nx: int, output: OutputProfile) -> tuple[int, int]:
-    """Resolve `(iy, ix)` inner chunk dimensions and fail closed on pathological 1x1 tiling."""
-    iy = divisor_chunk(ny, output.inner_chunk_yx[0])
-    ix = divisor_chunk(nx, output.inner_chunk_yx[1])
-    spatial_tiles = (ny // iy) * (nx // ix)
-    bad_y = ny >= MIN_LARGE_GRID_AXIS and iy < MIN_LARGE_GRID_CHUNK
-    bad_x = nx >= MIN_LARGE_GRID_AXIS and ix < MIN_LARGE_GRID_CHUNK
-    if bad_y or bad_x or spatial_tiles > MAX_SPATIAL_TILES_PER_FRAME:
+    """Return exact `(iy, ix)` inner chunk dimensions and enforce `MAX_SPATIAL_TILES_PER_FRAME`."""
+    if ny < 1 or nx < 1:
+        raise ValueError(f"Published grid dimensions must be >= 1, got ({ny}, {nx})")
+    iy, ix = output.inner_chunk_yx
+    if iy < 1 or ix < 1:
+        raise ValueError(f"inner_chunk_yx dimensions must be >= 1, got {(iy, ix)}")
+    tiles_y = (ny + iy - 1) // iy
+    tiles_x = (nx + ix - 1) // ix
+    spatial_tiles = tiles_y * tiles_x
+    if spatial_tiles > MAX_SPATIAL_TILES_PER_FRAME:
         raise ValueError(
-            f"Published grid ({ny}x{nx}) yields degenerate {iy}x{ix} inner chunks "
-            f"({spatial_tiles} spatial tiles > {MAX_SPATIAL_TILES_PER_FRAME} cap); "
-            "choose composite published grid dimensions or matching inner_chunk_yx"
+            f"Published grid ({ny}x{nx}) with {iy}x{ix} inner chunks requires "
+            f"{spatial_tiles} spatial tiles (> {MAX_SPATIAL_TILES_PER_FRAME} cap)"
         )
     return iy, ix
 
 
+def outer_shard_yx(ny: int, nx: int, output: OutputProfile) -> tuple[int, int]:
+    """Return ZEP-0002 outer shard `(outer_ny, outer_nx)` padded to multiples of `(iy, ix)`."""
+    iy, ix = resolve_inner_chunk_yx(ny, nx, output)
+    return ((ny + iy - 1) // iy) * iy, ((nx + ix - 1) // ix) * ix
+
+
 def _pack_volume_shard(
-    vols_4d: npt.NDArray[np.float32],
+    frames: Sequence[npt.NDArray[np.float32]],
     output: OutputProfile,
     shard_time_steps: int,
 ) -> bytes:
-    n_frames, _, ny, nx = vols_4d.shape
+    n_frames = len(frames)
     if n_frames < 1 or n_frames > shard_time_steps:
         raise ValueError(f"Invalid frame count {n_frames} for shard_time_steps={shard_time_steps}")
-    if not bool(np.all(np.isfinite(vols_4d))):
-        raise ValueError("Refusing to encode non-finite float32 values into ZEP-0002 shard")
+    nz, ny, nx = frames[0].shape
     iy, ix = resolve_inner_chunk_yx(ny, nx, output)
-    spatial_tiles = (ny // iy) * (nx // ix)
+    ys, xs = range(0, ny, iy), range(0, nx, ix)
     body = bytearray()
     index = bytearray()
-    level = output.zstd_level
-    for s in range(shard_time_steps):
-        if s >= n_frames:
-            index.extend(
-                struct.pack("<QQ", EMPTY_CHUNK_SENTINEL, EMPTY_CHUNK_SENTINEL) * spatial_tiles
-            )
-            continue
-        frame_vol = vols_4d[s]
-        for ty in range(0, ny, iy):
-            for tx in range(0, nx, ix):
-                raw_le = np.ascontiguousarray(
-                    frame_vol[:, ty : ty + iy, tx : tx + ix], dtype="<f4"
-                ).tobytes()
-                comp = bytes(_zstd.compress(raw_le, level))
+    tile_buf = np.empty((nz, iy, ix), dtype="<f4")
+    for frame in frames:
+        if frame.shape != (nz, ny, nx) or not bool(np.all(np.isfinite(frame))):
+            raise ValueError("Mismatched shape or non-finite float32 values in ZEP-0002 shard")
+        for ty in ys:
+            vy = min(iy, ny - ty)
+            for tx in xs:
+                vx = min(ix, nx - tx)
+                if vy < iy or vx < ix:
+                    tile_buf.fill(np.nan)
+                tile_buf[:, :vy, :vx] = frame[:, ty : ty + vy, tx : tx + vx]
+                comp = _zstd.compress(tile_buf, output.zstd_level)
                 index.extend(struct.pack("<QQ", len(body), len(comp)))
                 body.extend(comp)
+    tail = (shard_time_steps - n_frames) * len(ys) * len(xs)
+    index.extend(struct.pack("<QQ", EMPTY_CHUNK_SENTINEL, EMPTY_CHUNK_SENTINEL) * tail)
     footer_crc = struct.pack("<I", crc32c_u32(bytes(index)))
-    return bytes(body) + bytes(index) + footer_crc
+    body.extend(index)
+    body.extend(footer_crc)
+    return bytes(body)
 
 
 def encode_2d_shard_bytes(
@@ -119,11 +121,8 @@ def encode_2d_shard_bytes(
     """Encode 1..shard_time_steps Published-Grid 2D slabs into a ZEP-0002 shard."""
     if not frames:
         raise ValueError("encode_2d_shard_bytes requires >= 1 frame")
-    ny, nx = frames[0].ny, frames[0].nx
-    stacked = np.stack(
-        [np.frombuffer(f.buf, dtype=np.float32).reshape(1, ny, nx) for f in frames], axis=0
-    )
-    return _pack_volume_shard(stacked, output, shard_time_steps)
+    views = [np.frombuffer(f.buf, dtype=np.float32).reshape(1, f.ny, f.nx) for f in frames]
+    return _pack_volume_shard(views, output, shard_time_steps)
 
 
 def encode_3d_shard_bytes(
@@ -135,11 +134,8 @@ def encode_3d_shard_bytes(
     """Encode 1..shard_time_steps Published-Grid 3D volumes into a ZEP-0002 shard."""
     if not frames:
         raise ValueError("encode_3d_shard_bytes requires >= 1 frame")
-    nz, ny, nx = frames[0].nz, frames[0].ny, frames[0].nx
-    stacked = np.stack(
-        [np.frombuffer(v.buf, dtype=np.float32).reshape(nz, ny, nx) for v in frames], axis=0
-    )
-    return _pack_volume_shard(stacked, output, shard_time_steps)
+    views = [np.frombuffer(v.buf, dtype=np.float32).reshape(v.nz, v.ny, v.nx) for v in frames]
+    return _pack_volume_shard(views, output, shard_time_steps)
 
 
 def verify_shard_index(
@@ -155,7 +151,7 @@ def verify_shard_index(
     if n_frames < 1 or n_frames > shard_time_steps:
         raise ValueError("Invalid n_frames / shard_time_steps for shard index verification")
     iy, ix = resolve_inner_chunk_yx(ny, nx, output)
-    spatial_tiles = (ny // iy) * (nx // ix)
+    spatial_tiles = len(range(0, ny, iy)) * len(range(0, nx, ix))
     n_tiles = shard_time_steps * spatial_tiles
     idx_len = n_tiles * 16
     if len(shard_bytes) < idx_len + 4:
@@ -193,7 +189,7 @@ def decode_shard_f32_array(
     nx: int,
     output: OutputProfile,
 ) -> npt.NDArray[np.float32]:
-    """Verify ZEP-0002 index + CRC-32C and decompress all populated tiles to a NumPy array."""
+    """Verify ZEP-0002 index + CRC-32C and decompress populated domain cells `(T, nz, ny, nx)`."""
     populated = shard_time_steps if n_frames is None else n_frames
     idx_raw, iy, ix, spatial_tiles = verify_shard_index(
         shard_bytes,
@@ -203,22 +199,26 @@ def decode_shard_f32_array(
         nx=nx,
         output=output,
     )
-    out_arr = np.full((shard_time_steps, nz, ny, nx), np.nan, dtype=np.float32)
+    out_arr = np.empty((shard_time_steps, nz, ny, nx), dtype=np.float32)
+    out_arr[populated:].fill(np.nan)
     tile_bytes = nz * iy * ix * 4
+    shard_view = memoryview(shard_bytes)
     for s in range(populated):
         sp_idx = 0
         for ty in range(0, ny, iy):
+            vy = min(iy, ny - ty)
             for tx in range(0, nx, ix):
+                vx = min(ix, nx - tx)
                 off, nbytes = struct.unpack_from("<QQ", idx_raw, (s * spatial_tiles + sp_idx) * 16)
                 sp_idx += 1
                 try:
-                    raw_tile = bytes(_zstd.decompress(shard_bytes[off : off + nbytes]))
+                    raw_tile = _zstd.decompress(shard_view[off : off + nbytes])
                 except Exception as exc:
                     raise ValueError(f"Corrupt Zstd payload in tile {sp_idx - 1}") from exc
                 if len(raw_tile) != tile_bytes:
                     raise ValueError("Corrupt Zstd inner chunk byte length")
                 tile_vals = np.frombuffer(raw_tile, dtype="<f4").reshape(nz, iy, ix)
-                out_arr[s, :, ty : ty + iy, tx : tx + ix] = tile_vals.astype(np.float32, copy=False)
+                out_arr[s, :, ty : ty + vy, tx : tx + vx] = tile_vals[:, :vy, :vx]
     return out_arr
 
 

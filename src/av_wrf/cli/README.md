@@ -6,6 +6,10 @@ Command-line argument router and the repository's sole `os.environ` reader.
 uv run av-wrf check
 ```
 
+Cycle commands require an explicit store URI. Set `AV_WRF_STORE_URI` for both
+staging and publication, or set `AV_WRF_STAGE_STORE_URI` and pass `--store-uri`
+to `publish` and `reconcile` for separate destinations.
+
 - **Allowed imports:** `av_wrf.contracts`, `av_wrf.runner`, `av_wrf.verify`,
   and Python CLI/env stdlib modules (`argparse`, `os` in `env.py` only).
 - **Forbidden:** hardcoded product/region defaults, physics math, file codecs,

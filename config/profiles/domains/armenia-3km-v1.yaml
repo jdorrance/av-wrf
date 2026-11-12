@@ -5,6 +5,9 @@
 # - `dem_source: default` / `landuse_source: default` resolves stock WPS v4.7 `GEOGRID.TBL.ARW`
 #   (`topo_gmted2010_30s` + `modis_landuse_20class_30s_with_lakes`); switch `dem_source` to a
 #   custom `GEOGRID.TBL` Copernicus GLO-30 entry once local WPS binary DEM tiles are staged.
+# - `dzbot_m: 50.0` places the lowest mass midpoint at ~25.3 m AGL in valleys and ~21.9 m AGL even
+#   after hybrid compression over 5,137 m Mount Ararat, keeping level 0 strictly above consumer
+#   `NATIVE_DIAGNOSTIC_PARAMETERS.minimumLevelAglM = 20 m`.
 # - `max_dz_m: 850.0` leaves >= 15% summer thermal-expansion headroom below `windy-av-layer`
 #   `maximumProfileGapM = 1000.0 m` (`packages/soaring/src/column.ts:159`).
 # - `terrain_elevations_m` checks 800 m Ararat valley, 4,090 m Mount Aragats, and 5,137 m Ararat.
@@ -29,11 +32,11 @@ e_vert: 55
 exported_levels_k: 40
 p_top_pa: 5000.0
 auto_levels_opt: 2
-dzbot_m: 34.0
+dzbot_m: 50.0
 dzstretch_s: 1.11
 dzstretch_u: 1.06
 max_dz_m: 850.0
-min_bl_levels_2km_agl: 18
+min_bl_levels_2km_agl: 17
 terrain_elevations_m: [800.0, 4090.0, 5137.0]
 dem_source: default
 landuse_source: default

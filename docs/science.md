@@ -46,13 +46,14 @@ their respective sides of the Zarr v3 contract:
    while `THM` stores $\theta_m - 300\text{ K} = \theta(1 + (R_v/R_d)q_v) - 300\text{ K}$
    ([WRF Users' Guide Ch. 5](https://www2.mmm.ucar.edu/wrf/users/docs/user_guide_v4/v4.4/users_guide_chap5.html),
    [WRF Forum #5569](https://forum.mmm.ucar.edu/threads/accessing-variables-on-head_grid.5569/)).
-   `codecs/wrf_nc.py` cross-checks `T` and `THM` across every cell on every slice.
+   The NetCDF reader checks `T` and `THM` on exported levels and rejects masked
+   or invalid values at the file boundary.
 2. **Specific humidity & omission of `rhPercent`:** WRF `QVAPOR` and `Q2` are
    water-vapor mixing ratios $r$ (`kg/kg dry air`), converted via $q = r / (1 + r)$.
    Model-level `rhPercent` is intentionally omitted because `windy-av-layer`
    (`packages/forecast/src/native-fields.ts`) computes dewpoint directly from
    `spfhKgKg` and `pressurePa`, matching `ICON-EU` and `RRFS`.
-3. **2 m Bolton liquid-saturation guard (`clamp_spfh_2m_to_liquid_sat`):** WRF's
+3. **2 m Bolton liquid-saturation guard (`clamp_spfh_2m_vec`):** WRF's
    Revised MM5 surface layer (`sf_sfclay_physics = 1`) diagnoses `Q2` from
    Monin–Obukhov similarity without liquid-water saturation adjustment, so `Q2`
    can exceed `105%` RH WRT liquid water in nocturnal radiation or freezing fog.
@@ -60,62 +61,66 @@ their respective sides of the Zarr v3 contract:
    ($e_s = 6.112 \exp(17.67 T_c / (T_c + 243.5))\text{ hPa}$, $\epsilon = 0.622$)
    with $2^{-14}$ mantissa headroom so `keepbits = 15` rounding never exceeds `100%` RH.
 
-## 3. Vertical Coordinate, Mountain Compression, & Consumer `1,000 m` Gap Limit
+## 3. Vertical Coordinate, Mountain Compression, & Consumer `20 m` / `1,000 m` Gates
 
-1. **Log-pressure stretching & cubic hybrid coordinate (`core/vertical.py`):**
+1. **WRF `SUBROUTINE levels` (`auto_levels_opt = 2`) & cubic hybrid coordinate (`core/vertical.py`):**
    Following [Skamarock et al. (2019, Eqs. 2.2–2.6 & 5.3–5.7)](https://www2.mmm.ucar.edu/wrf/users/docs/technote/v4_technote.pdf)
-   and [WRF Real-Data Initialization](https://www2.mmm.ucar.edu/wrf/site/users_guide/real_initialization.html),
+   and [`dyn_em/module_initialize_real.F`](https://github.com/wrf-model/WRF/blob/v4.8.0/dyn_em/module_initialize_real.F),
    `auto_levels_opt = 2` (`e_vert = 55`) stretches domain-wide $\eta \in [1, 0]$
-   levels in log-pressure (`T0 = 300 K`) down to `p_top_pa = 5,000 Pa`, and
-   `hybrid_opt = 2` (`etac = 0.2`) maps them over elevated terrain via:
+   levels using isothermal `tt = 290 K`, clamped `(dzmax/2 - dz)/(dzmax/2)` blend
+   from `dzstretch_s` to `dzstretch_u`, and constant-`dz` upper fill down to
+   `p_top_pa = 5,000 Pa`. WRF limits that fill to `1.5 * max_dz`. `hybrid_opt = 2`
+   (`etac = 0.2`) maps the faces over terrain using
    $$p_d(\eta) = B(\eta)(\bar{p}_s - p_t) + [\eta - B(\eta)] \, (p_0 - p_t) + p_t$$
-   `av-wrf check` verifies `e_vert` reaches `p_top_pa` and $\Delta p_d > 0$ across
-   `terrain_elevations_m`, while `wrf_nc.py` validates solver-emitted `ZNW` and
-   `post.py`/`publish.py` enforce `pressure_pa[0] <= surface_pressure_pa` and
-   strictly decreasing column pressure across every cell.
-2. **Summer thermal-expansion headroom (`max_dz_m <= 900 m` vs. `1,000 m`):**
+   `av-wrf check` and `plan` verify `e_vert` reaches `p_top_pa` and $\Delta p_d > 0$
+   across `terrain_elevations_m`. The reference column uses WRF's default 200 K
+   isothermal floor. `solve` verifies `ZNW` and checks initialized column geometry
+   immediately after `real.exe`. `post` and `publish` enforce column pressure order.
+2. **Lowest mass midpoint vs. consumer `minimumLevelAglM = 20 m`:** `windy-av-layer`
+   (`NATIVE_DIAGNOSTIC_PARAMETERS.minimumLevelAglM = 20`) discards any model level
+   at or below `20.0 m` AGL. Shipped domain profiles use `dzbot_m = 50.0` (placing
+   level 0 at `~25.3 m` AGL in valleys and `~21.9 m` AGL even over `5,137 m` Mount
+   Ararat), and both `vertical.py` and `post.py` reject `level[0] <= 20.0 m` AGL
+   and count only usable levels in `(20, 2000]` m AGL toward `min_bl_levels_2km_agl`.
+   In an archived pilot initialization, reducing `dzstretch_s` from 1.11 to 1.09
+   raised the minimum count from 17 to 19 and lowered the lowest column top from
+   7.65 km to 5.95 km AGL. The shipped stretch preserves upper coverage.
+3. **Summer thermal-expansion headroom (`max_dz_m <= 900 m` vs. `1,000 m`):**
    `windy-av-layer` (`packages/soaring/src/column.ts:159`) rejects an **entire
    column as `unavailable`** if any adjacent level gap exceeds `maximumProfileGapM = 1,000 m`.
    `vertical.py` enforces `max_dz_m <= 900 m` (`850 m` in shipped domain profiles),
    and `post.py` verifies actual exported `height_msl_m - terrain_m` gaps.
-3. **First mass midpoint vs. consumer `minimumLevelAglM = 20 m`:** With
-   `dzbot_m = 34 m` ($\ge 25\text{ m}$ coupled surface-layer stability floor per
-   [WRF Forum #8325](https://forum.mmm.ucar.edu/threads/increase-eta-level-and-decrease-dzbot.8325/)),
-   the lowest mass midpoint sits at `~15–17 m` AGL.
 
-## 4. Winds, Vertical Velocity, MSLP, Gusts, Clouds, and CAPE
+## 4. Winds, Vertical Velocity, MSLP, Surface Fluxes, and CAPE
 
-1. **Grid-to-Earth wind rotation & output-frame Courant proxy (`core/namelist.py`, `core/post.py`):**
+1. **Grid-to-Earth wind rotation & solver vs. diagnostic CFL (`core/namelist.py`, `runner/solver_exec.py`):**
    WRF `SINALPHA = -sin(theta_lambert)` where $\theta = n(\lambda - \lambda_0)$
    ([`wrf-python` #142](https://github.com/NCAR/wrf-python/issues/142)). Actual RK3
-   substep stability is gated on `namelist.py` (`\Delta t \le 6 \Delta x_{\text{phys}}`)
-   and `wrf.exe` completion; `DiagnosticsReceipt.max_cfl` records an explicit
-   output-frame Courant proxy over finite exported fields.
-2. **Hydrostatic $\omega$ round-trip (`geometric_w_to_omega_pas`):** Nonhydrostatic
+   substep stability is gated on `namelist.py` (`\Delta t \le 6 \Delta x_{\text{phys}}`),
+   solver logs, and `wrf.exe` completion. `DiagnosticsReceipt.max_cfl`
+   uses grid-relative output winds and nominal cell spacing as a diagnostic proxy.
+2. **Hydrostatic $\omega$ round-trip (`geometric_w_to_omega_vec`):** Nonhydrostatic
    WRF outputs geometric $w = dz/dt$ (`m/s`). `av-wrf` converts via hydrostatic
    $\omega = -\rho_m g w$ so `windy-av-layer` (`geometricWFromOmegaMps`) recovers
    mountain-wave $w$ cleanly.
-3. **10 m wind gusts (`parameterized_gust_10m_mps`):** Aggregates `WSPD10MAX`
-   across every hourly history dump in `(t_prev, t_curr]` (so `3 h` tail steps
-   retain peak gusts from intermediate hours) and combines with the
-   [Panofsky et al. (1977)](https://www.pmf.unizg.hr/_download/repository/tb1_ch2.pdf) /
-   [ECMWF IFS `10fg`](https://codes.ecmwf.int/grib/param-db/49) turbulent-convective
-   increment $\Delta V_{\text{turb}} = 7.71 (u_*^3 + \frac{0.5 \kappa}{12} w_*^3)^{1/3}$
-   using actual surface density $\rho_{\text{sfc}} = p_{\text{sfc}} / (R_d T_{v0})$.
+3. **10 m gust and flux time support:** The endpoint gust estimate uses native
+   `U10`, `V10`, `UST`, `HFX`, `LH`, and `PBLH` for a turbulent increment.
+   Exported sensible and latent fluxes use signed `ACHFX` and `ACLHF` differences.
+   Precipitation uses bucket-adjusted `RAINC + RAINNC`. All three accumulators
+   share the full interval between published valid times, so tail rain totals
+   can be recovered by integrating the reported rate. A shorter heat window
+   requires its own time support in the consumer contract.
 4. **Plateau MSLP (`AFWA_MSLP` / `hypsometric_mslp_vec`):** Uses WRF's native
    `AFWA_MSLP` (`afwa_diag_opt = 1`) when present in `wrfout` and falls back to a
    $C^0$-continuous WMO / Shuell plateau reduction (`tv_sl` capped smoothly at
    `290.5 K` when `tv_0 <= 290.5 K` with zero discontinuity across temperature branches).
-5. **Signed heat fluxes & rainfall buckets (`core/post.py`):** Stock WRF v4.8
-   outputs signed `ACHFX` and `ACLHF` without integer bucket counters (`I_ACHFX`/`I_ACLHF`
-   do not exist in `Registry.EM_COMMON`), so `post_frame` differences signed `ACHFX`
-   and `ACLHF` directly across `(t_prev, t_curr]` while retaining `I_RAINC` and
-   `I_RAINNC` (`bucket_mm = 100.0`) for cumulative precipitation.
-6. **CAPE provenance (`afwa_buoy_opt = 1`):** Enabling `afwa_buoy_opt = 1` in `&afwa`
-   ([`registry.afwa`](https://github.com/wrf-model/WRF/blob/v4.8.0/Registry/registry.afwa))
-   computes `AFWA_CAPE` and `AFWA_CAPE_MU` directly in `module_diag_afwa.F` without
-   requiring Thompson aerosol-aware graupel number concentration; `wrf_nc.py`
-   reads `AFWA_CAPE_MU` when present and falls back to `AFWA_CAPE`.
+5. **CAPE provenance (`afwa_buoy_opt = 1`, strict `AFWA_CAPE_MU`):** Enabling
+   `afwa_buoy_opt = 1` in `&afwa` ([`registry.afwa`](https://github.com/wrf-model/WRF/blob/v4.8.0/Registry/registry.afwa))
+   computes `AFWA_CAPE_MU`. WRF starts at the surface and searches for maximum
+   equivalent potential temperature at pressures above the absolute `500 hPa`
+   cutoff ([`module_diag_functions.F`](https://github.com/wrf-model/WRF/blob/v4.8.0/phys/module_diag_functions.F#L517-L562)).
+   The Zarr group records this method. The provisional catalog's 300 hPa label
+   needs a consumer contract migration.
 
 ## 5. Comparison Against Dr. Jack Glendening (RASP / BLIPMAP) & Operational Caveats
 

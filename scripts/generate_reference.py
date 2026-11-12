@@ -62,10 +62,11 @@ def _render_products_section(repo: Path) -> list[str]:
     for yaml_path in sorted((repo / "config" / "products").glob("*.yaml")):
         info = check_product_config(repo / "config", yaml_path.stem)
         nj, ni = info.published_yx
+        recipe = "recipe available" if info.candidate_recipe_available else "no solve recipe"
         out.append(
             f"- `{info.product_id}`: published grid `{ni} x {nj}` (`x0M = {info.x0_m:.1f}`, "
             f"`y0M = {info.y0_m:.1f}`), primary `{info.primary_source}` "
-            f"(candidate `{info.candidate_source}`), `{info.lead_count}` leads, "
+            f"(candidate `{info.candidate_source}`, {recipe}), `{info.lead_count}` leads, "
             f"`{info.bl_levels_2km}` BL levels (`0-2 km` AGL), "
             f"remaining-horizon floor `{info.remaining_horizon_floor_hours} h`, "
             f"`time_step = {info.time_step_s} s`."
