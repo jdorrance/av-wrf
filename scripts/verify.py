@@ -44,7 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     _run_step("ruff-lint", ["ruff", "check"])
     _run_step("ruff-format", ["ruff", "format", "--check"])
     _run_step("mypy-strict", ["mypy"])
-    _run_step("pytest", ["pytest", "-m", "not container"])
+    _run_step("pytest", ["pytest"])
     if shutil.which("git") and (ROOT / ".git").exists():
         _run_step("git-whitespace-check", ["git", "diff", "--check"])
     print("verify: ALL GATES PASSED")

@@ -119,5 +119,4 @@ markers = [
   "property: Hypothesis property-based invariant tests",
   "contract: windy-av-layer wrf-zarr-v3 wire conformance tests",
   "integration: local filesystem store and recovery tests",
-  "container: Linux OCI WRF/WPS solver smoke tests",
 ]

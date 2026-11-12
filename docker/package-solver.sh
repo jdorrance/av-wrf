@@ -20,26 +20,4 @@ for table in RRTMG_LW_DATA RRTMG_SW_DATA LANDUSE.TBL NoahmpTable.TBL; do
     test -s "$wrf_run/$table"
 done
 
-python3 - <<'PY'
-import hashlib
-import json
-import pathlib
-import subprocess
-
-def version(*args):
-    return subprocess.check_output(args, text=True).splitlines()[0].strip()
-
-manifest = {
-    "wrf_sha": version("git", "-C", "WRF", "rev-parse", "HEAD"),
-    "wps_sha": version("git", "-C", "WPS", "rev-parse", "HEAD"),
-    "patch_sha256s": [
-        [patch.name, hashlib.sha256(patch.read_bytes()).hexdigest()]
-        for patch in sorted(pathlib.Path("patches").glob("*.patch"))
-    ],
-    "compiler": "gfortran-" + version("gfortran", "-dumpfullversion"),
-    "mpi": version("mpirun", "--version"),
-}
-pathlib.Path("/opt/av-wrf/build-manifest.json").write_text(
-    json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-)
-PY
+python3 "$(dirname "$0")/write-build-manifest.py" "$prefix/build-manifest.json"

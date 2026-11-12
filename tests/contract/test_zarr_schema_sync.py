@@ -30,7 +30,6 @@ from av_wrf.codecs import (  # noqa: E402
     zarr_shard_relpath,
 )
 from av_wrf.contracts import (  # noqa: E402
-    CAPE_PARCEL_DEFINITION,
     DEFAULT_INNER_SPATIAL_CHUNK,
     DEFAULT_SHARD_TIME_STEP,
     LOW_CLOUD_DEFINITION,
@@ -61,7 +60,7 @@ from av_wrf.runner import load_bundle  # noqa: E402
 
 
 class TestVendorZarrContract(unittest.TestCase):
-    def test_python_zarr_schema_matches_vendored_json_contract_completely(self) -> None:
+    def test_python_zarr_schema_matches_vendored_layout(self) -> None:
         schema_path = ROOT / "vendor" / "producer-contract" / "wrf-zarr-v3.schema.json"
         raw = json.loads(schema_path.read_text(encoding="utf-8"))
         self.assertEqual(raw["schemaId"], ZARR_SCHEMA_ID)
@@ -70,7 +69,10 @@ class TestVendorZarrContract(unittest.TestCase):
         self.assertEqual(raw["zarrFormat"], ZARR_FORMAT_VERSION)
         self.assertEqual(raw["moistureSourceOfTruth"], MOISTURE_SOURCE_OF_TRUTH)
         self.assertEqual(raw["temperatureDefinition"], TEMPERATURE_DEFINITION)
-        self.assertEqual(raw["capeParcelDefinition"], CAPE_PARCEL_DEFINITION)
+        # The provisional catalog retains this label until the consumer migrates.
+        self.assertEqual(
+            raw["capeParcelDefinition"], "afwa-mucape-lowest-300hpa-virtual-temp-undiluted"
+        )
         self.assertEqual(raw["lowCloudDefinition"], LOW_CLOUD_DEFINITION)
         self.assertEqual(raw["earthRadiusM"], WRF_SPHERE_RADIUS_M)
         self.assertEqual(raw["maxVerticalLevels"], MAX_EXPORTED_LEVELS)
@@ -139,6 +141,11 @@ class TestVendorZarrContract(unittest.TestCase):
             leads = selected_lead_hours(b.output)
             docs = build_zarr_v3_store_metadata(b.domain, b.output, leads)
             self.assertEqual(len(docs), 30)
+            group_attrs = docs["zarr.json"]["attributes"]
+            assert isinstance(group_attrs, dict)
+            self.assertEqual(
+                group_attrs["cape_parcel_definition"], "afwa-mucape-max-theta-e-pressure-gt-500hpa"
+            )
             nj, ni = published_grid_shape(b.domain)
             temp_meta = docs["temp_k/zarr.json"]
             self.assertEqual(temp_meta["shape"], [len(leads), b.domain.exported_levels_k, nj, ni])

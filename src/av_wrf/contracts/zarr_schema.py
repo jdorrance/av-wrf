@@ -17,8 +17,9 @@ ZARR_SCHEMA_STATUS = "provisional-phase-1"
 ZARR_FORMAT_VERSION = 3
 MOISTURE_SOURCE_OF_TRUTH = "spfh_kgkg"
 TEMPERATURE_DEFINITION = "sensible-air-temperature-k"
-# Locked provisional catalog label. The Zarr group records the native WRF parcel method.
-CAPE_PARCEL_DEFINITION = "afwa-mucape-lowest-300hpa-virtual-temp-undiluted"
+# WRF v4.8 searches for maximum equivalent potential temperature at p > 500 hPa.
+# https://github.com/wrf-model/WRF/blob/v4.8.0/phys/module_diag_functions.F#L517-L562
+CAPE_PARCEL_DEFINITION = "afwa-mucape-max-theta-e-pressure-gt-500hpa"
 LOW_CLOUD_DEFINITION = "ecmwf-sigma-ge-0p8-max-random-overlap"
 WRF_SPHERE_RADIUS_M = 6_370_000.0
 MAX_EXPORTED_LEVELS = 40

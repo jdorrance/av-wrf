@@ -1,0 +1,26 @@
+name: images
+
+on:
+  pull_request:
+    paths: ['docker/**', 'pyproject.toml', 'uv.lock', '.github/workflows/images.yml']
+  push:
+    branches: [main]
+    paths: ['docker/**', 'pyproject.toml', 'uv.lock', '.github/workflows/images.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  images:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker buildx build --load --target runtime -f docker/Dockerfile -t av-wrf:runtime .
+      - run: docker run --rm --network none av-wrf:runtime check
+      - run: docker run --rm --network none --entrypoint dpkg-query av-wrf:runtime -W ca-certificates libzstd1
+      - run: >-
+          docker buildx build --load --target solver --build-arg JOBS=2
+          -f docker/Dockerfile -t av-wrf:solver .
+      - run: docker run --rm --network none av-wrf:solver check

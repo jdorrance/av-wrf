@@ -11,6 +11,7 @@ import math
 
 from av_wrf.codecs.zarr_shard import outer_shard_yx, resolve_inner_chunk_yx
 from av_wrf.contracts import (
+    CAPE_PARCEL_DEFINITION,
     LOW_CLOUD_DEFINITION,
     MOISTURE_SOURCE_OF_TRUTH,
     TEMPERATURE_DEFINITION,
@@ -163,8 +164,7 @@ def build_zarr_v3_store_metadata(
                 "vertical_coordinate": "model-levels",
                 "moisture_source_of_truth": MOISTURE_SOURCE_OF_TRUTH,
                 "temperature_definition": TEMPERATURE_DEFINITION,
-                # WRF v4.8 Buoyancy selects max theta-e where pressure exceeds 500 hPa.
-                "cape_parcel_definition": "afwa-mucape-max-theta-e-pressure-gt-500hpa",
+                "cape_parcel_definition": CAPE_PARCEL_DEFINITION,
                 "low_cloud_definition": LOW_CLOUD_DEFINITION,
                 "lead_hours": list(lead_hours),
                 "crs_wkt": published_crs_wkt(domain),

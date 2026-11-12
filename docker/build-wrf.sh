@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+wrf_tag=${1:?WRF tag is required}
+jobs=${2:?Build job count is required}
+
+# The classic build expects NetCDF headers, tools and libraries under one prefix.
+multiarch=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
+mkdir -p "$NETCDF/lib"
+ln -s /usr/include /usr/bin "$NETCDF/"
+ln -s "/usr/lib/$multiarch"/libnetcdf* "$NETCDF/lib/"
+
+git clone --depth 1 --branch "$wrf_tag" https://github.com/wrf-model/WRF.git
+git -C WRF submodule update --init --depth 1 -- \
+    phys/noahmp phys/physics_mmm phys/MYNN-EDMF phys/MYNN-SFC phys/TEMPO phys/GFL
 for patch in patches/wrf-*.patch; do
     if [[ -f "$patch" ]]; then git -C WRF apply "/build/$patch"; fi
 done
@@ -19,5 +31,5 @@ sed -i -E 's/ -(march|mcpu)=native//g; s/ -f90=\$\(SFC\)//; s/ -cc=\$\(SCC\)//' 
 # WRF 4.8's classic Makefile omits the module order for the new Shin-Hong PBL.
 printf '\n%s\n' 'physics_mmm/bl_shinhong.o: ccpp_kind_types.o' \
     'module_bl_shinhong.o: physics_mmm/bl_shinhong.o' >> phys/Makefile
-./compile -j "$1" em_real
+./compile -j "$jobs" em_real
 test -x main/wrf.exe && test -x main/real.exe

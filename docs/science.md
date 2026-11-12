@@ -82,9 +82,9 @@ their respective sides of the Zarr v3 contract:
    level 0 at `~25.3 m` AGL in valleys and `~21.9 m` AGL even over `5,137 m` Mount
    Ararat), and both `vertical.py` and `post.py` reject `level[0] <= 20.0 m` AGL
    and count only usable levels in `(20, 2000]` m AGL toward `min_bl_levels_2km_agl`.
-   In an archived pilot initialization, reducing `dzstretch_s` from 1.11 to 1.09
-   raised the minimum count from 17 to 19 and lowered the lowest column top from
-   7.65 km to 5.95 km AGL. The shipped stretch preserves upper coverage.
+   On the archived pilot's 38 exported levels, reducing `dzstretch_s` from 1.11
+   to 1.09 raised the minimum count from 17 to 19 and lowered the minimum column
+   top from 6.43 km to 4.98 km AGL.
 3. **Summer thermal-expansion headroom (`max_dz_m <= 900 m` vs. `1,000 m`):**
    `windy-av-layer` (`packages/soaring/src/column.ts:159`) rejects an **entire
    column as `unavailable`** if any adjacent level gap exceeds `maximumProfileGapM = 1,000 m`.

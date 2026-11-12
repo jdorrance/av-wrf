@@ -216,6 +216,19 @@ def _exec_mpi_step(
                 raise RuntimeError(f"Solver CFL violation detected in {rsl_file.name}")
 
 
+def _link_run_tables(run_tables: Path, attempt_dir: Path) -> None:
+    """Link WRF physics tables. Skip the real/wrf/ndown/tc binaries shipped in run/."""
+    if not run_tables.is_dir():
+        raise FileNotFoundError(f"Missing WRF runtime tables directory: {run_tables}")
+    for item in sorted(run_tables.iterdir()):
+        if (
+            item.is_file()
+            and not item.name.startswith("namelist")
+            and item.name not in {"real", "wrf", "ndown", "tc"}
+        ):
+            _link_file(item, attempt_dir / item.name)
+
+
 def _execute_solver_binaries(
     attempt_dir: Path,
     b: LoadedBundle,
@@ -230,12 +243,7 @@ def _execute_solver_binaries(
         [str(_resolve_solver_exe(solver_prefix, "metgrid.exe"))], cwd=attempt_dir, check=True
     )
     mg_lvls, mg_soil = _inspect_metgrid_dims(attempt_dir, b, lock)
-    run_tables = solver_prefix / "share" / "wrf" / "run"
-    if not run_tables.is_dir():
-        raise FileNotFoundError(f"Missing WRF runtime tables directory: {run_tables}")
-    for item in sorted(run_tables.iterdir()):
-        if item.is_file() and not item.name.startswith("namelist"):
-            _link_file(item, attempt_dir / item.name)
+    _link_run_tables(solver_prefix / "share" / "wrf" / "run", attempt_dir)
     namelist = compile_wrf_run_namelist(
         b.domain,
         b.science,

@@ -10,16 +10,18 @@ docker buildx build --load --platform linux/arm64 --target solver \
 docker run --rm av-wrf:solver check
 ```
 
-Both targets install Python dependencies from `uv.lock`. The solver uses
-[WRF](https://github.com/wrf-model/WRF/releases) and
-[WPS](https://github.com/wrf-model/WPS/releases) with their classic GNU builds.
-The WPS classic build keeps GRIB2 decoding on the tested path.
-[WPS ungrib build issue](https://github.com/wrf-model/WPS/issues/279)
+Both targets ship the installed app and config. BuildKit mounts the sources
+for `uv sync` and caches dependencies from `uv.lock`. The solver caches its
+native libraries and link checks before copying the app.
+[Astral Docker guide](https://docs.astral.sh/uv/guides/integration/docker/)
 
-[`build-wrf.sh`](build-wrf.sh) and [`build-wps.sh`](build-wps.sh) compile in separate layers.
-[`package-solver.sh`](package-solver.sh) installs the five runtime executables,
-their data tables, the JasPer shared library and a build manifest. The final
-solver stage verifies dynamic linkage.
+BuildKit mounts each script only for its layer. [`build-jasper.sh`](build-jasper.sh)
+builds the GRIB2 library. [`build-wrf.sh`](build-wrf.sh) and
+[`build-wps.sh`](build-wps.sh) check out and compile the native solvers.
+[`package-solver.sh`](package-solver.sh) collects their runtime files and
+writes the manifest. [`check-solver.sh`](check-solver.sh) checks the packaged
+executables and libraries in the final image.
+[WPS CMake ungrib issue](https://github.com/wrf-model/WPS/issues/279)
 
 Mount WPS geography at the configured `geog_data_path`. Run `geog`, pass its
 `geo_em.d01.nc` to `plan` and `solve`, and use `forcing-manifest` to seal the

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+git clone --depth 1 --branch "$1" https://github.com/wrf-model/WPS.git WPS
 for patch in patches/wps-*.patch; do
     if [[ -f "$patch" ]]; then git -C WPS apply "/build/$patch"; fi
 done
