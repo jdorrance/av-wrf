@@ -4,7 +4,9 @@ from dataclasses import replace
 from pathlib import Path
 
 import netCDF4
+import numpy as np
 import pytest
+from scripts.audit_forecast import _radiation_counts, _read_native
 
 from av_wrf.codecs import read_wrfout_baseline_nc, read_wrfout_step_nc
 from tests.integration.test_netcdf_boundary import _small_domain_and_science, _write_real_wrfout
@@ -23,9 +25,12 @@ def test_rrtmg_surface_shortwave_admission(tmp_path: Path) -> None:
         ds.createVariable("SWDNB", "f4", dims)[:] = 100.0
         ds.createVariable("SWUPB", "f4", dims)[:] = 35.0
         ds.createVariable("ALBEDO", "f4", dims, fill_value=-9999.0)[:] = 0.3
+        for name in ("SWNORM", "SWDNT", "SWUPT"):
+            ds.createVariable(name, "f4", dims)[:] = 0.0
         for name, value in (("SWDNB", 0.0), ("SWUPB", -0.005), ("ALBEDO", -9999.0)):
             ds.variables[name][0, 0, 0] = value
     read_wrfout_step_nc(path, domain, science, require_surface_shortwave=True)
+    assert _radiation_counts(_read_native(path, 0))["invalid_daylight_albedo"] == 0
 
     for name, bad, good, message in (
         ("ALBEDO", -9999.0, 0.3, "daylight ALBEDO"),
@@ -37,8 +42,29 @@ def test_rrtmg_surface_shortwave_admission(tmp_path: Path) -> None:
             ds.variables[name][0, 1, 1] = bad
         with pytest.raises(ValueError, match=message):
             read_wrfout_step_nc(path, domain, science, require_surface_shortwave=True)
+        counts = _radiation_counts(_read_native(path, 0))
+        if name == "ALBEDO":
+            assert counts["invalid_daylight_albedo"] == 1
+        elif bad < 0:
+            assert counts[f"negative_{name}"] == 1
+        else:
+            assert counts["excess_surface_reflection"] == 1
         with netCDF4.Dataset(str(path), mode="r+") as ds:
             ds.variables[name][0, 1, 1] = good
+
+
+@pytest.mark.parametrize("name", ("SWDOWN", "SWNORM", "SWDNB", "SWUPB", "SWDNT", "SWUPT"))
+def test_native_audit_rejects_nonfinite_flux_at_night(tmp_path: Path, name: str) -> None:
+    path = tmp_path / "radiation"
+    with netCDF4.Dataset(path, mode="w") as ds:
+        for dim in ("Time", "south_north", "west_east"):
+            ds.createDimension(dim, 1)
+        dims = ("Time", "south_north", "west_east")
+        for field in ("ALBEDO", "SWDOWN", "SWNORM", "SWDNB", "SWUPB", "SWDNT", "SWUPT"):
+            ds.createVariable(field, "f4", dims)[:] = 0.0
+        ds[name][:] = np.nan
+    with pytest.raises(ValueError, match=f"Invalid native radiation variable {name}"):
+        _read_native(path, 0)
 
 
 def test_live_mynn_history_requires_cloud_fraction(tmp_path: Path) -> None:

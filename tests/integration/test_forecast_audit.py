@@ -47,6 +47,19 @@ def _write_wrfout(path: Path, ready: ReadyReceipt, nx: int, ny: int, *, bad: boo
             ds["SWUPB"][1, ny // 2, nx // 2] = -199980.0
 
 
+def _solver_receipt(ready: ReadyReceipt, files: tuple[Path, ...]) -> SolverReceipt:
+    return SolverReceipt(
+        ready.model_id,
+        ready.cycle_partition,
+        ready.attempt_id,
+        ready.config_sha256,
+        ready.oci_digest,
+        "test-fixture-geog",
+        (),
+        tuple((path.name, sha256_file(path)) for path in files),
+    )
+
+
 @pytest.fixture
 def published_fixture(tmp_path: Path) -> tuple[ReadyReceipt, Path, int, int]:
     config = tmp_path / "config"
@@ -103,16 +116,7 @@ def test_audit_reports_hashed_native_frames(
     ]
     for bad in (False, True):
         _write_wrfout(wrfout, ready, nx, ny, bad=bad)
-        receipt = SolverReceipt(
-            ready.model_id,
-            ready.cycle_partition,
-            ready.attempt_id,
-            ready.config_sha256,
-            ready.oci_digest,
-            "test-fixture-geog",
-            (),
-            ((wrfout.name, sha256_file(wrfout)),),
-        )
+        receipt = _solver_receipt(ready, (wrfout,))
         solver_path.write_text(json.dumps(receipt.to_doc()))
         assert main(args) == int(bad)
         report = json.loads(output.read_bytes())
@@ -126,6 +130,50 @@ def test_audit_reports_hashed_native_frames(
     wrfout.write_bytes(b"tampered")
     with pytest.raises(ValueError, match="Object digest differs"):
         main(args)
+
+
+@pytest.mark.parametrize("domain_id", (1, 2))
+@pytest.mark.parametrize("fault", ("missing", "extra", "wrong_domain", "mixed_receipt"))
+def test_native_audit_rejects_inventory_drift(
+    tmp_path: Path,
+    published_fixture: tuple[ReadyReceipt, Path, int, int],
+    domain_id: int,
+    fault: str,
+) -> None:
+    ready, ready_path, nx, ny = published_fixture
+    wrfout = tmp_path / f"wrfout_d{domain_id:02d}_history"
+    _write_wrfout(wrfout, ready, nx, ny, bad=False)
+    receipt = _solver_receipt(ready, (wrfout,))
+    other = tmp_path / f"wrfout_d{3 - domain_id:02d}_history"
+    if fault == "missing":
+        wrfout.unlink()
+    elif fault == "extra":
+        (tmp_path / f"wrfout_d{domain_id:02d}_extra").write_bytes(wrfout.read_bytes())
+    elif fault == "wrong_domain":
+        wrfout.rename(other)
+    else:
+        other.write_bytes(wrfout.read_bytes())
+        receipt = _solver_receipt(ready, (wrfout, other))
+    solver_path = tmp_path / "solver_receipt.json"
+    solver_path.write_text(json.dumps(receipt.to_doc()))
+    with pytest.raises(ValueError, match="Object inventory differs"):
+        main([str(ready_path), f"--wrfout-dir={tmp_path}", f"--solver-receipt={solver_path}"])
+
+
+@pytest.mark.parametrize("domain_id", (1, 2))
+def test_native_audit_requires_exact_hashed_times(
+    tmp_path: Path, published_fixture: tuple[ReadyReceipt, Path, int, int], domain_id: int
+) -> None:
+    ready, ready_path, nx, ny = published_fixture
+    wrfout = tmp_path / f"wrfout_d{domain_id:02d}_history"
+    _write_wrfout(wrfout, ready, nx, ny, bad=False)
+    with netCDF4.Dataset(wrfout, mode="r+") as ds:
+        stamp = ready.valid_times_utc[-1][:-1].replace("T", "_")[:-2] + "01"
+        ds["Times"][-1] = np.asarray(list(stamp), dtype="S1")
+    solver_path = tmp_path / "solver_receipt.json"
+    solver_path.write_text(json.dumps(_solver_receipt(ready, (wrfout,)).to_doc()))
+    with pytest.raises(ValueError, match="Missing wrfout lead timestamps"):
+        main([str(ready_path), f"--wrfout-dir={tmp_path}", f"--solver-receipt={solver_path}"])
 
 
 def test_audit_resolves_downloaded_attempt_payload(

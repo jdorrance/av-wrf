@@ -26,10 +26,9 @@ read-only table access. [`package-solver.sh`](package-solver.sh) packages these
 tables, runtime files, and the build manifest.
 
 Mount [WPS geography](https://www2.mmm.ucar.edu/wrf/site/access_code/geog_data.html)
-at the configured `geog_data_path`, including lake depth for the lake physics
-profile. Run `geog`, pass its
-output to `plan` and `solve`, and seal the local forcing with
-`forcing-manifest`. Set `AV_WRF_OCI_DIGEST` to the solver
+at the configured `geog_data_path`, including lake depth for lake physics.
+Pass `geog` output to `plan` and `solve`; seal inputs with `forcing-manifest`.
+Set `AV_WRF_OCI_DIGEST` to the solver
 image digest for both `plan` and `solve`. Set `AV_WRF_STORE_URI` to a mounted
 store for live runs. See [solver patches](patches/README.md) for build provenance.
 

@@ -15,7 +15,7 @@ for p in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(p))
 
 from av_wrf.codecs import build_synthetic_wrf_step  # noqa: E402
-from av_wrf.core import RawWrfStepInput  # noqa: E402
+from av_wrf.core import RawWrfStepInput, build_accum_baseline, post_frame  # noqa: E402
 from av_wrf.core.post_3d import crop2_f64, post_3d_slabs  # noqa: E402
 from av_wrf.runner import load_bundle  # noqa: E402
 
@@ -96,6 +96,30 @@ class TestPost3d(unittest.TestCase):
         self.assertGreaterEqual(max_dz, min_dz)
         self.assertGreaterEqual(bl, 1)
         self.assertGreater(cfl, 0.0)
+
+    def test_post_rejects_invalid_faces_even_with_increasing_midpoints_and_zero_w(self) -> None:
+        raw, domain = self.raw, self.domain
+        shape = (raw.phb_stag_m2s2.nz, raw.phb_stag_m2s2.ny, raw.phb_stag_m2s2.nx)
+        phb = np.frombuffer(raw.phb_stag_m2s2.buf, np.float32).reshape(shape)
+        terrain = np.frombuffer(raw.terrain_m.buf, np.float32).reshape(shape[1:])
+        np.frombuffer(raw.ph_stag_m2s2.buf, np.float32).fill(0.0)
+        np.frombuffer(raw.w_stag_mps.buf, np.float32).fill(0.0)
+        baseline = build_accum_baseline(
+            dataclasses.replace(raw, valid_time_unix_s=raw.valid_time_unix_s - 3600),
+            domain.bdy_trim_cells,
+        )
+        for face2_m in (120.0, 50.0, 60.0, float("nan"), float("inf")):
+            with self.subTest(face2_m=face2_m):
+                faces = np.asarray((0.0, 60.0, face2_m, 160.0))
+                phb[:4] = (terrain[None, :, :] + faces[:, None, None]) * 9.81
+                if face2_m == 120.0:
+                    post_frame(baseline, raw, domain, self.bundle.science)
+                else:
+                    # Both folded cases have valid increasing midpoints above 20 m AGL.
+                    if np.isfinite(face2_m):
+                        self.assertTrue(np.all(np.diff((faces[1:] + faces[:-1]) / 2) > 0))
+                    with self.assertRaisesRegex(ValueError, "geopotential"):
+                        post_frame(baseline, raw, domain, self.bundle.science)
 
 
 if __name__ == "__main__":

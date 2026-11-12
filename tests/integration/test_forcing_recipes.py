@@ -15,6 +15,7 @@ import numpy as np
 import yaml
 
 from av_wrf.contracts import BuildManifest, DomainProfile, ForcingProfile, parse_iso_utc
+from av_wrf.core import MYNN_HISTORY_FILE, MYNN_HISTORY_TEXT
 from av_wrf.runner import (
     LocalFileStore,
     load_bundle,
@@ -163,6 +164,8 @@ class TestForcingRecipes(TestCase):
         self.assertIn("interval_seconds = 10800", wps.read_text(encoding="utf-8"))
         self.assertIn("use_sh_qv = .true.", wrf.read_text(encoding="utf-8"))
         self.assertIn("use_sh_qv = .true.", (work / "namelist.input.real").read_text())
+        self.assertIn(MYNN_HISTORY_FILE, wrf.read_text())
+        self.assertEqual((work / MYNN_HISTORY_FILE).read_text(), MYNN_HISTORY_TEXT)
 
         grib, files = self.root / "grib", self._assembled_files()
         args = grib, self.lock, self.bundle.primary_source

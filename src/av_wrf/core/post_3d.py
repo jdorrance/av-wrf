@@ -167,10 +167,10 @@ def _wind_stats(
     domain: DomainProfile,
     science: ScienceProfile,
     shared_2d: SharedSurface,
-    thermo: tuple[ArrF64, array[float], ArrF64, ArrF64],
+    thermo: tuple[ArrF64, array[float], ArrF64, ArrF64, ArrF64],
 ) -> tuple[ArrF64, ArrF64, ArrF64, tuple[float, float, int, float]]:
     terr, _, ca, sa = shared_2d
-    p_pa, z_buf, tk, spfh = thermo
+    p_pa, z_buf, tk, spfh, phi = thermo
     trim, k_exp = domain.bdy_trim_cells, domain.exported_levels_k
     ny, nx = ca.shape
     shp3 = (k_exp, ny, nx)
@@ -182,7 +182,7 @@ def _wind_stats(
     agl = np.subtract(np.frombuffer(z_buf, np.float32).reshape(shp3), terr)
     dz, bl_n = model_column_spacing(agl)
     # True Eulerian thickness differs from the consumer midpoint gap used for admission.
-    phi = staggered_face_phi(raw, trim, k_exp)
+    # Face validity is checked before destaggering; this denominator floor cannot hide folds.
     dz_cell = np.maximum(1.0, (phi[1:] - phi[:-1]) / G0_MPS2)
     # dx_phys = dx / m, so the Courant proxy needs a Lambert scale (center-column proxy).
     m_scale = lambert_map_scale(
@@ -204,11 +204,14 @@ def post_3d_slabs(
     science: ScienceProfile,
     shared_2d: SharedSurface,
 ) -> tuple[dict[str, PubMass3D], dict[str, PubMass2D], tuple[float, float, int, float]]:
+    k_exp = domain.exported_levels_k
+    phi = staggered_face_phi(raw, domain.bdy_trim_cells, k_exp)
     p_pa, p_buf, z_buf, t_buf, tk, spfh, columns = _cloud_and_thermo(
         raw, domain, science, shared_2d
     )
-    u_e, v_e, omega, stats = _wind_stats(raw, domain, science, shared_2d, (p_pa, z_buf, tk, spfh))
-    k_exp = domain.exported_levels_k
+    u_e, v_e, omega, stats = _wind_stats(
+        raw, domain, science, shared_2d, (p_pa, z_buf, tk, spfh, phi)
+    )
     ny, nx = shared_2d[1].shape
     bufs = (
         ("pressure_pa", p_buf),

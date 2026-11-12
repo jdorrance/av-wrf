@@ -154,15 +154,29 @@ def estimate_auto_levels_agl_m(
     return _midpoints_from_eta_faces(etas, domain, terrain_m, etac, base_temp_k)
 
 
+def _validate_geopotential_faces(phi: npt.NDArray[np.float64]) -> None:
+    # WRF geopotential lives on vertical faces; averaging can conceal a folded cell.
+    # https://www2.mmm.ucar.edu/wrf/users/docs/technote/v4_technote.pdf (section 3.2)
+    if not np.all(np.isfinite(phi)):
+        raise ValueError("Non-finite geopotential face")
+    if np.any(phi[1:] <= phi[:-1]):
+        raise ValueError("Native grid has a folded geopotential column")
+
+
 def staggered_face_phi(raw: RawWrfStepInput, trim: int, k_exp: int) -> npt.NDArray[np.float64]:
-    """Return `(k_exp + 1, ny, nx)` staggered geopotential faces `ph + phb` for true dz."""
+    """Return finite, increasing `(k_exp + 1, ny, nx)` geopotential faces `ph + phb`."""
     nz, ny, nx = raw.ph_stag_m2s2.nz, raw.ph_stag_m2s2.ny, raw.ph_stag_m2s2.nx
     if k_exp + 1 > nz:
         raise ValueError("Exported levels exceed staggered geopotential faces")
     ph = np.frombuffer(raw.ph_stag_m2s2.buf, np.float32).reshape(nz, ny, nx)
     phb = np.frombuffer(raw.phb_stag_m2s2.buf, np.float32).reshape(nz, ny, nx)
-    phi = np.add(ph[: k_exp + 1, trim:-trim, trim:-trim], phb[: k_exp + 1, trim:-trim, trim:-trim])
-    return phi.astype(np.float64)
+    phi = np.add(
+        ph[: k_exp + 1, trim:-trim, trim:-trim],
+        phb[: k_exp + 1, trim:-trim, trim:-trim],
+        dtype=np.float64,
+    )
+    _validate_geopotential_faces(phi)
+    return phi
 
 
 def validate_solver_znw(znw: Sequence[float], domain: DomainProfile) -> None:
@@ -272,15 +286,14 @@ def validate_wrfinput_columns(
     published: bool = True,
 ) -> None:
     """Reject folded native columns and check consumer geometry on the output domain."""
+    trim = domain.bdy_trim_cells
+    region = slice(trim, -trim) if published else slice(None)
+    phi = np.add(ph[:, region, region], phb[:, region, region], dtype=np.float64)
+    _validate_geopotential_faces(phi)
     if not published:
         # The outer grid feeds the solver. Only the output grid has consumer height limits.
-        phi = np.add(ph, phb, dtype=np.float64)
-        if np.any(phi[1:] <= phi[:-1]):
-            raise ValueError("Parent wrfinput has a folded geopotential column")
         return
-    trim = domain.bdy_trim_cells
-    phi = np.add(ph[:, trim:-trim, trim:-trim], phb[:, trim:-trim, trim:-trim], dtype=np.float64)
-    agl = (phi[1:] + phi[:-1]) * (0.5 / G0_MPS2) - hgt_m[trim:-trim, trim:-trim]
+    agl = (phi[1:] + phi[:-1]) * (0.5 / G0_MPS2) - hgt_m[region, region]
     gaps_m, min_bl = model_column_spacing(agl)
     validate_column_geometry(
         float(np.min(gaps_m)), float(np.max(gaps_m)), min_bl, domain, gap_limit_m=domain.max_dz_m

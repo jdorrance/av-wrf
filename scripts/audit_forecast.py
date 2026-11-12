@@ -179,9 +179,9 @@ def _read_native(path: Path, index: int) -> dict[str, npt.NDArray[np.float64]]:
         for name in (*_SHORTWAVE, "ALBEDO"):
             if name not in ds.variables:
                 raise ValueError(f"Missing native radiation variable {name}: {path}")
-            values = ds[name][index]
-            data = np.asarray(values, dtype=np.float64)
-            if np.ma.is_masked(values) or data.ndim != 2 or not np.isfinite(data).all():
+            values = np.ma.asarray(ds[name][index], dtype=np.float64)
+            data = np.asarray(values.filled(np.nan))
+            if data.ndim != 2 or (name != "ALBEDO" and not np.isfinite(data).all()):
                 raise ValueError(f"Invalid native radiation variable {name}: {path}")
             result[name] = data
     return result
@@ -189,9 +189,8 @@ def _read_native(path: Path, index: int) -> dict[str, npt.NDArray[np.float64]]:
 
 def _radiation_counts(fields: dict[str, npt.NDArray[np.float64]]) -> dict[str, int]:
     tol = RRTMG_SHORTWAVE_TOLERANCE_WM2
-    horizontal = fields["SWDOWN"] > tol
-    downward = fields["SWDNB"] > tol
-    lit = horizontal | downward
+    # Albedo scales SWDNB at the column bottom; match the producer's daylight admission.
+    lit = fields["SWDNB"] > tol
     albedo = fields["ALBEDO"]
     # RRTMG writes these two fluxes on the same plane at the bottom of its column.
     # https://github.com/wrf-model/WRF/blob/v4.8.0/phys/module_ra_rrtmg_sw.F#L10790-L10799
@@ -204,9 +203,11 @@ def _radiation_counts(fields: dict[str, npt.NDArray[np.float64]]) -> dict[str, i
     )
     return {
         "daylight_samples": int(lit.sum()),
-        "invalid_daylight_albedo": int((lit & ((albedo < 0) | (albedo > 1))).sum()),
+        "invalid_daylight_albedo": int(
+            (lit & (~np.isfinite(albedo) | (albedo < 0) | (albedo > 1))).sum()
+        ),
         "excess_surface_reflection": int(excess.sum()),
-        "legacy_albedo_reflection": int((downward & legacy).sum()),
+        "legacy_albedo_reflection": int((lit & legacy).sum()),
         **{f"negative_{name}": int((fields[name] < -tol).sum()) for name in _SHORTWAVE},
     }
 
