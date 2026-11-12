@@ -19,6 +19,7 @@ class RuntimeEnv:
     oci_digest: str
     solver_prefix: str
     webhook_token: str = field(default="", repr=False)
+    native_timeout_s: int | None = None
 
 
 def load_runtime_env(environ: Mapping[str, str] | None = None) -> RuntimeEnv:
@@ -37,6 +38,10 @@ def load_runtime_env(environ: Mapping[str, str] | None = None) -> RuntimeEnv:
     manifest_path = env.get("AV_WRF_BUILD_MANIFEST", "/opt/av-wrf/build-manifest.json").strip()
     oci_digest = env.get("AV_WRF_OCI_DIGEST", "").strip()
     solver_prefix = env.get("AV_WRF_SOLVER_PREFIX", "/opt/av-wrf").strip() or "/opt/av-wrf"
+    timeout = env.get("AV_WRF_NATIVE_TIMEOUT_S", "").strip()
+    native_timeout_s = int(timeout) if timeout else None
+    if native_timeout_s is not None and native_timeout_s < 1:
+        raise ValueError("AV_WRF_NATIVE_TIMEOUT_S must be positive")
     return RuntimeEnv(
         store_uri=store_uri,
         stage_store_uri=stage_uri,
@@ -47,4 +52,5 @@ def load_runtime_env(environ: Mapping[str, str] | None = None) -> RuntimeEnv:
         oci_digest=oci_digest,
         solver_prefix=solver_prefix,
         webhook_token=env.get("AV_WRF_WEBHOOK_TOKEN", "").strip(),
+        native_timeout_s=native_timeout_s,
     )

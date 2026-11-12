@@ -2,6 +2,7 @@
 
 The [project plan](plan.md) owns the release gates. This page records pilot
 evidence and the tradeoffs behind the current implementation.
+The [remediation plan](review-remediation.md) tracks the follow-up reviews.
 
 ## Native pilot
 
@@ -21,6 +22,29 @@ product. Real archived inputs exercise WPS and initialization. GFS yielded 34
 atmospheric levels and four soil layers. ICON-EU yielded 75 atmospheric levels
 and eight soil temperature and moisture layers. WRF 4.8 accepts
 `history_begin_h` from [its I/O registry](https://github.com/wrf-model/WRF/blob/v4.8.0/Registry/registry.io_boilerplate).
+
+## Albedo replay
+
+The patched ARM64 image replayed both 16-lead pilots. WRF initial states,
+boundary files, and integration namelists matched the archived runs byte for
+byte. Before sunrise, native 2 m temperatures also matched exactly. The
+[Noah-MP guard](../docker/patches/README.md) eliminated negative shortwave
+in every saved frame, including the full computational grid. The previous
+published interiors contained 8,990 GFS and 8,120 ICON-EU negative slope
+shortwave samples. Both corrected counts were zero.
+
+The ICON-EU minus GFS mean absolute 2 m difference fell from 1.56 to
+0.78 K and the maximum from 18.32 to 6.38 K. At the original outlier
+cell, the gap changed from +18.32 to −2.15 K. Corrected 10 m wind speed
+mean absolute difference was 0.74 m/s. At one +16 h cell, native wind
+speeds were 0.47 and 10.93 m/s, with parameterized gusts of 0.53 and
+20.17 m/s. At +13 h, one cell had a 905 m boundary-layer depth difference.
+The paired replay measures disagreement; observation scoring is separate.
+
+The hardened image retained the same WRF, real, and metgrid binaries.
+The smaller ungrib build reproduced all 46 archived WPS intermediates
+byte for byte. Its nonroot two-lead cold start verified 80 published
+objects, solve reuse, and publish retry after pruning.
 
 ## ICON-EU forcing
 

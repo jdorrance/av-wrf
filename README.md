@@ -50,7 +50,7 @@ python3 scripts/check_repo.py
 - [vendor/producer-contract](vendor/producer-contract/README.md): provisional
   Phase 1 `wrf-zarr-v3` wire contract to be promoted into `windy-av-layer`.
 - [docker](docker/README.md): default Python `runtime` image plus `--target solver`
-  compiling pinned `WRF v4.8.0`, `WPS v4.7.0`, and `Jasper 1.900.29`.
+  compiling pinned `WRF v4.8.0` and `WPS v4.7.0`.
 
 ## More information
 

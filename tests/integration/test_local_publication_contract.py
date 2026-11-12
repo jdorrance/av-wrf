@@ -4,6 +4,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from threading import Event
 from traceback import format_exception
@@ -12,7 +13,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from av_wrf.contracts import BuildManifest, ReadyReceipt, RunLock
+from av_wrf.contracts import BuildManifest, ReadyReceipt, RunLock, SolverReceipt
 from av_wrf.runner import (
     LoadedBundle,
     LocalFileStore,
@@ -21,6 +22,7 @@ from av_wrf.runner import (
     dispatch_idempotency_key,
     json_bytes,
     load_bundle,
+    load_ready_receipt,
     plan_product_cycle,
     post_cycle_from_inputs,
     post_webhook_json,
@@ -28,6 +30,7 @@ from av_wrf.runner import (
     published_cycle_prefix,
     put_idempotent,
     reconcile_dispatch,
+    solver_receipt_key,
 )
 from av_wrf.runner.forcing_gfs import GFS
 from av_wrf.runner.publish import _advance_latest_pointer_with_retry
@@ -93,7 +96,8 @@ def planned_attempt(tmp_path: Path) -> tuple[Path, LocalFileStore, LoadedBundle,
         publish_origin_utc=f"2026-11-12T{bundle.product.publish_origin_hour_utc:02d}:00:00Z",
         attempt_id="att-local-publish",
         mpi_ranks=1,
-        build_manifest=BuildManifest("host-dev-unpinned", "w", "p", (), "gcc", "mpi"),
+        build_manifest=BuildManifest("sha256:" + "b" * 64, "w", "p", (), "gcc", "mpi"),
+        geog_bundle_sha256="a" * 64,
         bundle=bundle,
     )
     return config, store, bundle, lock
@@ -168,34 +172,60 @@ def test_pruning_waits_for_repost(
 
 
 def test_pruned_retry_finds_matching_receipt_in_allowed_namespace(
-    planned_attempt: tuple[Path, LocalFileStore, LoadedBundle, RunLock], receipt: ReadyReceipt
+    planned_attempt: tuple[Path, LocalFileStore, LoadedBundle, RunLock],
 ) -> None:
     config, store, bundle, lock = planned_attempt
-    live = replace(
-        receipt,
-        model_id=lock.model_id,
+    post_cycle_from_inputs(
+        config,
+        store,
+        product_id=lock.product_id,
         cycle_partition=lock.cycle_partition,
-        publish_origin_utc=lock.publish_origin_utc,
+        attempt_id=lock.attempt_id,
+        bundle=bundle,
+        wrfout_dir=None,
+        synthetic=True,
+    )
+    retry = partial(
+        publish_cycle_receipt,
+        config,
+        store,
+        product_id=lock.product_id,
+        cycle_partition=lock.cycle_partition,
+        attempt_id=lock.attempt_id,
+        bundle=bundle,
+        now_utc_iso=lock.publish_origin_utc,
+        prune_stage=True,
+    )
+    fixture = retry(allow_synthetic=True)
+    live = replace(
+        fixture,
+        forcing_profile_id=lock.forcing_profile_id,
+        oci_digest=lock.build_manifest.oci_digest,
+    )
+    live_root = published_cycle_prefix(lock.model_id, lock.cycle_partition)
+    fixture_root = synthetic_cycle_prefix(lock.model_id, lock.cycle_partition)
+    live_key, fixture_key = f"{live_root}/_ready.json", f"{fixture_root}/_ready.json"
+    solver = SolverReceipt(
+        product_id=lock.product_id,
+        cycle_partition=lock.cycle_partition,
         attempt_id=lock.attempt_id,
         config_sha256=lock.config_sha256,
+        oci_digest=live.oci_digest,
+        geog_sha256=lock.geog_bundle_sha256,
+        forcing_sha256s=(("forcing", "d" * 64),),
+        wrfout_sha256s=(("wrfout", "e" * 64),),
     )
-    fixture = replace(live, forcing_profile_id="synthetic-fixture", oci_digest="synthetic-fixture")
-    live_key = f"{published_cycle_prefix(lock.model_id, lock.cycle_partition)}/_ready.json"
-    fixture_key = f"{synthetic_cycle_prefix(lock.model_id, lock.cycle_partition)}/_ready.json"
-
-    def retry(*, allow_synthetic: bool) -> ReadyReceipt:
-        return publish_cycle_receipt(
-            config,
-            store,
-            product_id=lock.product_id,
-            cycle_partition=lock.cycle_partition,
-            attempt_id=lock.attempt_id,
-            bundle=bundle,
-            allow_synthetic=allow_synthetic,
-            now_utc_iso=lock.publish_origin_utc,
-        )
+    store.put_if_absent(
+        solver_receipt_key(lock.product_id, lock.cycle_partition, lock.attempt_id),
+        json_bytes(solver.to_doc()),
+    )
+    for path in ("_diagnostics.json", *(f"forecast.zarr/{key}" for key, _ in live.shard_sha256s)):
+        payload = store.get_bytes(f"{fixture_root}/{path}")
+        assert payload is not None
+        store.put_if_absent(f"{live_root}/{path}", payload)
 
     store.put_if_absent(live_key, json_bytes(live.to_doc()))
+    store.delete_prefix(fixture_key)
     store.put_if_absent(fixture_key, json_bytes(replace(fixture, attempt_id="competing").to_doc()))
     assert retry(allow_synthetic=True) == live
     store.delete_prefix(live_key)
@@ -210,6 +240,38 @@ def test_pruned_retry_finds_matching_receipt_in_allowed_namespace(
     with pytest.raises(FileExistsError, match="competing"):
         retry(allow_synthetic=False)
 
+    fixture_path = config.parent / "store" / fixture_key
+    fixture_path.write_bytes(
+        json_bytes(replace(fixture, shard_sha256s=fixture.shard_sha256s[:-1]).to_doc())
+    )
+    with pytest.raises(ValueError, match="Published Zarr inventory"):
+        retry(allow_synthetic=True)
+    fixture_path.write_bytes(json_bytes(fixture.to_doc()))
+
+    shard_key = f"{fixture_root}/forecast.zarr/{fixture.shard_sha256s[-1][0]}"
+    store.delete_prefix(shard_key)
+    with pytest.raises(ValueError, match="Corrupt or missing Zarr object"):
+        retry(allow_synthetic=True)
+    store.put_if_absent(shard_key, b"corrupt shard")
+    with pytest.raises(ValueError, match="Corrupt or missing Zarr object"):
+        retry(allow_synthetic=True)
+
+    store.delete_prefix(live_key)
+    store.put_if_absent(live_key, json_bytes(fixture.to_doc()))
+    with pytest.raises(ValueError, match="execution mode"):
+        retry(allow_synthetic=True)
+    with pytest.raises(ValueError, match="execution mode"):
+        load_ready_receipt(store, lock.model_id, lock.cycle_partition)
+    for wrong in (
+        replace(live, forcing_profile_id="wrong-source"),
+        replace(live, oci_digest="sha256:" + "0" * 64),
+        replace(live, publish_origin_utc="2026-11-11T00:00:00Z"),
+    ):
+        store.delete_prefix(live_key)
+        store.put_if_absent(live_key, json_bytes(wrong.to_doc()))
+        with pytest.raises(ValueError, match="Published receipt provenance"):
+            retry(allow_synthetic=True)
+
 
 def test_latest_pointer_compares_instants(tmp_path: Path, receipt: ReadyReceipt) -> None:
     b = bundle_for_recipe(Path(__file__).resolve().parents[2] / "config", GFS)
@@ -217,14 +279,28 @@ def test_latest_pointer_compares_instants(tmp_path: Path, receipt: ReadyReceipt)
     receipt = replace(receipt, publish_origin_utc=f"2026-11-12T{hour:02}:00:00Z")
     store = LocalFileStore(tmp_path)
     latest_key = "upstream/model/latest.json"
-    newer = json_bytes({"publish_origin_utc": f"2026-11-12T{hour:02}:00:00.001+00:00"})
+    doc = {
+        "model_id": receipt.model_id,
+        "cycle_partition": f"20261112/{hour:02}",
+        "publish_origin_utc": f"2026-11-12T{hour:02}:00:00.001+00:00",
+        "ready_key": f"upstream/{receipt.model_id}/20261112/{hour:02}/_ready.json",
+    }
+    newer = json_bytes(doc)
     token = store.compare_and_swap(latest_key, newer, None)
     now = f"2026-11-12T{hour:02}:15:00Z"
-    _advance_latest_pointer_with_retry(store, receipt, b, now)
+    assert _advance_latest_pointer_with_retry(store, receipt, b, now) == "newer"
     assert store.get_bytes(latest_key) == newer
+    token = store.compare_and_swap(latest_key, json_bytes({**doc, "ready_key": "wrong"}), token)
+    with pytest.raises(ValueError, match=r"Invalid cycle identity in latest\.json"):
+        _advance_latest_pointer_with_retry(store, receipt, b, now)
     store.compare_and_swap(latest_key, b"{}", token)
     with pytest.raises(ValueError, match=r"Invalid publish origin in latest\.json"):
         _advance_latest_pointer_with_retry(store, receipt, b, now)
+    late = f"2026-11-13T{hour:02d}:15:00Z"
+    assert _advance_latest_pointer_with_retry(store, receipt, b, late) == "outside_live_window"
+    store.delete_prefix(latest_key)
+    assert _advance_latest_pointer_with_retry(store, receipt, b, now) == "advanced"
+    assert _advance_latest_pointer_with_retry(store, receipt, b, now) == "current"
 
 
 def test_rejected_webhook_can_retry_delivery(tmp_path: Path, receipt: ReadyReceipt) -> None:

@@ -37,8 +37,8 @@ def validate_domain_profile(domain: DomainProfile) -> None:
     """Enforce the WPS Lambert coordinate and computational domain limits."""
     # WPS geogrid passes one Lambert spacing and uses its default spherical radius.
     # https://github.com/wrf-model/WPS/blob/v4.7.0/geogrid/src/llxy_module.F#L340-L389
-    if domain.dx_m != domain.dy_m:
-        raise ValueError("WPS Lambert grid spacing must be equal in both directions")
+    if domain.dx_m != domain.dy_m or not 0.0 < domain.dx_m < math.inf:
+        raise ValueError("WPS Lambert grid spacing must be equal, finite and positive")
     if domain.earth_radius_m != WRF_SPHERE_RADIUS_M:
         raise ValueError(f"WPS Lambert Earth radius must be {WRF_SPHERE_RADIUS_M:.0f} m")
     if not (abs(domain.center_lon_deg) <= 180.0 and abs(domain.central_meridian_deg) <= 180.0):

@@ -9,6 +9,7 @@ import unittest
 from array import array
 from collections.abc import Iterator
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import zarr
@@ -147,6 +148,11 @@ class TestZarrV3RoundTrip(unittest.TestCase):
                     allow_synthetic=True,
                 )
 
+            with (
+                patch("av_wrf.runner.stages._producer_sha256", return_value="0" * 64),
+                self.assertRaisesRegex(ValueError, "Producer code SHA-256 drifted"),
+            ):
+                publish()
             manifest.write_bytes(json_bytes({**doc, "producer_sha256": "0" * 64}))
             with self.assertRaisesRegex(ValueError, "Staged producer SHA-256 differs"):
                 publish()
@@ -160,6 +166,12 @@ class TestZarrV3RoundTrip(unittest.TestCase):
             del lock_doc["producer_sha256"]
             lock_path.write_bytes(json_bytes(lock_doc))
             publish()
+            manifest.write_bytes(json_bytes({**doc, "execution_mode": "solver"}))
+            with (
+                patch("av_wrf.runner.publish.verify_solver_receipt"),
+                self.assertRaisesRegex(ValueError, "requires a producer SHA-256"),
+            ):
+                publish()
 
     def test_rejects_later_terrain_change_before_post_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -35,7 +35,7 @@ def _check_native_namelists(config: Path, product_id: str) -> None:
             )
             (work / "namelist.input").write_text(render_fortran_namelist(sections), "utf-8")
             proc = subprocess.run(
-                ["mpirun", "--allow-run-as-root", "-np", "1", f"/opt/av-wrf/bin/{exe}.exe"],
+                ["mpirun", "-np", "1", f"/opt/av-wrf/bin/{exe}.exe"],
                 cwd=work,
                 capture_output=True,
                 text=True,

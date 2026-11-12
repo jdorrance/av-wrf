@@ -179,7 +179,7 @@ class TestSolverCompletion(TestCase):
                     patch(
                         "av_wrf.runner.solver_exec._resolve_solver_exe", return_value=root / "bin"
                     ),
-                    patch("av_wrf.runner.solver_exec.subprocess.run", side_effect=fake_geogrid),
+                    patch("av_wrf.runner.solver.subprocess.run", side_effect=fake_geogrid),
                     patch("av_wrf.runner.solver_exec._validate_geo_em") as validate,
                 ):
                     if error is None:

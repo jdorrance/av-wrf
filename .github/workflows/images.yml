@@ -39,6 +39,10 @@ jobs:
           -f docker/Dockerfile -t av-wrf:solver .
       - run: docker run --rm --network none av-wrf:solver check
       - run: >-
-          docker run --rm --network none --entrypoint python
+          docker run --rm --network none --user 65534:65534 --entrypoint python
+          --mount "type=bind,source=$PWD/docker/check-icon-grib.py,target=/check-icon-grib.py,readonly"
+          av-wrf:solver /check-icon-grib.py --ungrib /opt/av-wrf/bin/ungrib.exe
+      - run: >-
+          docker run --rm --network none --user 65534:65534 --entrypoint python
           --mount "type=bind,source=$PWD/docker/check-namelist.py,target=/check-namelist.py,readonly"
           av-wrf:solver /check-namelist.py

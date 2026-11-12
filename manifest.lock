@@ -1,6 +1,8 @@
 {
   "files": {
-    "docker/patches/README.md": "dff57ac3c9496782653047e9523ec7311259dcb415758ed30fd0aa1d56f88d6c",
+    "docker/patches/README.md": "61b31b4bbef97ae21a12ce4a8b397ab7ac22c3857f17f82572c79becf446d772",
+    "docker/patches/wps-ungrib-packed-grib2.patch": "b2eec53c5858c6d89804c615fdf53bc878857042aafda03b4d5cf1935664714f",
+    "docker/patches/wrf-noahmp-preserve-albedo.patch": "b3718c4d6965c7a2fc3bf347a0d5521a0a41273028fa7de44770edc8c605ccc0",
     "tests/oracle/__init__.py": "203d5b5e998c0d173545b648682fb05d2f3d60712ca22cf0f5b3f98570356062",
     "tests/oracle/reference_cases.py": "d278bfb3b1bc8bcec0323b39ee0248d6ceea51bddf567dca2f301f1e57e3f6bf",
     "vendor/producer-contract/README.md": "939e08a8070987bd29ee3764998b0e877adcd9a1368cfa3c754ac1ef1e4f24c6",

@@ -4,11 +4,9 @@ set -euo pipefail
 prefix=/opt/av-wrf
 wrf_run=$prefix/share/wrf/run
 wps_tables=$prefix/share/wps
-mkdir -p "$prefix/bin" "$prefix/lib" "$wrf_run" "$wps_tables/Variable_Tables"
+mkdir -p "$prefix/bin" "$wrf_run" "$wps_tables/Variable_Tables"
 install -m 755 WRF/main/{real,wrf}.exe WPS/geogrid/src/geogrid.exe \
     WPS/metgrid/src/metgrid.exe WPS/ungrib/src/ungrib.exe "$prefix/bin/"
-cp -P /opt/jasper/lib/libjasper.so.* "$prefix/lib/"
-
 # Follow WRF's data symlinks while excluding examples and compiled programs.
 find -L WRF/run -maxdepth 1 -type f ! -name '*.exe' ! -name 'namelist*' ! -name 'README*' \
     -exec cp -L -t "$wrf_run" -- {} +

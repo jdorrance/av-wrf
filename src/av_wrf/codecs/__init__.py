@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from av_wrf.codecs.icon_grib import IconGribCutout
+from av_wrf.codecs.icon_grib import IconGribCutout, verify_icon_object
 from av_wrf.codecs.synthetic import (
     build_synthetic_wrf_baseline,
     build_synthetic_wrf_step,
@@ -63,6 +63,7 @@ __all__ = [
     "synthetic_thm_from_dry_theta",
     "validate_wrfinput_nc",
     "verify_grid_against_domain",
+    "verify_icon_object",
     "verify_local_wrf_nc",
     "verify_shard_index",
     "verify_wps_fields",

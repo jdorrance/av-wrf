@@ -157,6 +157,7 @@ class TestForcingRecipes(TestCase):
         )
         self.assertIn("interval_seconds = 10800", wps.read_text(encoding="utf-8"))
         self.assertIn("use_sh_qv = .true.", wrf.read_text(encoding="utf-8"))
+        self.assertIn("use_sh_qv = .true.", (work / "namelist.input.real").read_text())
 
         grib, files = self.root / "grib", self._assembled_files()
         args = grib, self.lock, self.bundle.primary_source

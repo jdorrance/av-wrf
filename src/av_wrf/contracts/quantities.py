@@ -7,20 +7,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import NewType
 
-Meters = NewType("Meters", float)
-Pascals = NewType("Pascals", float)
 TempK = NewType("TempK", float)
-WrfPerturbPotTempK = NewType("WrfPerturbPotTempK", float)
-WrfPerturbMoistThetaK = NewType("WrfPerturbMoistThetaK", float)
-MixingRatioKgKg = NewType("MixingRatioKgKg", float)
-SpecificHumidityKgKg = NewType("SpecificHumidityKgKg", float)
-AccumulatedJouleM2 = NewType("AccumulatedJouleM2", float)
-MeanFluxWm2 = NewType("MeanFluxWm2", float)
-AccumulatedPrecipMm = NewType("AccumulatedPrecipMm", float)
-PrecipRateMmHr = NewType("PrecipRateMmHr", float)
-GridWindMps = NewType("GridWindMps", float)
 EarthWindMps = NewType("EarthWindMps", float)
-VerticalVelocityMps = NewType("VerticalVelocityMps", float)
 OmegaPaS = NewType("OmegaPaS", float)
 
 
@@ -91,8 +79,6 @@ class Slab3DF32:
         return float(self.buf[(k * self.ny + j) * self.nx + i])
 
 
-CompStagX2D = NewType("CompStagX2D", Slab2DF32)
-CompStagY2D = NewType("CompStagY2D", Slab2DF32)
 CompMass2D = NewType("CompMass2D", Slab2DF32)
 PubMass2D = NewType("PubMass2D", Slab2DF32)
 
@@ -106,33 +92,19 @@ CompMass3D = NewType("CompMass3D", Slab3DF32)
 PubMass3D = NewType("PubMass3D", Slab3DF32)
 
 __all__ = [
-    "AccumulatedJouleM2",
-    "AccumulatedPrecipMm",
     "CompBucket2D",
     "CompMass2D",
     "CompMass3D",
-    "CompStagX2D",
     "CompStagX3D",
-    "CompStagY2D",
     "CompStagY3D",
     "CompStagZ3D",
     "EarthWindMps",
-    "GridWindMps",
-    "MeanFluxWm2",
-    "Meters",
-    "MixingRatioKgKg",
     "OmegaPaS",
-    "Pascals",
-    "PrecipRateMmHr",
     "PubBucket2D",
     "PubMass2D",
     "PubMass3D",
     "Slab2DF32",
     "Slab2DI32",
     "Slab3DF32",
-    "SpecificHumidityKgKg",
     "TempK",
-    "VerticalVelocityMps",
-    "WrfPerturbMoistThetaK",
-    "WrfPerturbPotTempK",
 ]

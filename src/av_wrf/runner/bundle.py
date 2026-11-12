@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
@@ -125,11 +126,17 @@ def validate_bundle(
     b: LoadedBundle, *, publish_origin_utc: str | None = None
 ) -> tuple[int, int, tuple[int, ...]]:
     """Validate horizon SLA, candidate source, vertical BL stretch, and Zarr v3 store schema."""
-    origin = publish_origin_utc or f"2000-01-01T{b.product.publish_origin_hour_utc:02d}:00:00Z"
-    window = resolve_cycle_window(b.product, b.output, origin)
+    origins: tuple[str, ...]
+    if publish_origin_utc is None:
+        year, hour = datetime.now(UTC).year, b.product.publish_origin_hour_utc
+        origins = (f"{year:04d}-01-01T{hour:02d}:00:00Z", f"{year:04d}-07-01T{hour:02d}:00:00Z")
+    else:
+        origins = (publish_origin_utc,)
+    window = resolve_cycle_window(b.product, b.output, origins[0])
     resolve_forcing_window(window, b.primary_source, domain=b.domain)
-    remaining_floor = validate_horizon_policy(
-        b.product, b.primary_source, b.output, publish_origin_utc=window.publish_origin_utc
+    remaining_floor = min(
+        validate_horizon_policy(b.product, b.primary_source, b.output, publish_origin_utc=origin)
+        for origin in (window.publish_origin_utc, *origins[1:])
     )
     compile_wrf_namelist_sections(b.domain, b.science, b.primary_source)
     if not b.candidate_source.fail_closed:

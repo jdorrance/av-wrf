@@ -36,7 +36,7 @@ def _validate_dynamics(science: ScienceProfile, domain: DomainProfile) -> None:
         )
         for lat in (south, north)
     )
-    min_phys_dx_km = (min(abs(domain.dx_m), abs(domain.dy_m)) / m_max) / 1000.0
+    min_phys_dx_km = (domain.dx_m / m_max) / 1000.0
     max_dt_s = 6.0 * min_phys_dx_km
     if not 0 < science.time_step_s <= max_dt_s:
         raise ValueError(

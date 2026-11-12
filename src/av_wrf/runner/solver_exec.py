@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
+import shutil
 from datetime import timedelta
 from numbers import Integral
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import mkdtemp
 
 from av_wrf.codecs import (
     check_geogrid_rotation,
@@ -27,30 +27,25 @@ from av_wrf.core import (
 )
 from av_wrf.runner.bundle import LoadedBundle, load_bundle
 from av_wrf.runner.mirrors import resolve_forcing_window, verify_forcing_manifest
-from av_wrf.runner.solver import _hash_complete_wrfout, load_build_manifest, verify_solver_receipt
+from av_wrf.runner.solver import (
+    _hash_complete_wrfout,
+    _install_solved_attempt,
+    _link_file,
+    _link_run_tables,
+    _recover_solved_attempt,
+    _resolve_solver_exe,
+    _run_native,
+    load_build_manifest,
+    verify_solver_receipt,
+)
 from av_wrf.runner.stages import _verify_producer_sha256, load_run_lock
 from av_wrf.runner.store import (
     ObjectStore,
     _copy_sha256_file,
-    json_bytes,
     put_idempotent,
     sha256_file,
     solver_receipt_key,
 )
-
-
-def _resolve_solver_exe(solver_prefix: Path, exe_name: str) -> Path:
-    """Resolve a `bin` executable whose target stays within the solver prefix."""
-    candidate = (solver_prefix / "bin" / exe_name).resolve()
-    if (
-        solver_prefix.resolve() not in candidate.parents
-        or not candidate.is_file()
-        or not os.access(candidate, os.X_OK)
-    ):
-        raise FileNotFoundError(
-            f"Missing executable '{exe_name}' under {solver_prefix / 'bin'} (PATH fallback denied)"
-        )
-    return candidate
 
 
 def _verify_runtime_build_manifest(
@@ -59,12 +54,6 @@ def _verify_runtime_build_manifest(
     installed = load_build_manifest(solver_prefix / "build-manifest.json", runtime.oci_digest)
     if installed != runtime or runtime != lock.build_manifest:
         raise ValueError("Installed solver and runtime build manifests must match the RunLock")
-
-
-def _link_file(src: Path, dst: Path) -> None:
-    if not src.is_file():
-        raise FileNotFoundError(f"Missing required solver asset: {src}")
-    os.symlink(src.resolve(), dst)
 
 
 def _grib_alpha_suffix(index: int) -> str:
@@ -79,6 +68,7 @@ def run_geogrid(
     product_id: str,
     work_dir: Path,
     solver_prefix: Path = Path("/opt/av-wrf"),
+    timeout_s: int | None = None,
     bundle: LoadedBundle | None = None,
 ) -> tuple[Path, str]:
     """Generate the validated static grid and return its path and SHA-256."""
@@ -96,7 +86,7 @@ def run_geogrid(
     )
     wps_txt = render_fortran_namelist(compile_geogrid_namelist_sections(b.domain))
     (work_dir / "namelist.wps").write_text(wps_txt, encoding="utf-8")
-    subprocess.run([str(exe)], cwd=work_dir, check=True)
+    _run_native([str(exe)], work_dir, timeout_s)
     # WPS picks the first matching resolution for each field and logs the selected source.
     # https://github.com/wrf-model/WPS/blob/v4.7.0/geogrid/src/source_data_module.F#L802-L831
     log_path = work_dir / "geogrid.log"
@@ -168,22 +158,15 @@ def _stage_wps_attempt(
 ) -> ForcingManifest:
     source = b.primary_source
     recipe, _, _ = resolve_forcing_window(lock, source, domain=b.domain)
-    attempt_dir.parent.mkdir(parents=True, exist_ok=True)
-    with TemporaryDirectory(prefix=".inputs-", dir=attempt_dir.parent) as tmp:
-        inputs = Path(tmp) / "inputs"
-        grib = inputs / "grib"
-        inputs.mkdir(mode=0o700)
-        grib.mkdir()
-        geo_em = inputs / "geo_em.d01.nc"
-        digest = _copy_sha256_file(geog_file, geo_em)
-        if digest != lock.geog_bundle_sha256:
-            raise ValueError(f"geo_em.d01.nc SHA-256 {digest} != RunLock {lock.geog_bundle_sha256}")
-        _validate_geo_em(geo_em, b.domain)
-        manifest = verify_forcing_manifest(
-            grib_dir, lock, source, domain=b.domain, snapshot_dir=grib
-        )
-        attempt_dir.mkdir()
-        inputs.rename(attempt_dir / "inputs")
+    inputs = attempt_dir / "inputs"
+    inputs.mkdir(parents=True, mode=0o700)
+    grib, geo_em = inputs / "grib", inputs / "geo_em.d01.nc"
+    grib.mkdir()
+    digest = _copy_sha256_file(geog_file, geo_em)
+    if digest != lock.geog_bundle_sha256:
+        raise ValueError(f"geo_em.d01.nc SHA-256 {digest} != RunLock {lock.geog_bundle_sha256}")
+    _validate_geo_em(geo_em, b.domain)
+    manifest = verify_forcing_manifest(grib_dir, lock, source, domain=b.domain, snapshot_dir=grib)
 
     vtable = attempt_dir / "Vtable"
     if recipe.vtable_text is None:
@@ -205,11 +188,16 @@ def _stage_wps_attempt(
 
 
 def _exec_mpi_step(
-    attempt_dir: Path, cmd: list[str], marker: str, *, reject_cfl: bool = False
+    attempt_dir: Path,
+    cmd: list[str],
+    marker: str,
+    timeout_s: int | None,
+    *,
+    reject_cfl: bool = False,
 ) -> None:
     for rsl in attempt_dir.glob("rsl.*"):
         rsl.unlink()
-    subprocess.run(cmd, cwd=attempt_dir, check=True)
+    _run_native(cmd, attempt_dir, timeout_s)
     exe_name = Path(cmd[-1]).name
     rsl0 = attempt_dir / "rsl.error.0000"
     if not rsl0.is_file():
@@ -230,32 +218,16 @@ def _exec_mpi_step(
         raise RuntimeError(f"{exe_name} missing completion marker '{marker}' in rsl.error.0000")
 
 
-def _link_run_tables(run_tables: Path, attempt_dir: Path) -> None:
-    """Link WRF physics tables. Skip the real/wrf/ndown/tc binaries shipped in run/."""
-    if not run_tables.is_dir():
-        raise FileNotFoundError(f"Missing WRF runtime tables directory: {run_tables}")
-    for item in sorted(run_tables.iterdir()):
-        if (
-            item.is_file()
-            and not item.name.startswith("namelist")
-            and item.name.removesuffix(".exe") not in {"real", "wrf", "ndown", "tc"}
-        ):
-            _link_file(item, attempt_dir / item.name)
-
-
 def _execute_solver_binaries(
     attempt_dir: Path,
     b: LoadedBundle,
     lock: RunLock,
     solver_prefix: Path,
     mpi_launcher: tuple[str, ...],
+    timeout_s: int | None,
 ) -> None:
-    subprocess.run(
-        [str(_resolve_solver_exe(solver_prefix, "ungrib.exe"))], cwd=attempt_dir, check=True
-    )
-    subprocess.run(
-        [str(_resolve_solver_exe(solver_prefix, "metgrid.exe"))], cwd=attempt_dir, check=True
-    )
+    for executable in ("ungrib.exe", "metgrid.exe"):
+        _run_native([str(_resolve_solver_exe(solver_prefix, executable))], attempt_dir, timeout_s)
     mg_lvls, mg_soil = _inspect_metgrid_dims(attempt_dir, b, lock)
     _link_run_tables(solver_prefix / "share" / "wrf" / "run", attempt_dir)
     namelist = compile_wrf_run_namelist(
@@ -274,6 +246,7 @@ def _execute_solver_binaries(
         attempt_dir,
         [*rank_cmd, str(_resolve_solver_exe(solver_prefix, "real.exe"))],
         "SUCCESS COMPLETE REAL_EM INIT",
+        timeout_s,
     )
     validate_wrfinput_nc(attempt_dir / "wrfinput_d01", b.domain, b.science)
     integration = compile_wrf_run_namelist(
@@ -289,6 +262,7 @@ def _execute_solver_binaries(
         attempt_dir,
         [*rank_cmd, str(_resolve_solver_exe(solver_prefix, "wrf.exe"))],
         "SUCCESS COMPLETE WRF",
+        timeout_s,
         reject_cfl=True,
     )
 
@@ -306,6 +280,7 @@ def run_wrf_cycle(
     runtime_manifest: BuildManifest,
     mpi_launcher: tuple[str, ...],
     solver_prefix: Path = Path("/opt/av-wrf"),
+    timeout_s: int | None = None,
     bundle: LoadedBundle | None = None,
 ) -> SolverReceipt:
     """Execute `ungrib -> metgrid -> real -> wrf` in clean attempt scratch and bind receipt."""
@@ -316,26 +291,58 @@ def run_wrf_cycle(
     if attempt_dir.resolve() != attempt_dir:
         raise ValueError("Solver attempt directory must be an independent path under scratch")
     receipt_key = solver_receipt_key(product_id, cycle_partition, attempt_id)
-    if store.get_bytes(receipt_key) is not None:
-        return verify_solver_receipt(store, lock, attempt_dir)
-    _verify_producer_sha256(lock)
-    if attempt_dir.exists():
-        raise FileExistsError(f"Solver attempt scratch already exists: {attempt_dir}")
-    manifest = _stage_wps_attempt(attempt_dir, b, lock, grib_dir, geog_file, solver_prefix)
-    _execute_solver_binaries(attempt_dir, b, lock, solver_prefix, mpi_launcher)
-    window = resolve_cycle_window(b.product, b.output, lock.publish_origin_utc)
+    with store.cycle_lock(receipt_key):
+        if store.get_bytes(receipt_key) is not None:
+            return verify_solver_receipt(store, lock, attempt_dir)
+        _verify_producer_sha256(lock)
+        if attempt_dir.exists() and not attempt_dir.is_dir():
+            raise FileExistsError(f"Solver attempt path is not a directory: {attempt_dir}")
+        recovered = _recover_solved_attempt(store, receipt_key, lock, attempt_dir)
+        if recovered is not None:
+            return recovered
+        scratch, receipt = _solve_in_scratch(
+            attempt_dir, b, lock, grib_dir, geog_file, solver_prefix, mpi_launcher, timeout_s
+        )
+        raw = _install_solved_attempt(scratch, attempt_dir, receipt)
+        put_idempotent(store, receipt_key, raw)
+        return receipt
+
+
+def _solve_in_scratch(
+    attempt_dir: Path,
+    bundle: LoadedBundle,
+    lock: RunLock,
+    grib_dir: Path,
+    geog_file: Path,
+    solver_prefix: Path,
+    mpi_launcher: tuple[str, ...],
+    timeout_s: int | None,
+) -> tuple[Path, SolverReceipt]:
+    attempt_dir.parent.mkdir(parents=True, exist_ok=True)
+    workspace = Path(mkdtemp(prefix=f".{attempt_dir.name}.solve-", dir=attempt_dir.parent))
+    scratch = workspace / "work"
+    try:
+        manifest = _stage_wps_attempt(scratch, bundle, lock, grib_dir, geog_file, solver_prefix)
+    except Exception:
+        shutil.rmtree(workspace)
+        raise
+    try:
+        _execute_solver_binaries(scratch, bundle, lock, solver_prefix, mpi_launcher, timeout_s)
+    except Exception as exc:
+        exc.add_note(f"Native solver logs are in {scratch}")
+        raise
+    window = resolve_cycle_window(bundle.product, bundle.output, lock.publish_origin_utc)
     receipt = SolverReceipt(
-        product_id,
-        cycle_partition,
-        attempt_id,
+        lock.product_id,
+        lock.cycle_partition,
+        lock.attempt_id,
         lock.config_sha256,
         lock.build_manifest.oci_digest,
         lock.geog_bundle_sha256,
         manifest.file_sha256s,
-        _hash_complete_wrfout(attempt_dir, window),
+        _hash_complete_wrfout(scratch, window),
         acquisition_inventory_sha256=(
             manifest.acquisition_inventory[1] if manifest.acquisition_inventory else None
         ),
     )
-    put_idempotent(store, receipt_key, json_bytes(receipt.to_doc()))
-    return receipt
+    return scratch, receipt

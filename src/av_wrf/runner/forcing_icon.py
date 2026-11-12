@@ -53,12 +53,15 @@ _SOIL_CENTERS_CM = tuple((top + bottom) / 2 for top, bottom in _SOIL_LAYERS)
 _SOIL_TEMP = (2, 3, 18, 106)
 _SOIL_WATER = (2, 3, 20, 106)
 ICON_INPUT_SELECTORS = {
+    "CLAT": (0, 191, 1, 1),
+    "CLON": (0, 191, 2, 1),
     **{field: codes for field, _, _, codes in (*_AIR, _HEIGHT)},
     **{field: codes for field, _, _, codes, _ in (*_FIXED, *_SURFACE)},
     "H_ICE": (10, 2, 1, 1),  # Native thickness, normalized as ice fraction.
     "T_SO": _SOIL_TEMP,
     "W_SO": _SOIL_WATER,
 }
+_SURFACE_LEVELS = {field: level for field, _, _, _, level in _SURFACE}
 # With a missing second surface WPS uses the raw value, including 5 for 0.005 m.
 # https://github.com/wrf-model/WPS/blob/v4.7.0/ungrib/src/rd_grib2.F#L721-L744
 _SOIL_TEMP_SELECTORS = {
@@ -111,6 +114,14 @@ def _icon_inputs(cycle: datetime, hours: tuple[int, ...]) -> dict[str, tuple[str
         )
         for hour in hours
     }
+
+
+def icon_input_metadata(key: str) -> tuple[int, tuple[int, int, int, int], float]:
+    """Return the lead hour, GRIB selector, and first level for a planned DWD object key."""
+    parts = key.split("/")
+    field = parts[3]
+    level = float(parts[7]) if parts[4] == "lvt1" else float(_SURFACE_LEVELS.get(field, 0))
+    return int(parts[-1][2:5]), ICON_INPUT_SELECTORS[field], level
 
 
 def _vtable() -> str:
@@ -179,7 +190,7 @@ def _validate_file(
     messages = inspect_grib(
         path,
         GRIB_KEYS
-        + ",uvRelativeToGrid:i,bitmapPresent:i,"
+        + ",uvRelativeToGrid:i,bitmapPresent:i,numberOfValues:i,"
         + ",".join(f"{key}:i" for key in _SOIL_SELECTOR_KEYS),
     )
     spacing = source.grid_spacing_deg
@@ -195,7 +206,11 @@ def _validate_file(
         identity = tuple(row.get(key) for key in _IDENTITY_KEYS)
         if identity != expected:
             raise ValueError(f"Wrong ICON-EU source, cycle or valid time in {path} for f{fhr:03d}")
-        if row.get("uvRelativeToGrid") != 0 or row.get("bitmapPresent") != 0:
+        if (
+            row.get("uvRelativeToGrid") != 0
+            or row.get("bitmapPresent") != 0
+            or row.get("numberOfValues") != row.get("numberOfDataPoints")
+        ):
             raise ValueError(
                 f"ICON-EU grid must use earth-relative winds and complete values: {path}"
             )
@@ -238,4 +253,4 @@ ICON_EU = ForcingRecipe(
     vtable_text=_vtable(),
 )
 
-__all__ = ["ICON_EU", "ICON_INPUT_SELECTORS", "ICON_INVARIANT_FIELDS"]
+__all__ = ["ICON_EU", "ICON_INPUT_SELECTORS", "ICON_INVARIANT_FIELDS", "icon_input_metadata"]

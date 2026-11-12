@@ -101,12 +101,6 @@ def validate_horizon_policy(
         raise ValueError(f"spinup_hours ({product.spinup_hours}) must be >= {MIN_SPINUP_HOURS}")
     if not 0 < product.min_horizon_hours < output.map_end_hour or product.max_cycle_age_hours < 0:
         raise ValueError("Expected a positive remaining horizon and non-negative cycle age")
-    remaining_floor = output.map_end_hour - product.max_cycle_age_hours
-    if remaining_floor < product.min_horizon_hours:
-        raise ValueError(
-            f"Remaining horizon at max_cycle_age_hours ({remaining_floor}h) "
-            f"is below min_horizon_hours ({product.min_horizon_hours}h)"
-        )
     origin_gap = (product.publish_origin_hour_utc - product.forcing_cycle_hour_utc) % 24
     if origin_gap < product.spinup_hours:
         raise ValueError(
@@ -124,8 +118,8 @@ def validate_horizon_policy(
         )
     cron_after_origin = timedelta(minutes=cron_offset_min - 60 * origin_gap)
     margin = timedelta(hours=MIN_SOLVER_DEADLINE_MARGIN_HOURS)
-    latest_live_age = timedelta(hours=_latest_live_age_hours(product, output))
-    if latest_live_age - cron_after_origin < margin:
+    latest_live_age = _latest_live_age_hours(product, output)
+    if timedelta(hours=latest_live_age) - cron_after_origin < margin:
         raise ValueError(
             f"Daily UTC cron leaves less than {MIN_SOLVER_DEADLINE_MARGIN_HOURS:g}h "
             "before the live cycle expires"
@@ -139,7 +133,7 @@ def validate_horizon_policy(
             raise ValueError(f"Daily UTC cron leaves only {hours:.2f}h before briefing deadline")
     if not source.fail_closed:
         raise ValueError(f"ForcingProfile '{source.profile_id}' must enforce fail_closed=True")
-    return remaining_floor
+    return output.map_end_hour - latest_live_age
 
 
 def is_cycle_live_fresh(

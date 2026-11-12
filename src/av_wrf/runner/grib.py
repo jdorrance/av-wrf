@@ -4,6 +4,7 @@ import json
 import math
 import subprocess
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import suppress
 from pathlib import Path
 
 GRIB_FIELD_KEYS = (
@@ -22,7 +23,8 @@ GRIB_KEYS = (
     "latitudeOfFirstGridPointInDegrees:d,latitudeOfLastGridPointInDegrees:d,"
     "longitudeOfFirstGridPointInDegrees:d,longitudeOfLastGridPointInDegrees:d,"
     "iDirectionIncrementInDegrees:d,jDirectionIncrementInDegrees:d,Ni:i,Nj:i,"
-    "iScansNegatively:i,jPointsAreConsecutive:i,alternativeRowScanning:i"
+    "iScansNegatively:i,jScansPositively:i,jPointsAreConsecutive:i,alternativeRowScanning:i,"
+    "numberOfDataPoints:i,min:d,max:d,average:d"
 )
 
 
@@ -56,6 +58,10 @@ def inspect_grib(path: Path, keys: str) -> list[dict[str, object]]:
 def grib_number(row: Mapping[str, object], key: str) -> float:
     """Read a finite numeric ecCodes key."""
     value = row.get(key)
+    # Older grib_ls JSON quotes doubles printed in scientific notation.
+    if isinstance(value, str):
+        with suppress(ValueError):
+            value = float(value)
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ValueError(f"Missing or invalid GRIB2 key {key}")
     return float(value)
@@ -71,12 +77,10 @@ def _validate_latlon_coverage(
     ni, nj = grib_number(row, "Ni"), grib_number(row, "Nj")
     lon0 = grib_number(row, "longitudeOfFirstGridPointInDegrees")
     lon1 = grib_number(row, "longitudeOfLastGridPointInDegrees")
-    south, north = sorted(
-        (
-            grib_number(row, "latitudeOfFirstGridPointInDegrees"),
-            grib_number(row, "latitudeOfLastGridPointInDegrees"),
-        )
-    )
+    lat0 = grib_number(row, "latitudeOfFirstGridPointInDegrees")
+    lat1 = grib_number(row, "latitudeOfLastGridPointInDegrees")
+    south, north = sorted((lat0, lat1))
+    scan_north = row.get("jScansPositively")
     width = dx * (ni - 1)
     west = w - (w - lon0) % 360.0
     if (
@@ -91,7 +95,8 @@ def _validate_latlon_coverage(
         or not math.isclose(dy, spacing, abs_tol=1e-6)
         or min(ni, nj) < 2
         or not math.isclose((lon1 - lon0) % 360.0, width, abs_tol=1e-5)
-        or not math.isclose(north - south, dy * (nj - 1), abs_tol=1e-5)
+        or scan_north not in (0, 1)
+        or not math.isclose(lat1 - lat0, (1 if scan_north else -1) * dy * (nj - 1), abs_tol=1e-5)
         or (ni * dx < 360.0 - 1e-5 and e > west + width + 1e-5)
         or s < south - 1e-5
         or n > north + 1e-5
@@ -109,6 +114,7 @@ def checked_grib_grid(
     """Yield messages on one covered grid with contiguous, WPS-readable framing."""
     _validate_latlon_coverage(rows[0], bounds, spacing)
     grid = rows[0].get("md5Section3")
+    points = grib_number(rows[0], "Ni") * grib_number(rows[0], "Nj")
     offset = 0
     for row in rows:
         if not isinstance(grid, str) or not grid or row.get("md5Section3") != grid:
@@ -116,6 +122,10 @@ def checked_grib_grid(
         length = int(grib_number(row, "totalLength"))
         if row.get("offset") != offset or length < 20 or row.get("packingType") not in packings:
             raise ValueError(f"Invalid GRIB2 framing or packing in {path}")
+        if row.get("numberOfDataPoints") != points:
+            raise ValueError(f"Invalid GRIB2 data-point count in {path}")
+        for key in ("min", "max", "average"):
+            grib_number(row, key)
         offset += length
         yield row
     if offset != path.stat().st_size:

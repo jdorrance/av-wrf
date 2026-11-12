@@ -57,6 +57,9 @@ class TestGrid(unittest.TestCase):
         d = _load_configured_domains()[0]
         with self.assertRaisesRegex(ValueError, "grid spacing must be equal"):
             validate_domain_profile(dataclasses.replace(d, dy_m=d.dx_m * 2.0))
+        for spacing in (-d.dx_m, 0.0, math.inf):
+            with self.assertRaisesRegex(ValueError, "finite and positive"):
+                validate_domain_profile(dataclasses.replace(d, dx_m=spacing, dy_m=spacing))
         with self.assertRaisesRegex(ValueError, "Earth radius"):
             validate_domain_profile(dataclasses.replace(d, earth_radius_m=d.earth_radius_m + 1.0))
 

@@ -18,6 +18,8 @@ can be a string or an ordered list of objects to assemble. Hours may reference
 the same invariant object. `forcing-manifest --file HOUR=FILENAME` seals one
 normalized file for each hour before solve. Solve checks private scratch
 copies of the forcing and geography, then passes those copies to WPS.
+Set `AV_WRF_NATIVE_TIMEOUT_S` to bound each local native stage. A failed
+solve leaves its logs in a private scratch directory for inspection.
 
 Prepare DWD v1 inputs from the ICON-EU product's `prep` output:
 
@@ -29,7 +31,9 @@ uv run --extra icon python -m av_wrf.runner.icon_acquire \
 Pass the emitted hour-to-filename map to `forcing-manifest` with `--file`.
 Pass the generated `*.sources-*.json` path with `--acquisition-inventory` to
 bind the source hashes to the normalized files and solver receipt. Use
-`--workers` to set download concurrency. The caller manages cache retention.
+`--workers` to set download concurrency. Cached objects are immutable. Remove a
+named corrupt cache entry and rerun. Use fresh cache and GRIB directories to
+acquire a revised source snapshot.
 
 - **Allowed imports:** `av_wrf.contracts`, `av_wrf.core`, `av_wrf.codecs`, and I/O libraries.
 - **Forbidden:** importing `av_wrf.verify` or `av_wrf.cli`, reading `os.environ`,

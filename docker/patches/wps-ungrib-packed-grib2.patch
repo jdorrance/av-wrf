@@ -1,0 +1,26 @@
+--- a/ungrib/src/ungrib.F
++++ b/ungrib/src/ungrib.F
+@@ -142,15 +142 @@
+-#if defined (USE_PNG) && (USE_JPEG2000)
+-     call mprintf(.true.,INFORM, &
+-        "Linked in png and jpeg libraries for Grib Edition 2")
+-#else
+-     call mprintf(.true.,STDOUT,"WARNING - Grib Edition 2 data detected, and")
+-     call mprintf(.true.,STDOUT,"        - png and jpeg libs were NOT selected")
+-     call mprintf(.true.,STDOUT,"        - during the build.")
+-     call mprintf(.true.,STDOUT,"Stopping")
+-     call mprintf(.true.,LOGFILE,"WARNING - Grib Edition 2 data detected, and")
+-     call mprintf(.true.,LOGFILE,"        - png and jpeg libs were NOT selected")
+-     call mprintf(.true.,LOGFILE,"        - during the build.")
+-     call mprintf(.true.,LOGFILE,"Stopping")
+-     call mprintf(.true.,ERROR,"NEED_GRIB2_LIBS")
+-#endif
+   else
+--- a/ungrib/src/rd_grib2.F
++++ b/ungrib/src/rd_grib2.F
+@@ -689,4 +689,5 @@
+             call gf_free(gfld)
+             call gf_getfld(cgrib,lengrib,n,.TRUE.,expand,gfld,ierr)
++            if (ierr.ne.0) error stop "Error unpacking GRIB2 field"
+             pabbrev=param_get_abbrev(gfld%discipline,gfld%ipdtmpl(1),
+      &                               gfld%ipdtmpl(2))

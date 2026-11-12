@@ -20,6 +20,7 @@ from av_wrf.contracts import (
     WRF_ZARR_V3_3D_NAMES,
     CycleWindow,
     DiagnosticsReceipt,
+    ReadyReceipt,
     RunLock,
     StagedPostManifest,
     parse_iso_utc,
@@ -92,15 +93,23 @@ def _verify_pressure(
         raise ValueError(f"Lowest level pressure_pa must be below surface_pressure_pa in {rel_key}")
 
 
+def _verified_object(store: ObjectStore, key: str, digest: str) -> bytes:
+    payload = store.get_bytes(key)
+    if payload is None or sha256_hex(payload) != digest:
+        raise ValueError(f"Corrupt or missing Zarr object: {key}")
+    return payload
+
+
 def _verify_diagnostics_receipt(
-    stage_store: ObjectStore, stage_root: str, exp_sha: str, lock: RunLock
+    store: ObjectStore, root: str, lock: RunLock, exp_sha: str | None
 ) -> bytes:
-    diag_raw = stage_store.get_bytes(f"{stage_root}/_diagnostics.json")
+    key = f"{root}/_diagnostics.json"
+    diag_raw = store.get_bytes(key)
     if diag_raw is None:
-        raise FileNotFoundError("Missing staged _diagnostics.json; restage with `av-wrf post`")
-    if sha256_hex(diag_raw) != exp_sha:
-        raise ValueError("Missing or corrupt staged _diagnostics.json before publish")
-    diag_obj = json.loads(diag_raw.decode("utf-8"))
+        raise FileNotFoundError(f"Missing {key}")
+    if exp_sha is not None and sha256_hex(diag_raw) != exp_sha:
+        raise ValueError(f"Corrupt {key}")
+    diag_obj = json.loads(diag_raw)
     if not isinstance(diag_obj, dict):
         raise ValueError("Expected JSON object in _diagnostics.json")
     diag = DiagnosticsReceipt.from_doc(diag_obj)
@@ -109,13 +118,40 @@ def _verify_diagnostics_receipt(
         lock.cycle_partition,
         lock.attempt_id,
     ):
-        raise ValueError("Staged diagnostics provenance does not match frozen RunLock")
-    nonnegative = (diag.max_cfl, diag.total_precip_mm, *diag.initial_dps_dt_hpa_hr)
+        raise ValueError(f"Diagnostics provenance does not match RunLock: {key}")
+    nonnegative = (
+        diag.max_cfl,
+        diag.total_precip_mm,
+        *diag.initial_dps_dt_hpa_hr,
+        *(seconds for _, seconds in diag.stage_seconds),
+    )
     if not all(math.isfinite(value) and value >= 0.0 for value in nonnegative) or not all(
         math.isfinite(value) for value in (diag.mean_sensible_flux_wm2, diag.mean_latent_flux_wm2)
     ):
-        raise ValueError("Invalid staged forecast diagnostics")
+        raise ValueError(f"Invalid forecast diagnostics: {key}")
     return diag_raw
+
+
+def verify_published_objects(
+    store: ObjectStore,
+    root: str,
+    receipt: ReadyReceipt,
+    b: LoadedBundle,
+    window: CycleWindow,
+    lock: RunLock,
+) -> None:
+    """Check the committed inventory and hashes before acknowledging a publish retry."""
+    meta, coords = _expected_canonical_bytes(b, window)
+    keys = expected_shard_keys(b.output, len(window.lead_hours)) | meta.keys()
+    digests = dict(receipt.shard_sha256s)
+    if len(receipt.shard_sha256s) != len(keys) or digests.keys() != keys:
+        raise ValueError("Published Zarr inventory differs from the expected store hierarchy")
+    _verify_diagnostics_receipt(store, root, lock, None)
+    canonical = meta | coords
+    for rel_key, digest in digests.items():
+        payload = _verified_object(store, f"{root}/{receipt.zarr_relpath}/{rel_key}", digest)
+        if rel_key in canonical and payload != canonical[rel_key]:
+            raise ValueError(f"Published Zarr metadata or coordinate {rel_key} contradicts RunLock")
 
 
 def verify_staged_objects(
@@ -129,7 +165,7 @@ def verify_staged_objects(
     on_verified_object: Callable[[str, bytes], None],
 ) -> bytes:
     """Verify canonical staged metadata and decoded fields and hand off each verified object."""
-    diag_raw = _verify_diagnostics_receipt(stage_store, stage_root, pm.diagnostics_sha256, lock)
+    diag_raw = _verify_diagnostics_receipt(stage_store, stage_root, lock, pm.diagnostics_sha256)
     meta_expected, coord_expected = _expected_canonical_bytes(b, window)
     if (
         len(pm.meta_sha256s) != len(meta_expected)
@@ -140,10 +176,7 @@ def verify_staged_objects(
     expected_shas = dict((*pm.meta_sha256s, *pm.shard_sha256s))
 
     def fetch_verified(rel_key: str) -> bytes:
-        payload = stage_store.get_bytes(f"{staged_zarr}/{rel_key}")
-        if payload is None or sha256_hex(payload) != expected_shas[rel_key]:
-            raise ValueError(f"Corrupt or missing staged Zarr object: {rel_key}")
-        return payload
+        return _verified_object(stage_store, f"{staged_zarr}/{rel_key}", expected_shas[rel_key])
 
     for rel_key, expected in (meta_expected | coord_expected).items():
         payload = fetch_verified(rel_key)

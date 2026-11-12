@@ -16,10 +16,15 @@ from time import sleep
 
 import httpx
 
-from av_wrf.codecs import IconGribCutout
+from av_wrf.codecs import IconGribCutout, verify_icon_object
 from av_wrf.core import resolve_cycle_window
 from av_wrf.runner.bundle import LoadedBundle, load_bundle
-from av_wrf.runner.forcing_icon import ICON_EU, ICON_INPUT_SELECTORS, ICON_INVARIANT_FIELDS
+from av_wrf.runner.forcing_icon import (
+    ICON_EU,
+    ICON_INPUT_SELECTORS,
+    ICON_INVARIANT_FIELDS,
+    icon_input_metadata,
+)
 from av_wrf.runner.mirrors import _forcing_subset
 from av_wrf.runner.store import LocalFileStore, json_bytes, put_idempotent, sha256_hex
 
@@ -71,18 +76,32 @@ def _read_plan(
 
 
 def _has_grib2_frame(raw: bytes) -> bool:
-    # GRIB2 section 0 carries the edition and total message length.
-    # https://www.nco.ncep.noaa.gov/pmb/docs/grib2/grib2_doc/grib2_sect0.shtml
-    return (
-        len(raw) >= 20
-        and raw.startswith(b"GRIB")
-        and raw[7] == 2
-        and int.from_bytes(raw[8:16], "big") == len(raw)
-        and raw.endswith(b"7777")
-    )
+    # DWD serves one field per object. Section 2 is optional.
+    # https://www.nco.ncep.noaa.gov/pmb/docs/grib2/grib2_doc/
+    if (
+        len(raw) < 20
+        or not raw.startswith(b"GRIB")
+        or raw[7] != 2
+        or int.from_bytes(raw[8:16], "big") != len(raw)
+        or not raw.endswith(b"7777")
+    ):
+        return False
+    offset, end = 16, len(raw) - 4
+    for section, minimum in ((1, 21), (2, 5), (3, 14), (4, 9), (5, 11), (6, 6), (7, 5)):
+        if offset + 5 > end:
+            return False
+        number = raw[offset + 4]
+        if section == 2 and number == 3:
+            continue
+        size = int.from_bytes(raw[offset : offset + 4], "big")
+        if number != section or not minimum <= size <= end - offset:
+            return False
+        offset += size
+    return offset == end
 
 
 def _download(
+    cycle: datetime,
     key: str,
     *,
     client: httpx.Client,
@@ -109,11 +128,16 @@ def _download(
                 sleep(delay)
                 continue
             raw = response.content
-            if _has_grib2_frame(raw):
-                put_idempotent(cache, key, raw)
-                return
-            last_error = ValueError(f"Expected one complete DWD GRIB2 message from {url}")
-            break
+            if not _has_grib2_frame(raw):
+                last_error = ValueError(f"Expected one complete DWD GRIB2 message from {url}")
+                break
+            try:
+                verify_icon_object(raw, key, cycle, *icon_input_metadata(key))
+            except ValueError as exc:
+                last_error = exc
+                break
+            put_idempotent(cache, key, raw)
+            return
     raise RuntimeError(f"ICON-EU forcing object unavailable: {key}") from last_error
 
 
@@ -147,14 +171,14 @@ def _assemble(
 
     def read_object(key: str) -> bytes:
         raw = cache.get_bytes(key)
-        if raw is None:
-            raise FileNotFoundError(f"Missing cached ICON-EU object: {key}")
+        if raw is None or not _has_grib2_frame(raw):
+            raise ValueError(f"Missing or malformed cached ICON-EU object: {key}")
         raw_shas[key] = sha256_hex(raw)
         return raw
 
     with httpx.Client(limits=limits, timeout=30) as client, ThreadPoolExecutor(workers) as pool:
         fetch = partial(
-            _download, client=client, mirrors=source.mirrors, cache=cache, root=cache_root
+            _download, cycle, client=client, mirrors=source.mirrors, cache=cache, root=cache_root
         )
         list(pool.map(fetch, fixed_set))
         cutout = IconGribCutout.from_native(

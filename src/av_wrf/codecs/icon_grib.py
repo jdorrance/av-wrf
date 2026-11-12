@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from math import isclose, isfinite
 from typing import BinaryIO, cast
 
 import numpy as np
@@ -51,22 +52,22 @@ def _identity(gid: int, cycle: datetime, hour: int) -> tuple[str, int]:
     import eccodes as ec
 
     valid = cycle + timedelta(hours=hour)
-    keys = ("edition", "centre", "dataDate", "dataTime", "validityDate", "validityTime")
-    expected = (
-        2,
-        78,
-        int(cycle.strftime("%Y%m%d")),
-        int(cycle.strftime("%H%M")),
-        int(valid.strftime("%Y%m%d")),
-        int(valid.strftime("%H%M")),
-    )
-    if tuple(ec.codes_get_long(gid, key) for key in keys) != expected:
-        raise ValueError(f"Wrong DWD ICON GRIB2 cycle or valid time for f{hour:03d}")
+    expected = {
+        "edition": 2,
+        "centre": 78,
+        "generatingProcessIdentifier": 2,
+        "productDefinitionTemplateNumber": 0,
+        "dataDate": int(cycle.strftime("%Y%m%d")),
+        "dataTime": int(cycle.strftime("%H%M")),
+        "validityDate": int(valid.strftime("%Y%m%d")),
+        "validityTime": int(valid.strftime("%H%M")),
+    }
+    if any(ec.codes_get_long(gid, key) != value for key, value in expected.items()):
+        raise ValueError(f"Wrong DWD ICON GRIB2 identity or valid time for f{hour:03d}")
     if ec.codes_get_string(gid, "gridType") != "unstructured_grid":
         raise ValueError("Expected the DWD native triangular grid")
     uuid = cast(str, ec.codes_get_string(gid, "uuidOfHGrid"))
-    count = int(ec.codes_get_long(gid, "numberOfDataPoints"))
-    return uuid, count
+    return uuid, int(ec.codes_get_long(gid, "numberOfDataPoints"))
 
 
 def _field(gid: int) -> _Field:
@@ -78,6 +79,25 @@ def _field(gid: int) -> _Field:
         int(ec.codes_get_long(gid, "parameterNumber")),
         int(ec.codes_get_long(gid, "typeOfFirstFixedSurface")),
     )
+
+
+def verify_icon_object(
+    raw: bytes, key: str, cycle: datetime, hour: int, selector: _Field, level: float
+) -> None:
+    """Unpack native ICON data and check its key identity before cache admission."""
+    import eccodes as ec
+
+    with _message(raw, key) as gid:
+        _, count = _identity(gid, cycle, hour)
+        if _field(gid) != selector or not isclose(ec.codes_get_double(gid, "level"), level):
+            raise ValueError("Wrong ICON GRIB2 selector or level")
+        if (
+            count < 1
+            or ec.codes_get_size(gid, "values") != count
+            or ec.codes_get_long(gid, "numberOfMissing") != 0
+            or not all(isfinite(ec.codes_get_double(gid, k)) for k in ("min", "max", "average"))
+        ):
+            raise ValueError("Incomplete or nonfinite ICON native field")
 
 
 def _coordinates(
@@ -93,17 +113,25 @@ def _coordinates(
     return uuid, values
 
 
+def _normalize_weights(weights: _FloatArray, context: str) -> None:
+    support = weights.sum(axis=1, keepdims=True)
+    if not np.all(np.isfinite(support) & (support > 0.0)):
+        raise ValueError(f"Invalid ICON interpolation weights for {context}")
+    weights /= support
+
+
 def _cutout(
     coordinates: tuple[str, str],
     read_object: Callable[[str], bytes],
     cycle: datetime,
     bounds: tuple[float, float, float, float],
     spacing: float,
+    selectors: Mapping[str, _Field],
 ) -> _Cutout:
     from scipy.spatial import Delaunay
 
-    lat_uuid, lat = _coordinates(coordinates[0], read_object, cycle, (0, 191, 1, 1))
-    lon_uuid, lon = _coordinates(coordinates[1], read_object, cycle, (0, 191, 2, 1))
+    lat_uuid, lat = _coordinates(coordinates[0], read_object, cycle, selectors["CLAT"])
+    lon_uuid, lon = _coordinates(coordinates[1], read_object, cycle, selectors["CLON"])
     if lat_uuid != lon_uuid or lat.shape != lon.shape or np.max(np.abs(lat)) > 90.0:
         raise ValueError("Mismatched ICON latitude and longitude grid")
     west, south, east, north = bounds
@@ -137,7 +165,7 @@ def _cutout(
     transforms = np.asarray(mesh.transform[simplex], dtype=np.float64)
     local = np.einsum("nij,nj->ni", transforms[:, :2], targets - transforms[:, 2])
     weights = np.maximum(np.column_stack((local, 1.0 - local.sum(axis=1))), 0.0)
-    weights /= weights.sum(axis=1, keepdims=True)
+    _normalize_weights(weights, "the native grid")
     return _Cutout(
         west, south, east, north, spacing, nx, ny, lat_uuid, lat.size, nearby[vertices], weights
     )
@@ -160,6 +188,8 @@ def _values(gid: int, cutout: _Cutout, cycle: datetime, hour: int) -> _FloatArra
 def _encode(gid: int, cutout: _Cutout, values: _FloatArray) -> bytes:
     import eccodes as ec
 
+    if not np.isfinite(values).all():
+        raise ValueError("Nonfinite values in the normalized ICON field")
     for key, value in {
         "gridType": "regular_ll",
         "Ni": cutout.nx,
@@ -213,7 +243,7 @@ class IconGribCutout:
     ) -> IconGribCutout:
         """Read DWD invariant fields by object key and precompute interpolation weights."""
         cutout = _cutout(
-            (fields["CLAT"][0], fields["CLON"][0]), read_object, cycle, bounds, spacing
+            (fields["CLAT"][0], fields["CLON"][0]), read_object, cycle, bounds, spacing, selectors
         )
         land_key = fields["FR_LAND"][0]
         with _message(read_object(land_key), land_key) as gid:
@@ -224,7 +254,7 @@ class IconGribCutout:
             mask = _encode(gid, cutout, target_land.astype(np.float64))
         same_surface = (land >= 0.5) == target_land[:, None]
         surface_weights = cutout.weights * same_surface
-        surface_weights /= surface_weights.sum(axis=1, keepdims=True)
+        _normalize_weights(surface_weights, "the target land/sea class")
         terrain_key = fields["HSURF"][0]
         with _message(read_object(terrain_key), terrain_key) as gid:
             if _field(gid) != selectors["HSURF"]:
@@ -317,4 +347,4 @@ def _full_heights(
     return tuple(messages)
 
 
-__all__ = ["IconGribCutout"]
+__all__ = ["IconGribCutout", "verify_icon_object"]

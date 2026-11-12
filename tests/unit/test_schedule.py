@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import sys
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -20,10 +21,32 @@ from av_wrf.core import (  # noqa: E402
     selected_lead_hours,
     validate_horizon_policy,
 )
-from av_wrf.runner import load_bundle  # noqa: E402
+from av_wrf.runner import load_bundle, validate_bundle  # noqa: E402
 
 
 class TestSchedule(unittest.TestCase):
+    def test_remaining_horizon_caps_live_age(self) -> None:
+        cfg = ROOT / "config"
+        b = load_bundle(cfg, next((cfg / "products").glob("*.yaml")).stem)
+        age = b.output.map_end_hour - b.product.min_horizon_hours
+        product = dataclasses.replace(
+            b.product, max_cycle_age_hours=age + 2, region_tz="UTC", local_deadline_hhmm="18:00"
+        )
+        origin = datetime(2026, 11, 12, product.publish_origin_hour_utc, tzinfo=UTC)
+        cutoff = origin + timedelta(hours=age)
+        self.assertEqual(
+            validate_horizon_policy(product, b.primary_source, b.output),
+            product.min_horizon_hours,
+        )
+        self.assertTrue(
+            is_cycle_live_fresh(product, b.output, origin.isoformat(), cutoff.isoformat())
+        )
+        self.assertFalse(
+            is_cycle_live_fresh(
+                product, b.output, origin.isoformat(), (cutoff + timedelta(seconds=1)).isoformat()
+            )
+        )
+
     def test_cron_requires_full_solver_margin_before_cycle_expiry(self) -> None:
         cfg = ROOT / "config"
         b = load_bundle(cfg, next((cfg / "products").glob("*.yaml")).stem)
@@ -123,6 +146,22 @@ class TestSchedule(unittest.TestCase):
             after = f"{date}T{deadline_hour}:30:01Z"
             self.assertTrue(is_cycle_live_fresh(product, b.output, origin, deadline))
             self.assertFalse(is_cycle_live_fresh(product, b.output, origin, after))
+
+    def test_config_check_catches_a_summer_only_briefing_failure(self) -> None:
+        cfg = ROOT / "config"
+        b = load_bundle(cfg, next((cfg / "products").glob("*.yaml")).stem)
+        product = dataclasses.replace(
+            b.product,
+            region_tz="America/New_York",
+            local_deadline_hhmm="20:01",
+            forcing_cycle_hour_utc=18,
+            publish_origin_hour_utc=0,
+            schedule_cron_utc="15 23 * * *",
+        )
+        changed = dataclasses.replace(b, product=product)
+        validate_bundle(changed, publish_origin_utc="20260101/00")
+        with self.assertRaisesRegex(ValueError, "before briefing deadline"):
+            validate_bundle(changed)
 
 
 if __name__ == "__main__":

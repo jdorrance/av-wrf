@@ -137,5 +137,9 @@ their respective sides of the Zarr v3 contract:
 - **Topographic radiation (`slope_rad = 1`, `topo_shading = 1`) vs. RASP `sfcsun`:**
   3 km slope aspect and `25 km` cast shadows enter Noah-MP's surface energy budget
   directly (`radt = 3 min`) without consumer double-counting.
+  The [Noah-MP patch](../docker/patches/README.md) retains valid WRF albedo
+  across steps with no incident shortwave so RRTMG receives a reflectance at dawn.
 - **Cold-start land state, snow, & high-altitude inland lakes:** Phase 1
-  initializes Noah-MP (`5, 25, 70, 150 cm`) from `18Z` GFS (`6 h` spin-up).
+  initializes Noah-MP soil layers from the selected forcing and integrates
+  through the configured spin-up. Warm land-state cycling needs observation
+  qualification.

@@ -148,7 +148,6 @@ def _run_plan_prep_or_solve(
             env.oci_digest,
             allow_unpinned_dev=bool(args.allow_unpinned_dev),
         )
-        geog_sha = sha256_file(args.geog_file) if args.geog_file else None
         key, lock = plan_product_cycle(
             cfg_dir,
             stage_store,
@@ -157,7 +156,7 @@ def _run_plan_prep_or_solve(
             attempt_id=att,
             mpi_ranks=env.mpi_ranks,
             build_manifest=manifest,
-            geog_bundle_sha256=geog_sha,
+            geog_bundle_sha256=sha256_file(args.geog_file) if args.geog_file else None,
             bundle=bundle,
         )
         return {"status": "locked", "lock_key": key, "cycle_partition": lock.cycle_partition}
@@ -171,7 +170,12 @@ def _run_plan_prep_or_solve(
             work_dir=Path(args.work_dir),
             bundle=bundle,
         )
-        return {"status": "prepped", "namelist_wps": str(wps_p), "namelist_input": str(wrf_p)}
+        return {
+            "status": "prepped",
+            "namelist_wps": str(wps_p),
+            "namelist_input_real": str(wrf_p.with_suffix(".input.real")),
+            "namelist_input": str(wrf_p),
+        }
     s_rec = run_wrf_cycle(
         cfg_dir,
         stage_store,
@@ -184,6 +188,7 @@ def _run_plan_prep_or_solve(
         mpi_launcher=env.mpi_launcher,
         solver_prefix=Path(env.solver_prefix),
         runtime_manifest=load_build_manifest(Path(env.build_manifest_path), env.oci_digest),
+        timeout_s=env.native_timeout_s,
         bundle=bundle,
     )
     return {"status": "solved", "cycle": part, "wrfout_count": len(s_rec.wrfout_sha256s)}
@@ -230,6 +235,7 @@ def _run_publish_cmd(
     ]
     prune = bool(args.prune_stage)
     last_rec = None
+    latest: list[str] = []
     for idx, dst_store in enumerate(destinations):
         last_rec = publish_cycle_receipt(
             cfg_dir,
@@ -241,6 +247,7 @@ def _run_publish_cmd(
             stage_store=stg_store,
             allow_synthetic=bool(args.allow_synthetic_fixture),
             prune_stage=(prune and idx == len(raw_uris) - 1),
+            on_latest=latest.append,
         )
     if last_rec is None:
         raise ValueError("No destination store URI provided to publish")
@@ -250,6 +257,7 @@ def _run_publish_cmd(
         "shards": len(last_rec.shard_sha256s),
         "destinations": len(raw_uris),
         "forcing_profile_id": last_rec.forcing_profile_id,
+        "latest": latest,
     }
 
 
@@ -316,6 +324,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             product_id=str(args.product),
             work_dir=Path(args.work_dir),
             solver_prefix=Path(env.solver_prefix),
+            timeout_s=env.native_timeout_s,
         )
         print(json.dumps({"status": "geog_ready", "geo_em": str(geo_em), "sha256": geo_sha}))
         return 0

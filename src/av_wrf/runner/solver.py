@@ -1,15 +1,80 @@
-"""Read installed solver build manifests and verify frozen execution receipts."""
+"""Resolve installed solver assets and verify frozen execution receipts."""
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import signal
+import subprocess
 from collections.abc import Mapping
+from contextlib import suppress
 from pathlib import Path
+from tempfile import mkdtemp
 
 from av_wrf.codecs import select_cycle_wrfout_slices
 from av_wrf.contracts import BuildManifest, CycleWindow, RunLock, SolverReceipt
-from av_wrf.runner.store import ObjectStore, sha256_file, solver_receipt_key
+from av_wrf.runner.store import (
+    ObjectStore,
+    _sync_directory,
+    json_bytes,
+    put_idempotent,
+    sha256_file,
+    solver_receipt_key,
+)
+
+_LOCAL_SOLVER_RECEIPT = ".solver-receipt.json"
+
+
+def _run_native(command: list[str], cwd: Path, timeout_s: int | None) -> None:
+    """Run a local native stage and cancel its process group if its deadline expires."""
+    if timeout_s is None:
+        subprocess.run(command, cwd=cwd, check=True)
+        return
+    if timeout_s < 1:
+        raise ValueError("Native stage timeout must be positive")
+    with subprocess.Popen(command, cwd=cwd, start_new_session=True) as process:
+        try:
+            code = process.wait(timeout=timeout_s)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            raise
+    if code:
+        raise subprocess.CalledProcessError(code, command)
+
+
+def _resolve_solver_exe(solver_prefix: Path, exe_name: str) -> Path:
+    """Resolve a `bin` executable whose target stays within the solver prefix."""
+    candidate = (solver_prefix / "bin" / exe_name).resolve()
+    if (
+        solver_prefix.resolve() not in candidate.parents
+        or not candidate.is_file()
+        or not os.access(candidate, os.X_OK)
+    ):
+        raise FileNotFoundError(
+            f"Missing executable '{exe_name}' under {solver_prefix / 'bin'} (PATH fallback denied)"
+        )
+    return candidate
+
+
+def _link_file(src: Path, dst: Path) -> None:
+    if not src.is_file():
+        raise FileNotFoundError(f"Missing required solver asset: {src}")
+    os.symlink(src.resolve(), dst)
+
+
+def _link_run_tables(run_tables: Path, attempt_dir: Path) -> None:
+    """Link WRF physics tables. Skip the real/wrf/ndown/tc binaries shipped in run/."""
+    if not run_tables.is_dir():
+        raise FileNotFoundError(f"Missing WRF runtime tables directory: {run_tables}")
+    for item in sorted(run_tables.iterdir()):
+        if (
+            item.is_file()
+            and not item.name.startswith("namelist")
+            and item.name.removesuffix(".exe") not in {"real", "wrf", "ndown", "tc"}
+        ):
+            _link_file(item, attempt_dir / item.name)
 
 
 def parse_build_manifest(raw: Mapping[str, object], oci_digest: str) -> BuildManifest:
@@ -109,7 +174,13 @@ def verify_solver_receipt(
             f"Missing solver_receipt.json for {lock.product_id} {lock.cycle_partition} "
             f"({lock.attempt_id}); run `av-wrf solve` before live `post`/`publish`"
         )
-    doc = json.loads(raw.decode("utf-8"))
+    return _verify_solver_receipt_bytes(raw, lock, wrfout_dir, selected_wrfouts)
+
+
+def _verify_solver_receipt_bytes(
+    raw: bytes, lock: RunLock, wrfout_dir: Path | None, selected: set[Path] | None = None
+) -> SolverReceipt:
+    doc = json.loads(raw)
     if not isinstance(doc, dict):
         raise ValueError("Expected JSON object in solver_receipt.json")
     rec = SolverReceipt.from_doc(doc)
@@ -128,8 +199,44 @@ def verify_solver_receipt(
     if not rec.wrfout_sha256s or not rec.forcing_sha256s:
         raise ValueError("SolverReceipt missing forcing or wrfout digests")
     if wrfout_dir is not None:
-        _verify_wrfout_files(wrfout_dir, rec.wrfout_sha256s, selected_wrfouts)
+        _verify_wrfout_files(wrfout_dir, rec.wrfout_sha256s, selected)
     return rec
+
+
+def _recover_solved_attempt(
+    store: ObjectStore, key: str, lock: RunLock, attempt: Path
+) -> SolverReceipt | None:
+    try:
+        raw = (attempt / _LOCAL_SOLVER_RECEIPT).read_bytes()
+    except FileNotFoundError:
+        return None
+    receipt = _verify_solver_receipt_bytes(raw, lock, None)
+    try:
+        _verify_wrfout_files(attempt, receipt.wrfout_sha256s, None)
+    except (OSError, ValueError):
+        return None
+    put_idempotent(store, key, raw)
+    return receipt
+
+
+def _install_solved_attempt(scratch: Path, attempt: Path, receipt: SolverReceipt) -> bytes:
+    for name, _ in receipt.wrfout_sha256s:
+        with (scratch / name).open("rb") as output:
+            os.fsync(output.fileno())
+    raw = json_bytes(receipt.to_doc())
+    with (scratch / _LOCAL_SOLVER_RECEIPT).open("xb") as journal:
+        journal.write(raw)
+        journal.flush()
+        os.fsync(journal.fileno())
+    _sync_directory(scratch)
+    if attempt.is_dir():
+        archive = Path(mkdtemp(prefix=f".{attempt.name}.previous-", dir=attempt.parent))
+        attempt.rename(archive / "work")
+        _sync_directory(archive)
+    scratch.rename(attempt)
+    scratch.parent.rmdir()
+    _sync_directory(attempt.parent)
+    return raw
 
 
 __all__ = [

@@ -15,7 +15,7 @@ if __name__ == "__main__":
     manifest = {
         **{
             f"{repo.lower()}_sha": _version("git", "-C", repo, "rev-parse", "HEAD")
-            for repo in ("WRF", "WPS", "jasper")
+            for repo in ("WRF", "WPS")
         },
         "patch_sha256s": [
             [patch.name, hashlib.sha256(patch.read_bytes()).hexdigest()]

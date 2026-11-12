@@ -20,24 +20,27 @@ RUN --mount=from=uv,source=/uv,target=/bin/uv \
     uv sync --project /project --locked --no-dev --no-editable --reinstall-package av-wrf
 COPY config/ config/
 
+FROM app AS solver-app
+RUN --mount=from=uv,source=/uv,target=/bin/uv \
+    --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,target=/project \
+    uv sync --project /project --locked --no-dev --no-editable --extra icon
+
 FROM debian:bookworm-slim AS solver-build
 RUN --mount=type=bind,source=docker/install-debian-packages.sh,target=/tmp/install-packages.sh \
     sh /tmp/install-packages.sh \
-    autoconf automake bc build-essential ca-certificates csh file gfortran git \
-    libjpeg62-turbo-dev libnetcdf-dev libnetcdff-dev libopenmpi-dev libpng-dev \
-    libtool m4 openmpi-bin perl python3 time zlib1g-dev
+    bc build-essential ca-certificates csh file gfortran git \
+    libnetcdf-dev libnetcdff-dev libopenmpi-dev openmpi-bin perl python3 time
 
-ENV NETCDF=/opt/netcdf WRFIO_NCD_LARGE_FILE_SUPPORT=1 \
-    JASPERLIB=/opt/jasper/lib JASPERINC=/opt/jasper/include
+ENV NETCDF=/opt/netcdf WRFIO_NCD_LARGE_FILE_SUPPORT=1
 WORKDIR /build
 ARG JOBS=8
-RUN --mount=type=bind,source=docker/build-jasper.sh,target=/tmp/build-jasper.sh \
-    bash /tmp/build-jasper.sh "${JOBS}"
 
-COPY docker/patches/ patches/
+COPY docker/patches/wrf-*.patch patches/
 RUN --mount=type=bind,source=docker/build-wrf.sh,target=/tmp/build-wrf.sh \
     bash /tmp/build-wrf.sh "${JOBS}"
 
+COPY docker/patches/wps-*.patch patches/
 RUN --mount=type=bind,source=docker/build-wps.sh,target=/tmp/build-wps.sh \
     bash /tmp/build-wps.sh
 RUN --mount=type=bind,source=docker/package-solver.sh,target=/tmp/package-solver.sh \
@@ -47,10 +50,10 @@ RUN --mount=type=bind,source=docker/package-solver.sh,target=/tmp/package-solver
 FROM python-base AS solver
 RUN --mount=type=bind,source=docker/install-debian-packages.sh,target=/tmp/install-packages.sh \
     sh /tmp/install-packages.sh \
-    libeccodes-tools libgfortran5 libjpeg62-turbo libnetcdff7 libpng16-16 openmpi-bin
+    libeccodes-tools libgfortran5 libnetcdff7 openmpi-bin
 COPY --from=solver-build /opt/av-wrf /opt/av-wrf
 RUN --mount=type=bind,source=docker/check-solver.sh,target=/tmp/check-solver.sh \
     sh /tmp/check-solver.sh
-COPY --from=app /app/ /app/
+COPY --from=solver-app /app/ /app/
 
 FROM app AS runtime

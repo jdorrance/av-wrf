@@ -1,5 +1,7 @@
 """CLI storage choices must be explicit before opening a store."""
 
+import json
+from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -15,6 +17,36 @@ CONFIG = Path(__file__).resolve().parents[2] / "config"
 
 
 class TestCliStorage(TestCase):
+    def test_publish_reports_latest_outcome_for_each_destination(self) -> None:
+        product = next((CONFIG / "products").glob("*.yaml")).stem
+        bundle = load_bundle(CONFIG, product)
+        cycle = f"20261112/{bundle.product.publish_origin_hour_utc:02d}"
+        outcomes = iter(("outside_live_window", "newer"))
+
+        def publish(
+            *_args: object, on_latest: Callable[[str], None], **_kwargs: object
+        ) -> SimpleNamespace:
+            on_latest(next(outcomes))
+            return SimpleNamespace(
+                cycle_partition=cycle, shard_sha256s=(), forcing_profile_id="source"
+            )
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = load_runtime_env({"AV_WRF_STAGE_STORE_URI": (root / "stage").as_uri()})
+            args = ["publish", "--config-dir", str(CONFIG), "--product", product, "--cycle", cycle]
+            for name in ("dst1", "dst2"):
+                args.extend(("--store-uri", (root / name).as_uri()))
+            with (
+                patch("av_wrf.cli.main.load_runtime_env", return_value=env),
+                patch("av_wrf.cli.main.publish_cycle_receipt", side_effect=publish),
+                redirect_stdout(StringIO()) as stdout,
+            ):
+                self.assertEqual(main(args), 0)
+            self.assertEqual(
+                json.loads(stdout.getvalue())["latest"], ["outside_live_window", "newer"]
+            )
+
     def test_reconcile_rejects_missing_target_and_wrong_attempt_before_claim(self) -> None:
         product = next((CONFIG / "products").glob("*.yaml")).stem
         hour = load_bundle(CONFIG, product).product.publish_origin_hour_utc

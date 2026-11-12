@@ -11,7 +11,9 @@ from unittest import TestCase
 from unittest.mock import patch
 
 import httpx
+import numpy as np
 
+from av_wrf.codecs.icon_grib import _normalize_weights
 from av_wrf.contracts import BuildManifest
 from av_wrf.runner.forcing_icon import _REQUIRED, _SOIL_TEMP, _SOIL_TEMP_SELECTORS, ICON_EU
 from av_wrf.runner.grib import GRIB_FIELD_KEYS
@@ -22,7 +24,12 @@ from tests.integration import bundle_for_recipe
 
 CONFIG = Path(__file__).resolve().parents[2] / "config"
 CYCLE = datetime(2026, 11, 11, 18, tzinfo=UTC)
-_FRAME = b"GRIB\x00\x00\x00\x02" + (20).to_bytes(8, "big") + b"7777"
+_KEY = next(key for key in ICON_EU.file_keys(CYCLE, (0,))["0"] if "/T_G/" in key)
+_SECTIONS = b"".join(
+    length.to_bytes(4, "big") + bytes((number,)) + bytes(length - 5)
+    for number, length in ((1, 21), (3, 14), (4, 9), (5, 11), (6, 6), (7, 5))
+)
+_FRAME = b"GRIB\x00\x00\x00\x02" + (20 + len(_SECTIONS)).to_bytes(8, "big") + _SECTIONS + b"7777"
 
 
 def _messages() -> list[dict[str, object]]:
@@ -38,6 +45,7 @@ def _messages() -> list[dict[str, object]]:
         "iDirectionIncrementInDegrees": 0.0625,
         "jDirectionIncrementInDegrees": 0.0625,
         "iScansNegatively": 0,
+        "jScansPositively": 1,
         "jPointsAreConsecutive": 0,
         "alternativeRowScanning": 0,
         "gridType": "regular_ll",
@@ -47,6 +55,11 @@ def _messages() -> list[dict[str, object]]:
         "bitmapPresent": 0,
         "Ni": 1377,
         "Nj": 657,
+        "numberOfDataPoints": 1377 * 657,
+        "numberOfValues": 1377 * 657,
+        "min": 0.0,
+        "max": 1.0,
+        "average": 0.5,
         "longitudeOfFirstGridPointInDegrees": 336.5,
         "longitudeOfLastGridPointInDegrees": 62.5,
         "latitudeOfFirstGridPointInDegrees": 29.5,
@@ -71,6 +84,16 @@ def _messages() -> list[dict[str, object]]:
 
 
 class TestIconForcing(TestCase):
+    def test_surface_weights_require_positive_finite_support(self) -> None:
+        for value in (0.0, float("nan"), float("inf")):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    ValueError, "Invalid ICON interpolation weights for the target land/sea class"
+                ),
+            ):
+                _normalize_weights(np.array([[value, 0.0, 0.0]]), "the target land/sea class")
+
     def test_download_honors_retry_after_and_reuses_cache(self) -> None:
         responses = iter(
             (
@@ -82,35 +105,45 @@ class TestIconForcing(TestCase):
             TemporaryDirectory() as tmp,
             httpx.Client(transport=httpx.MockTransport(lambda _: next(responses))) as client,
             patch("av_wrf.runner.icon_acquire.sleep") as delay,
+            patch("av_wrf.runner.icon_acquire.verify_icon_object") as verify,
         ):
             root = Path(tmp)
             cache = LocalFileStore(root)
             for _ in range(2):
                 _download(
-                    "forcing.grib2",
+                    CYCLE,
+                    _KEY,
                     client=client,
                     mirrors=("https://example.invalid",),
                     cache=cache,
                     root=root,
                 )
-                self.assertEqual(cache.get_bytes("forcing.grib2"), _FRAME)
+                self.assertEqual(cache.get_bytes(_KEY), _FRAME)
             delay.assert_called_once_with(2.0)
+            verify.assert_called_once()
 
     def test_download_falls_back_from_malformed_mirrors(self) -> None:
-        truncated = _FRAME[:8] + (24).to_bytes(8, "big") + _FRAME[-4:]
-        bodies = iter((b"<html>Unavailable</html>", truncated, _FRAME * 2, _FRAME))
+        truncated = _FRAME[:8] + (len(_FRAME) + 4).to_bytes(8, "big") + _FRAME[16:]
+        bad_section = _FRAME[:20] + b"\x07" + _FRAME[21:]
+        bodies = iter((b"<html>Unavailable</html>", truncated, _FRAME * 2, bad_section, _FRAME))
         transport = httpx.MockTransport(lambda _: httpx.Response(200, content=next(bodies)))
-        with TemporaryDirectory() as tmp, httpx.Client(transport=transport) as client:
+        with (
+            TemporaryDirectory() as tmp,
+            httpx.Client(transport=transport) as client,
+            patch("av_wrf.runner.icon_acquire.verify_icon_object") as verify,
+        ):
             root = Path(tmp)
             cache = LocalFileStore(root)
             _download(
-                "forcing.grib2",
+                CYCLE,
+                _KEY,
                 client=client,
-                mirrors=tuple(f"https://mirror-{i}.invalid" for i in range(4)),
+                mirrors=tuple(f"https://mirror-{i}.invalid" for i in range(5)),
                 cache=cache,
                 root=root,
             )
-            self.assertEqual(cache.get_bytes("forcing.grib2"), _FRAME)
+            self.assertEqual(cache.get_bytes(_KEY), _FRAME)
+            verify.assert_called_once()
 
     def test_acquisition_rejects_prep_drift(self) -> None:
         product = bundle_for_recipe(CONFIG, ICON_EU).product.product_id
@@ -179,6 +212,7 @@ class TestIconForcing(TestCase):
                     ("uvRelativeToGrid", 1, "earth-relative winds"),
                     ("validityTime", 0, "Wrong ICON-EU source, cycle or valid time"),
                     ("packingType", "grid_ccsds", "Invalid GRIB2 framing or packing"),
+                    ("numberOfValues", 1, "complete values"),
                 ):
                     with self.subTest(key=key), self.assertRaisesRegex(ValueError, error):
                         old = rows[0][key]

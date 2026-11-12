@@ -219,7 +219,7 @@ def prep_cycle_namelists(
     work_dir: Path,
     bundle: LoadedBundle | None = None,
 ) -> tuple[Path, Path]:
-    """Verify RunLock and write namelist.wps, namelist.input, and forcing_subset.json."""
+    """Verify RunLock and write WPS, real, WRF, and forcing subset inputs."""
     b = load_bundle(config_root, product_id) if bundle is None else bundle
     lk = load_run_lock(store, product_id, cycle_partition, attempt_id, bundle=b)
     source = b.primary_source
@@ -232,6 +232,12 @@ def prep_cycle_namelists(
     )
     wrf_path.write_text(
         render_fortran_namelist(compile_wrf_run_namelist(b.domain, b.science, lk, source)),
+        encoding="utf-8",
+    )
+    (work_dir / "namelist.input.real").write_text(
+        render_fortran_namelist(
+            compile_wrf_run_namelist(b.domain, b.science, lk, source, for_real=True)
+        ),
         encoding="utf-8",
     )
     (work_dir / "forcing_subset.json").write_bytes(json_bytes(subset))
