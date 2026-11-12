@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import math
+from collections import deque
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import numpy as np
 import numpy.typing as npt
@@ -73,9 +75,7 @@ def _decode_field_shard(rel_key: str, payload: bytes, b: LoadedBundle) -> npt.ND
     field_name = rel_key.split("/", 1)[0]
     ny, nx = published_grid_shape(b.domain)
     nz = b.domain.exported_levels_k if field_name in WRF_ZARR_V3_3D_NAMES else 1
-    arr = decode_shard_f32_array(
-        payload, shard_time_steps=1, n_frames=1, nz=nz, ny=ny, nx=nx, output=b.output
-    )
+    arr = decode_shard_f32_array(payload, nz=nz, ny=ny, nx=nx, output=b.output)
     if not bool(np.all(np.isfinite(arr))):
         raise ValueError(f"Non-finite values in decoded staged shard {rel_key}")
     validate_thermodynamic_field(field_name, arr)
@@ -146,15 +146,16 @@ def verify_published_objects(
     digests = dict(receipt.shard_sha256s)
     if len(receipt.shard_sha256s) != len(keys) or digests.keys() != keys:
         raise ValueError("Published Zarr inventory differs from the expected store hierarchy")
-    _verify_diagnostics_receipt(store, root, lock, None)
+    zarr_root = f"{root}/{receipt.zarr_relpath}"
+    _verify_diagnostics_receipt(store, zarr_root.rsplit("/", 1)[0], lock, None)
     canonical = meta | coords
     for rel_key, digest in digests.items():
-        payload = _verified_object(store, f"{root}/{receipt.zarr_relpath}/{rel_key}", digest)
+        payload = _verified_object(store, f"{zarr_root}/{rel_key}", digest)
         if rel_key in canonical and payload != canonical[rel_key]:
             raise ValueError(f"Published Zarr metadata or coordinate {rel_key} contradicts RunLock")
 
 
-def verify_staged_objects(
+def _verify_staged_objects(
     stage_store: ObjectStore,
     stage_root: str,
     pm: StagedPostManifest,
@@ -208,3 +209,32 @@ def verify_staged_objects(
             validate_column_geometry(float(np.min(gaps)), float(np.max(gaps)), min_bl, b.domain)
         on_verified_object(rel_key, payload)
     return diag_raw
+
+
+def write_verified_payload(
+    stage_store: ObjectStore,
+    stage_root: str,
+    pm: StagedPostManifest,
+    b: LoadedBundle,
+    window: CycleWindow,
+    lock: RunLock,
+    write: Callable[[str, bytes], None],
+) -> None:
+    """Verify and copy one payload with a bounded number of concurrent writes."""
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        pending: deque[Future[None]] = deque()
+
+        def push(rel_key: str, payload: bytes) -> None:
+            if len(pending) == 4:
+                pending.popleft().result()
+            pending.append(pool.submit(write, f"{pm.zarr_relpath}/{rel_key}", payload))
+
+        diag_raw = _verify_staged_objects(
+            stage_store, stage_root, pm, b, window, lock, on_verified_object=push
+        )
+        for future in pending:
+            future.result()
+    write("_diagnostics.json", diag_raw)
+
+
+__all__ = ["validate_post_manifest", "verify_published_objects", "write_verified_payload"]

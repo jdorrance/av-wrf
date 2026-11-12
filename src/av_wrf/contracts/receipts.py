@@ -26,6 +26,9 @@ def req_float(doc: Mapping[str, object], key: str) -> float:
     val = doc.get(key)
     if isinstance(val, bool) or not isinstance(val, (int, float)):
         raise ValueError(f"Expected number for '{key}'")
+    # json.loads accepts NaN/Infinity by default; no receipt may carry a non-finite metric.
+    if not math.isfinite(float(val)):
+        raise ValueError(f"Expected finite number for '{key}'")
     return float(val)
 
 
@@ -269,6 +272,8 @@ class DiagnosticsReceipt:
     mean_sensible_flux_wm2: float
     mean_latent_flux_wm2: float
     total_precip_mm: float
+    adaptive_dt_min_s: float = 0.0
+    adaptive_dt_max_s: float = 0.0
 
     def to_doc(self) -> dict[str, object]:
         return dataclasses.asdict(self)
@@ -290,4 +295,6 @@ class DiagnosticsReceipt:
             req_float(doc, "mean_sensible_flux_wm2"),
             req_float(doc, "mean_latent_flux_wm2"),
             req_float(doc, "total_precip_mm"),
+            req_float(doc, "adaptive_dt_min_s") if "adaptive_dt_min_s" in doc else 0.0,
+            req_float(doc, "adaptive_dt_max_s") if "adaptive_dt_max_s" in doc else 0.0,
         )

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import math
 import struct
 import sys
 import unittest
@@ -26,7 +25,6 @@ from av_wrf.codecs import (  # noqa: E402
     outer_shard_yx,
     resolve_inner_chunk_yx,
     synthetic_thm_from_dry_theta,
-    verify_shard_index,
     zarr_shard_relpath,
 )
 from av_wrf.contracts import (  # noqa: E402
@@ -82,6 +80,7 @@ class TestVendorZarrContract(unittest.TestCase):
         self.assertEqual(len(WRF_ZARR_V3_COORDS), 7)
 
         vendored_fields = raw["fields"]
+        self.assertEqual(len(vendored_fields), 22)
         self.assertEqual(len(vendored_fields), len(WRF_ZARR_V3_FIELDS))
         for idx in range(len(WRF_ZARR_V3_FIELDS)):
             expected = vendored_fields[idx]
@@ -98,40 +97,36 @@ class TestVendorZarrContract(unittest.TestCase):
 
         prod_id = sorted((ROOT / "config" / "products").glob("*.yaml"))[0].stem
         base_out = load_bundle(ROOT / "config", prod_id).output
-        # Prime 149 x 181 grid now uses exact [64, 64] inner chunks inside a [192, 192] outer shard!
         self.assertEqual(resolve_inner_chunk_yx(149, 181, base_out), (64, 64))
         self.assertEqual(outer_shard_yx(149, 181, base_out), (192, 192))
-        # Pathological 1x1 inner chunk exceeding 64-tile cap is rejected
-        with self.assertRaises(ValueError):
-            resolve_inner_chunk_yx(100, 100, dataclasses.replace(base_out, inner_chunk_yx=(4, 4)))
+        with self.assertRaisesRegex(ValueError, "cap"):
+            resolve_inner_chunk_yx(1025, 1025, base_out)
 
-        out = dataclasses.replace(base_out, inner_chunk_yx=(6, 8), shard_time_steps=3)
-        # Non-divisible 10 x 13 grid padded to 12 x 16 (2 x 2 = 4 spatial tiles per frame)
-        f0 = PubMass2D(Slab2DF32.from_values(10, 13, [float(i) for i in range(130)]))
-        f1 = PubMass2D(Slab2DF32.from_values(10, 13, [float(i) + 500.0 for i in range(130)]))
-        shard2d = encode_2d_shard_bytes([f0, f1], out, shard_time_steps=3)
-        dec2d = decode_shard_f32_array(
-            shard2d, shard_time_steps=3, n_frames=2, nz=1, ny=10, nx=13, output=out
-        ).ravel()
-        self.assertEqual(list(dec2d[:130]), list(f0.buf))
-        self.assertEqual(list(dec2d[130:260]), list(f1.buf))
-        self.assertTrue(all(math.isnan(v) for v in dec2d[260:]))
-        with self.assertRaises(ValueError):
-            verify_shard_index(shard2d, shard_time_steps=3, n_frames=3, ny=10, nx=13, output=out)
+        # Prime dimensions exercise padding on both axes with canonical 64x64 tiles.
+        ny, nx = 149, 181
+        slab = PubMass2D(Slab2DF32.from_values(ny, nx, [float(i) for i in range(ny * nx)]))
+        shard2d = encode_2d_shard_bytes(slab, base_out)
+        dec2d = decode_shard_f32_array(shard2d, nz=1, ny=ny, nx=nx, output=base_out)
+        self.assertEqual(dec2d.ravel().tolist(), list(slab.buf))
+        volume = PubMass3D(
+            Slab3DF32.from_values(2, ny, nx, [float(i) * 0.5 for i in range(2 * ny * nx)])
+        )
+        shard3d = encode_3d_shard_bytes(volume, base_out)
+        dec3d = decode_shard_f32_array(shard3d, nz=2, ny=ny, nx=nx, output=base_out)
+        self.assertEqual(dec3d.ravel().tolist(), list(volume.buf))
 
-        v0 = PubMass3D(Slab3DF32.from_values(2, 10, 13, [float(i) * 0.5 for i in range(260)]))
-        v1 = PubMass3D(Slab3DF32.from_values(2, 10, 13, [float(i) * 1.5 for i in range(260)]))
-        shard3d = encode_3d_shard_bytes([v0, v1], out, shard_time_steps=2)
-        dec3d = decode_shard_f32_array(shard3d, shard_time_steps=2, nz=2, ny=10, nx=13, output=out)
-        self.assertEqual(dec3d.ravel().tolist(), [*v0.buf, *v1.buf])
-
-        idx_len = 8 * 16
+        idx_len = 9 * 16
         body = shard3d[: -(idx_len + 4)]
-        bad_idx = bytearray(shard3d[-(idx_len + 4) : -4])
-        struct.pack_into("<QQ", bad_idx, 0, 4, 8)
-        forged = body + bytes(bad_idx) + struct.pack("<I", crc32c_u32(bytes(bad_idx)))
-        with self.assertRaises(ValueError):
-            verify_shard_index(forged, shard_time_steps=2, n_frames=2, ny=10, nx=13, output=out)
+        original_idx = shard3d[-(idx_len + 4) : -4]
+        for offset, length in ((4, 8), (0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF), (0, 0)):
+            bad_idx = bytearray(original_idx)
+            struct.pack_into("<QQ", bad_idx, 0, offset, length)
+            forged = body + bad_idx + struct.pack("<I", crc32c_u32(bytes(bad_idx)))
+            with self.subTest(offset=offset, length=length), self.assertRaises(ValueError):
+                decode_shard_f32_array(forged, nz=2, ny=ny, nx=nx, output=base_out)
+        bad_crc = shard3d[:-1] + bytes([shard3d[-1] ^ 1])
+        with self.assertRaisesRegex(ValueError, "CRC-32C"):
+            decode_shard_f32_array(bad_crc, nz=2, ny=ny, nx=nx, output=base_out)
 
     def test_complete_zarr_v3_hierarchy_exact_64x64_chunks_and_cli_check(self) -> None:
         cfg_dir = ROOT / "config"

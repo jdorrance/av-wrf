@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
@@ -14,7 +15,7 @@ import numpy.typing as npt
 import zarr
 from zarr.types import AnyArray
 
-from av_wrf.codecs import select_cycle_wrfout_slices
+from av_wrf.codecs import domain_tag, select_cycle_wrfout_slices
 from av_wrf.codecs.wrf_nc import RRTMG_SHORTWAVE_TOLERANCE_WM2
 from av_wrf.contracts import ReadyReceipt, SolverReceipt, parse_iso_utc
 from av_wrf.contracts.receipts import req_int
@@ -25,6 +26,7 @@ from av_wrf.contracts.zarr_schema import (
     ZARR_SCHEMA_VERSION,
 )
 from av_wrf.runner import sha256_file
+from av_wrf.runner.publish import ready_forecast_relpath
 
 _LEGACY_ALBEDO_SENTINEL = -9999.0
 _SHORTWAVE = ("SWDOWN", "SWNORM", "SWDNB", "SWUPB", "SWDNT", "SWUPT")
@@ -51,9 +53,10 @@ def _open_forecast(path: Path) -> tuple[ReadyReceipt, zarr.Group]:
     ready = ReadyReceipt.from_doc(_read_doc(path))
     if (ready.schema_id, ready.schema_version) != (ZARR_SCHEMA_ID, ZARR_SCHEMA_VERSION):
         raise ValueError(f"Unexpected forecast schema: {path}")
-    root = (path.parent / ready.zarr_relpath).resolve()
-    if root.parent != path.parent.resolve():
-        raise ValueError(f"Forecast store must be adjacent to its ready receipt: {path}")
+    ready_dir = path.parent.resolve()
+    root = (ready_dir / ready_forecast_relpath(ready)).resolve()
+    if root == ready_dir or not root.is_relative_to(ready_dir):
+        raise ValueError(f"Forecast store escapes its ready receipt directory: {path}")
     _verify_hashes(
         root,
         ready.shard_sha256s,
@@ -232,13 +235,20 @@ def _native_radiation(
         ready.oci_digest,
     ):
         raise ValueError("Solver receipt and published forecast identities differ")
+    # The receipt lists only the active domain's history, including on nested runs.
+    first_name = solver.wrfout_sha256s[0][0] if solver.wrfout_sha256s else ""
+    match = re.fullmatch(r"wrfout_d([0-9]{2})_.+", first_name)
+    if match is None:
+        raise ValueError("Solver receipt lacks a WRF history filename")
+    domain_id = int(match[1])
+    pattern = f"wrfout_{domain_tag(domain_id)}_*"
     _verify_hashes(
         directory,
         solver.wrfout_sha256s,
-        {p.name for p in directory.glob("wrfout_d01_*") if p.is_file()},
+        {p.name for p in directory.glob(pattern) if p.is_file()},
     )
     initial, leads = select_cycle_wrfout_slices(
-        directory, ready.publish_origin_utc, ready.valid_times_utc
+        directory, ready.publish_origin_utc, ready.valid_times_utc, domain_id=domain_id
     )
     full: Counter[str] = Counter()
     interior: Counter[str] = Counter()

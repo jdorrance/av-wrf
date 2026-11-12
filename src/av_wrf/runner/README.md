@@ -21,7 +21,10 @@ uv run --extra icon python -m av_wrf.runner.icon_acquire \
   --plan work/prep/forcing_subset.json --cache work/dwd --grib-dir work/grib
 ```
 
-The GFS command needs `grib_ls` and hashes the received NOAA regional subset.
+GFS needs `grib_ls` and defaults to range requests for global fields. Use
+`acquire --gfs-regional-filter` or the standalone `--regional-filter` for the
+planned NOAA cutout. The [NOMADS filter](https://nomads.ncep.noaa.gov/info.php?page=gribfilter)
+requires at least ten seconds between automated requests.
 Stage archived inputs directly when available. Seal the complete cycle with
 `forcing-manifest --file HOUR=FILENAME`. Use `--acquisition-inventory` to bind
 the generated `*.sources-*.json` to the manifest and solver receipt. Use fresh

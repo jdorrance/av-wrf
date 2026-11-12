@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from av_wrf.contracts import DomainProfile, ForcingProfile
-from av_wrf.core import computational_latlon_bounds
+from av_wrf.core import computational_latlon_bounds, forcing_domain
 from av_wrf.runner.forcing_recipe import ForcingRecipe
 from av_wrf.runner.grib import (
     GRIB_FIELD_KEYS,
@@ -97,7 +97,7 @@ def _validate_file(
     rows = checked_grib_grid(
         path,
         messages,
-        computational_latlon_bounds(domain, snap_deg=spacing),
+        computational_latlon_bounds(forcing_domain(domain, spacing), snap_deg=spacing),
         spacing,
         ("grid_simple", "grid_complex", "grid_complex_spatial_differencing"),
     )

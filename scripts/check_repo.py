@@ -19,6 +19,7 @@ from scripts.sync_contract import verify_manifest_lock  # noqa: E402
 
 ALLOWED_TOP_LEVEL = frozenset(
     {
+        ".dockerignore",
         ".github",
         ".gitignore",
         ".env.example",
@@ -44,6 +45,7 @@ ALLOWED_TOP_LEVEL = frozenset(
 IGNORED_NAMES = frozenset(
     {
         ".git",
+        ".kilo",
         "__pycache__",
         ".venv",
         ".pytest_cache",

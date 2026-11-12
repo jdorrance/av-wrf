@@ -8,7 +8,11 @@ import tomllib
 from pathlib import Path
 
 CONSUMER_FENCE_TOKENS = ("pmtiles", "lenschow", "samples.bin", "profiles.bin", "subgrid_terrain")
-SHARED_CORE_FOUNDATIONS = frozenset({"grid", "thermo", "vertical"})
+# `namelist` and `nesting` are pure primitive modules shared by the WPS compiler and core
+# namelist validation, so they are foundations alongside grid/thermo/vertical.
+SHARED_CORE_FOUNDATIONS = frozenset(
+    {"grid", "thermo", "vertical", "namelist", "nesting", "physics_namelist", "post_3d"}
+)
 MAX_FILE_LINES, MAX_FUNC_LINES, MAX_LINE_COLS = 350, 60, 100
 _ROOT_PYPROJECT = Path(__file__).resolve().parent.parent / "pyproject.toml"
 

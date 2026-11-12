@@ -36,6 +36,7 @@ from av_wrf.contracts import (
     MAX_EXPORTED_LEVELS,
     DomainProfile,
     NormalizedWrfFrame,
+    RawWrfStepInput,
 )
 from av_wrf.core.thermo import G0_MPS2, P0_PA, R_DRY_J_KG_K
 
@@ -153,6 +154,17 @@ def estimate_auto_levels_agl_m(
     return _midpoints_from_eta_faces(etas, domain, terrain_m, etac, base_temp_k)
 
 
+def staggered_face_phi(raw: RawWrfStepInput, trim: int, k_exp: int) -> npt.NDArray[np.float64]:
+    """Return `(k_exp + 1, ny, nx)` staggered geopotential faces `ph + phb` for true dz."""
+    nz, ny, nx = raw.ph_stag_m2s2.nz, raw.ph_stag_m2s2.ny, raw.ph_stag_m2s2.nx
+    if k_exp + 1 > nz:
+        raise ValueError("Exported levels exceed staggered geopotential faces")
+    ph = np.frombuffer(raw.ph_stag_m2s2.buf, np.float32).reshape(nz, ny, nx)
+    phb = np.frombuffer(raw.phb_stag_m2s2.buf, np.float32).reshape(nz, ny, nx)
+    phi = np.add(ph[: k_exp + 1, trim:-trim, trim:-trim], phb[: k_exp + 1, trim:-trim, trim:-trim])
+    return phi.astype(np.float64)
+
+
 def validate_solver_znw(znw: Sequence[float], domain: DomainProfile) -> None:
     """Check that solver-emitted full eta faces match the configured WRF grid."""
     if len(znw) != domain.e_vert:
@@ -256,8 +268,16 @@ def validate_wrfinput_columns(
     phb: npt.NDArray[np.float32],
     hgt_m: npt.NDArray[np.float32],
     domain: DomainProfile,
+    *,
+    published: bool = True,
 ) -> None:
-    """Gate solver-initialized columns over the published interior before integration."""
+    """Reject folded native columns and check consumer geometry on the output domain."""
+    if not published:
+        # The outer grid feeds the solver. Only the output grid has consumer height limits.
+        phi = np.add(ph, phb, dtype=np.float64)
+        if np.any(phi[1:] <= phi[:-1]):
+            raise ValueError("Parent wrfinput has a folded geopotential column")
+        return
     trim = domain.bdy_trim_cells
     phi = np.add(ph[:, trim:-trim, trim:-trim], phb[:, trim:-trim, trim:-trim], dtype=np.float64)
     agl = (phi[1:] + phi[:-1]) * (0.5 / G0_MPS2) - hgt_m[trim:-trim, trim:-trim]
@@ -284,6 +304,7 @@ __all__ = [
     "auto_eta_faces",
     "estimate_auto_levels_agl_m",
     "model_column_spacing",
+    "staggered_face_phi",
     "validate_column_geometry",
     "validate_frame_columns",
     "validate_solver_znw",

@@ -94,6 +94,30 @@ def require_path_segment(value: str, label: str) -> None:
         raise ValueError(f"{label} must be a single safe path segment")
 
 
+def _product_namespaces(config_root: Path) -> dict[str, str]:
+    """Read product identities and reject competing publication namespaces before planning."""
+    paths = sorted((config_root / "products").glob("*.yaml"))
+    if not paths:
+        raise FileNotFoundError(f"No product YAML files found under {config_root / 'products'}")
+    namespaces: dict[str, str] = {}
+    for path in paths:
+        require_path_segment(path.stem, "product_id")
+        doc = parse_declarative_yaml(path)
+        if doc.get("product_id") != path.stem:
+            raise ValueError(f"{path}: product_id must match the filename")
+        model_id = doc.get("model_id")
+        if not isinstance(model_id, str):
+            raise ValueError(f"{path}: model_id must be a single safe path segment")
+        require_path_segment(model_id, "model_id")
+        # Public forecasts share model_id roots; separate product run locks cannot fence them.
+        if model_id in namespaces.values():
+            raise ValueError(
+                "Configured products must have distinct model_id publication namespaces"
+            )
+        namespaces[path.stem] = model_id
+    return namespaces
+
+
 def load_bundle(config_root: Path, product_id: str) -> LoadedBundle:
     """Load and hash the same bytes for the product and each referenced profile."""
     hasher = hashlib.sha256()

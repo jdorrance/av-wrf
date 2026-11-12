@@ -12,6 +12,7 @@ from av_wrf.cli.env import RuntimeEnv, load_runtime_env
 from av_wrf.runner import (
     LoadedBundle,
     ObjectStore,
+    acquire_forcing,
     check_all_products,
     check_product_config,
     load_build_manifest,
@@ -35,8 +36,9 @@ from av_wrf.runner import (
 CLI_COMMANDS: tuple[tuple[str, str], ...] = (
     ("check", "Validate configured product(s), vertical stretch, namelist, and Zarr v3."),
     ("plan", "Resolve cycle timestamps and persist an immutable run.lock.json."),
-    ("geog", "Build and validate geo_em.d01.nc in a new working directory."),
+    ("geog", "Build and validate static geography for the active domains."),
     ("prep", "Write Fortran namelist.wps + namelist.input and forcing_subset.json recipe."),
+    ("acquire", "Acquire and seal the locked forcing inventory."),
     ("forcing-manifest", "Verify local GRIB2 inputs and record the forcing inventory."),
     ("solve", "Execute WPS ungrib/metgrid + MPI real/wrf and bind solver_receipt.json."),
     ("post", "Stage wrfout frames into attempt-scoped sharded wrf-zarr-v3 arrays."),
@@ -44,7 +46,7 @@ CLI_COMMANDS: tuple[tuple[str, str], ...] = (
     ("reconcile", "Dispatch pending _ready.json webhook idempotently (fail closed)."),
 )
 
-_CYCLE_CMDS = {"plan", "prep", "forcing-manifest", "solve", "post", "publish", "reconcile"}
+_CYCLE_CMDS = {name for name, _ in CLI_COMMANDS if name not in {"check", "geog"}}
 
 
 def _add_subcommand_flags(cmd_name: str, cmd: argparse.ArgumentParser) -> None:
@@ -64,12 +66,12 @@ def _add_subcommand_flags(cmd_name: str, cmd: argparse.ArgumentParser) -> None:
             action="store_true",
             help="Permit local host dry-run when solver build-manifest.json is absent",
         )
-        cmd.add_argument("--geog-file", type=Path, help="Bind prebuilt geo_em.d01.nc SHA-256")
+        cmd.add_argument("--geog-file", type=Path, help="Bind the geography file or bundle SHA-256")
     if cmd_name in {"geog", "prep"}:
         default_dir = "work/geog" if cmd_name == "geog" else "work/prep"
         dir_help = "New geogrid directory" if cmd_name == "geog" else "Target directory"
         cmd.add_argument("--work-dir", default=default_dir, help=dir_help)
-    if cmd_name in {"forcing-manifest", "solve"}:
+    if cmd_name in {"acquire", "forcing-manifest", "solve"}:
         cmd.add_argument("--grib-dir", type=Path, required=True, help="Staged forcing directory")
     if cmd_name == "forcing-manifest":
         cmd.add_argument("--acquisition-inventory", type=Path, help="Source hash inventory path")
@@ -82,10 +84,10 @@ def _add_subcommand_flags(cmd_name: str, cmd: argparse.ArgumentParser) -> None:
         )
     if cmd_name == "solve":
         cmd.add_argument("--work-dir", default="work/solve", help="Attempt scratch root")
-        cmd.add_argument("--geog-file", type=Path, required=True, help="Locked geo_em.d01.nc")
+        cmd.add_argument("--geog-file", type=Path, required=True, help="Locked geography path")
     if cmd_name == "post":
         source = cmd.add_mutually_exclusive_group(required=True)
-        source.add_argument("--wrfout-dir", type=Path, help="Directory of wrfout_d01_* files")
+        source.add_argument("--wrfout-dir", type=Path, help="Active-domain WRF output directory")
         source.add_argument("--synthetic", action="store_true", help="Stage full synthetic horizon")
     if cmd_name == "publish":
         cmd.add_argument(
@@ -101,7 +103,6 @@ def _add_subcommand_flags(cmd_name: str, cmd: argparse.ArgumentParser) -> None:
         cmd.add_argument(
             "--store-uri",
             action="append",
-            default=None,
             help="Target destination store URI(s) (repeatable; defaults to AV_WRF_STORE_URI)",
         )
     if cmd_name == "reconcile":
@@ -113,7 +114,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="av-wrf")
     sub = parser.add_subparsers(dest="command", required=True)
     for cmd_name, help_text in CLI_COMMANDS:
-        _add_subcommand_flags(cmd_name, sub.add_parser(cmd_name, help=help_text))
+        cmd = sub.add_parser(cmd_name, help=help_text)
+        _add_subcommand_flags(cmd_name, cmd)
+        if cmd_name == "acquire":
+            cmd.add_argument("--plan", type=Path, help="Verify a prep forcing_subset.json")
+            cmd.add_argument("--cache", type=Path, help="ICON source object cache")
+            cmd.add_argument("--workers", type=int, default=8, help="Concurrent downloads")
+            cmd.add_argument("--gfs-regional-filter", action="store_true", help="Use NOAA cutout")
     return parser
 
 
@@ -231,7 +238,7 @@ def _run_publish_cmd(
 ) -> dict[str, object]:
     raw_uris: list[str] = list(dict.fromkeys(args.store_uri or [env.store_uri]))
     destinations = [
-        stg_store if uri == env.stage_store_uri else open_store(uri) for uri in raw_uris
+        stg_store if uri == env.stage_store_uri else open_store(uri, s3=env.s3) for uri in raw_uris
     ]
     prune = bool(args.prune_stage)
     last_rec = None
@@ -266,7 +273,7 @@ def _dispatch_cycle_cmd(args: argparse.Namespace, env: RuntimeEnv, cfg_dir: Path
     bundle = load_bundle(cfg_dir, prod_id)
     orig_utc, part = parse_cycle_arg(str(args.cycle), bundle.product)
     if args.command == "reconcile":
-        dst_store = open_store(args.store_uri or env.store_uri)
+        dst_store = open_store(args.store_uri or env.store_uri, s3=env.s3)
         rec = load_ready_receipt(dst_store, bundle.product.model_id, part)
         if args.attempt is not None and rec.attempt_id != args.attempt:
             raise ValueError(f"Expected published attempt {args.attempt!r}, got {rec.attempt_id!r}")
@@ -281,11 +288,23 @@ def _dispatch_cycle_cmd(args: argparse.Namespace, env: RuntimeEnv, cfg_dir: Path
         )
         out = {"status": "reconciled", "dispatched_now": sent, "cycle": part}
     else:
-        stg_store = open_store(env.stage_store_uri)
+        stg_store = open_store(env.stage_store_uri, s3=env.s3)
         if args.command in {"plan", "prep", "solve"}:
             out = _run_plan_prep_or_solve(args, env, cfg_dir, stg_store, bundle, orig_utc, part)
         elif args.command == "forcing-manifest":
             out = _run_forcing_manifest_cmd(args, stg_store, bundle, part)
+        elif args.command == "acquire":
+            lock = load_run_lock(stg_store, prod_id, part, att, bundle=bundle)
+            manifest = acquire_forcing(
+                bundle,
+                lock,
+                args.grib_dir,
+                plan_path=args.plan,
+                cache=args.cache,
+                workers=args.workers,
+                gfs_regional_filter=args.gfs_regional_filter,
+            )
+            out = {"status": "forcing_verified", "forecast_hours": manifest.forecast_hours}
         elif args.command == "post":
             prefix, count = post_cycle_from_inputs(
                 cfg_dir,
@@ -329,7 +348,3 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps({"status": "geog_ready", "geo_em": str(geo_em), "sha256": geo_sha}))
         return 0
     return _dispatch_cycle_cmd(args, env, cfg_dir)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

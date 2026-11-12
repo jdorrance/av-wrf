@@ -37,7 +37,14 @@ PROFILE_TO_NAMELIST_KEY: dict[str, tuple[str, str]] = {
     "sf_sfclay_physics": ("physics", "sf_sfclay_physics"),
     "sf_surface_physics": ("physics", "sf_surface_physics"),
     "bl_pbl_physics": ("physics", "bl_pbl_physics"),
+    "bl_mynn_edmf": ("physics", "bl_mynn_edmf"),
     "topo_wind": ("physics", "topo_wind"),
+    "icloud": ("physics", "icloud"),
+    "icloud_bl": ("physics", "icloud_bl"),
+    "sf_lake_physics": ("physics", "sf_lake_physics"),
+    "use_lakedepth": ("physics", "use_lakedepth"),
+    "lakedepth_default_m": ("physics", "lakedepth_default"),
+    "lake_min_elev_m": ("physics", "lake_min_elev"),
     "ysu_topdown_pblmix": ("physics", "ysu_topdown_pblmix"),
     "shinhong_scu_mixing": ("physics", "shinhong_scu_mixing"),
     "shinhong_nonlocal_flux": ("physics", "shinhong_nonlocal_flux"),
@@ -52,6 +59,8 @@ PROFILE_TO_NAMELIST_KEY: dict[str, tuple[str, str]] = {
     "km_opt": ("dynamics", "km_opt"),
     "diff_6th_opt": ("dynamics", "diff_6th_opt"),
     "diff_6th_factor": ("dynamics", "diff_6th_factor"),
+    "diff_6th_slopeopt": ("dynamics", "diff_6th_slopeopt"),
+    "diff_6th_thresh": ("dynamics", "diff_6th_thresh"),
     "epssm": ("dynamics", "epssm"),
     "w_damping": ("dynamics", "w_damping"),
     "damp_opt": ("dynamics", "damp_opt"),
@@ -59,6 +68,11 @@ PROFILE_TO_NAMELIST_KEY: dict[str, tuple[str, str]] = {
     "dampcoef": ("dynamics", "dampcoef"),
     "gwd_opt": ("dynamics", "gwd_opt"),
     "gwd_if_nonhyd": ("dynamics", "gwd_if_nonhyd"),
+    "use_adaptive_time_step": ("domains", "use_adaptive_time_step"),
+    "target_cfl": ("domains", "target_cfl"),
+    "target_hcfl": ("domains", "target_hcfl"),
+    "min_time_step_s": ("domains", "min_time_step"),
+    "max_time_step_s": ("domains", "max_time_step"),
     "afwa_diag_opt": ("afwa", "afwa_diag_opt"),
     "afwa_buoy_opt": ("afwa", "afwa_buoy_opt"),
     "spec_bdy_width": ("bdy_control", "spec_bdy_width"),
@@ -142,16 +156,30 @@ class TestNamelist(unittest.TestCase):
         )
         custom_dom = dataclasses.replace(dom, dem_source="cop_glo30", landuse_source="modis_15s")
         wps_3h = compile_wps_namelist_sections(custom_dom, sci, lock, cand)
-        self.assertEqual(wps_3h["share"]["end_date"], "2026-11-12_18:00:00")
+        self.assertEqual(
+            wps_3h["share"]["end_date"], ("2026-11-12_18:00:00", "2026-11-11_18:00:00")
+        )
         self.assertEqual(wps_3h["share"]["interval_seconds"], 10_800)
-        self.assertEqual(wps_3h["geogrid"]["geog_data_res"], "modis_15s+cop_glo30+default")
+        geog_res = wps_3h["geogrid"]["geog_data_res"]
+        self.assertEqual(
+            geog_res[0] if isinstance(geog_res, tuple) else geog_res,
+            "modis_15s+cop_glo30+modis_lai+30s+default",
+        )
         self.assertEqual(required_forcing_forecast_hours(lock, src), tuple(range(23)))
         self.assertEqual(required_forcing_forecast_hours(lock, cand), tuple(range(0, 25, 3)))
         real = compile_wrf_run_namelist(dom, sci, lock, cand, for_real=True)["time_control"]
         wrf = compile_wrf_run_namelist(dom, sci, lock, cand)["time_control"]
-        self.assertEqual(real["end_hour"], 18)
-        self.assertEqual(wrf["end_hour"], 16)
+        self.assertEqual(real["end_hour"], (18, 18))
+        self.assertEqual(wrf["end_hour"], (16, 16))
         self.assertEqual(wrf["run_hours"], 22)
+        self.assertEqual(wrf["history_interval"], (60, 60))
+        self.assertEqual(wrf["history_begin_h"], (23, 6))
+        self.assertNotIn("iofields_filename", real)
+        self.assertEqual(wrf["iofields_filename"], ("mynn-history.txt",) * 2)
+        uncoupled = compile_wrf_run_namelist(
+            dom, dataclasses.replace(sci, icloud_bl=0), lock, cand
+        )["time_control"]
+        self.assertNotIn("iofields_filename", uncoupled)
 
         wrf_txt = render_fortran_namelist(compile_wrf_run_namelist(dom, sci, lock, src))
         self.assertNotIn("nwp_diagnostics", wrf_txt)
@@ -168,7 +196,7 @@ class TestNamelist(unittest.TestCase):
         for landuse, dem in (("custom", "default"), ("default", "custom"), ("custom", "custom")):
             domain = dataclasses.replace(dom, landuse_source=landuse, dem_source=dem)
             sections = compile_geogrid_namelist_sections(domain)
-            self.assertEqual(sections["geogrid"]["geog_data_res"], "custom+default")
+            self.assertEqual(sections["geogrid"]["geog_data_res"], "custom+modis_lai+30s+default")
             self.assertNotIn("start_date", sections["share"])
 
     def test_wide_lambert_grid_limits_timestep_at_its_corners(self) -> None:

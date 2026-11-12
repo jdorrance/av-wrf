@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
 
@@ -68,16 +69,21 @@ def _write_frame_shards(
     b: LoadedBundle,
     digests: list[tuple[str, str]],
 ) -> None:
-    for name in WRF_ZARR_V3_2D_NAMES:
-        if name == "terrain_m":
-            continue
+    def write(name: str) -> tuple[str, str]:
         rel = zarr_shard_relpath(name, b.output, time_index=time_index)
-        raw = encode_2d_shard_bytes([frame.fields_2d[name]], b.output)
-        digests.append((rel, put_idempotent(store, f"{zarr_stage}/{rel}", raw)))
-    for name in WRF_ZARR_V3_3D_NAMES:
-        rel = zarr_shard_relpath(name, b.output, time_index=time_index)
-        raw = encode_3d_shard_bytes([frame.fields_3d[name]], b.output)
-        digests.append((rel, put_idempotent(store, f"{zarr_stage}/{rel}", raw)))
+        raw = (
+            encode_3d_shard_bytes(frame.fields_3d[name], b.output)
+            if name in WRF_ZARR_V3_3D_NAMES
+            else encode_2d_shard_bytes(frame.fields_2d[name], b.output)
+        )
+        return rel, put_idempotent(store, f"{zarr_stage}/{rel}", raw)
+
+    names = tuple(name for name in WRF_ZARR_V3_2D_NAMES if name != "terrain_m")
+    names += WRF_ZARR_V3_3D_NAMES
+    # Submit only one bounded batch; workers never touch netCDF handles.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for offset in range(0, len(names), 4):
+            digests.extend(pool.map(write, names[offset : offset + 4]))
 
 
 def _frame_window_totals(frame: NormalizedWrfFrame) -> tuple[float, float, float, float]:
@@ -110,8 +116,12 @@ def _stream_staged_frames(
     dps_series: list[float] = []
     sh_wh, lh_wh, total_h, pr_tot, max_cfl = 0.0, 0.0, 0.0, 0.0, 0.0
     prev_psfc: Sequence[float] = crop_sponge_2d(f000_step.psfc_pa, b.domain.bdy_trim_cells).buf
-    scheduled = zip(window.valid_times_utc, starts_s, valid_s, lead_steps, strict=True)
-    for i, (expected_time, start_s, end_s, raw_step) in enumerate(scheduled):
+    steps = iter(lead_steps)
+    scheduled = zip(window.valid_times_utc, starts_s, valid_s, strict=True)
+    for i, (expected_time, start_s, end_s) in enumerate(scheduled):
+        raw_step = next(steps, None)
+        if raw_step is None:
+            raise ValueError("Too few WRF steps for the scheduled horizon")
         if (raw_step.valid_time_utc, raw_step.valid_time_unix_s) != (expected_time, end_s):
             raise ValueError(f"WRF step timestamp does not match scheduled {expected_time}")
         if raw_step.terrain_m != f000_step.terrain_m:
@@ -122,7 +132,7 @@ def _stream_staged_frames(
         max_cfl = max(max_cfl, validate_frame_columns(frame, b.domain))
         if i == 0:
             rel_t = zarr_shard_relpath("terrain_m", b.output)
-            raw_t = encode_2d_shard_bytes([frame.fields_2d["terrain_m"]], b.output)
+            raw_t = encode_2d_shard_bytes(frame.fields_2d["terrain_m"], b.output)
             digests.append((rel_t, put_idempotent(store, f"{zarr_stage}/{rel_t}", raw_t)))
         d_sh, d_lh, d_pr, dt_h = _frame_window_totals(frame)
         sh_wh, lh_wh, pr_tot, total_h = sh_wh + d_sh, lh_wh + d_lh, pr_tot + d_pr, total_h + dt_h
@@ -131,9 +141,15 @@ def _stream_staged_frames(
             dps_series.append(round(pressure_tendency_abs_hpa_hr(prev_psfc, psfc, dt_h), 4))
             prev_psfc = psfc
         _write_frame_shards(store, zarr_stage, i, frame, b, digests)
+        # zip/enumerate retain their last tuple; keep volumes out and release before next().
+        del raw_step, frame
+    if next(steps, None) is not None:
+        raise ValueError("Too many WRF steps for the scheduled horizon")
     coords = encode_coord_chunks(b.domain, window.lead_hours, valid_s, starts_s, valid_s)
-    for c_rel, c_bytes in sorted(coords.items()):
-        digests.append((c_rel, put_idempotent(store, f"{zarr_stage}/{c_rel}", c_bytes)))
+    digests.extend(
+        (rel, put_idempotent(store, f"{zarr_stage}/{rel}", data))
+        for rel, data in sorted(coords.items())
+    )
     stats = (sh_wh / total_h, lh_wh / total_h, pr_tot, max_cfl)
     return digests, stats, dps_series
 
@@ -155,7 +171,7 @@ def _stage_diagnostics_and_manifest(
     streamed: _StreamResult,
     elapsed_s: float,
     execution_mode: str,
-) -> None:
+) -> bytes:
     shard_digests, (sh_m, lh_m, pr_tot, max_cfl), dps = streamed
     diag = DiagnosticsReceipt(
         lk.model_id,
@@ -184,8 +200,7 @@ def _stage_diagnostics_and_manifest(
         execution_mode=execution_mode,
         producer_sha256=lk.producer_sha256,
     )
-    pm_key = post_manifest_key(lk.product_id, lk.cycle_partition, lk.attempt_id)
-    put_idempotent(store, pm_key, json_bytes(pm.to_doc()))
+    return json_bytes(pm.to_doc())
 
 
 def _stage_cycle(
@@ -208,9 +223,11 @@ def _stage_cycle(
         ]
         streamed = _stream_staged_frames(store, zarr_stage, f000_step, lead_steps, window, b)
         elapsed_s = round(max(1e-4, time.perf_counter() - t0), 4)
-        _stage_diagnostics_and_manifest(
+        manifest = _stage_diagnostics_and_manifest(
             store, stage_root, lk, window, meta_digests, streamed, elapsed_s, execution_mode
         )
+        pm_key = post_manifest_key(lk.product_id, lk.cycle_partition, lk.attempt_id)
+        put_idempotent(store, pm_key, manifest)
     return zarr_stage
 
 
@@ -235,7 +252,7 @@ def _open_cycle_inputs(
     if wrfout_dir is None:
         raise ValueError("Pass --wrfout-dir <dir> or --synthetic to `av-wrf post`")
     (f0_p, f0_i), leads = select_cycle_wrfout_slices(
-        wrfout_dir, win.publish_origin_utc, win.valid_times_utc
+        wrfout_dir, win.publish_origin_utc, win.valid_times_utc, domain_id=lk.active_domain_id
     )
     verify_solver_receipt(
         store, lk, wrfout_dir, selected_wrfouts={f0_p, *(path for path, _ in leads)}
@@ -256,6 +273,7 @@ def _open_cycle_inputs(
             time_index=index,
             expected_valid_utc=vt,
             require_surface_shortwave=True,
+            require_mynn_clouds=True,
         )
         for (path, index), vt in zip(leads, win.valid_times_utc, strict=True)
     )

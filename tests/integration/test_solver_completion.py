@@ -12,7 +12,7 @@ import netCDF4
 import numpy as np
 
 from av_wrf.contracts import BuildManifest, CycleWindow
-from av_wrf.core import resolve_cycle_window
+from av_wrf.core import nesting_active, resolve_cycle_window
 from av_wrf.runner import (
     LocalFileStore,
     attempt_stage_prefix,
@@ -113,6 +113,36 @@ class TestSolverCompletion(TestCase):
                 plan(mpi_ranks=bundle.domain.e_we * bundle.domain.e_sn)
             self.assertEqual(plan(mpi_ranks=4)[1].mpi_ranks, 4)
 
+    def test_plan_freezes_active_nested_domain(self) -> None:
+        bundle = next(
+            load_bundle(CONFIG, path.stem)
+            for path in sorted((CONFIG / "products").glob("*.yaml"))
+            if nesting_active(
+                load_bundle(CONFIG, path.stem).domain,
+                load_bundle(CONFIG, path.stem).primary_source.grid_spacing_deg,
+            )
+        )
+        product = bundle.product
+        with TemporaryDirectory() as tmp:
+            store = LocalFileStore(Path(tmp))
+            _, lock = plan_product_cycle(
+                CONFIG,
+                store,
+                product_id=product.product_id,
+                publish_origin_utc=f"2026-11-12T{product.publish_origin_hour_utc:02d}:00:00Z",
+                attempt_id="nested-lock",
+                mpi_ranks=4,
+                build_manifest=BuildManifest("host-dev-unpinned", "w", "p", (), "g", "m"),
+                bundle=bundle,
+            )
+            self.assertEqual((lock.max_dom, lock.active_domain_id), (2, 2))
+            self.assertEqual(
+                load_run_lock(
+                    store, product.product_id, lock.cycle_partition, lock.attempt_id, bundle=bundle
+                ),
+                lock,
+            )
+
     def test_native_manifest_validates_commits_and_preserves_legacy_builds(self) -> None:
         image = "sha256:" + "a" * 64
         manifest = {
@@ -135,13 +165,17 @@ class TestSolverCompletion(TestCase):
         default_log = (
             "2026-11-12 08:56:12.265 --- INFORM: Using default data source for HGT_M.\n"
             "2026-11-12 08:56:12.266 --- INFORM: Using default data source for LANDUSEF.\n"
+            "2026-11-12 08:56:12.267 --- INFORM: Using modis_lai data source for LAI12M.\n"
+            "2026-11-12 08:56:12.268 --- INFORM: Using 30s data source for VAR_SSO.\n"
         )
         log_error = RuntimeError, "Missing or empty WPS geogrid.log"
         cases = (
             ("default", default_log, None),
             (
-                "missing-resolution",
-                default_log,
+                "default",
+                default_log.replace(
+                    "default data source for HGT_M", "missing-resolution data source for HGT_M"
+                ),
                 (ValueError, "Geogrid selected.*missing-resolution"),
             ),
             ("default", None, log_error),
@@ -154,7 +188,9 @@ class TestSolverCompletion(TestCase):
             table.parent.mkdir(parents=True)
             table.touch()
             for i, (dem, log, error) in enumerate(cases):
-                domain = replace(bundle.domain, dem_source=dem, geog_data_path=tmp)
+                domain = replace(
+                    bundle.domain, dem_source=dem, geog_data_path=tmp, parent_grid_ratio=1
+                )
                 work = root / f"work-{i}"
                 geo = work / "geo_em.d01.nc"
                 run = partial(
@@ -167,24 +203,24 @@ class TestSolverCompletion(TestCase):
                 )
 
                 def fake_geogrid(
-                    _args: list[str], *, cwd: Path, check: bool, log_text: str | None = log
-                ) -> None:
-                    self.assertTrue(check)
+                    _args: list[str], cwd: Path, _timeout: int | None, log_text: str | None = log
+                ) -> float:
                     (cwd / "geo_em.d01.nc").write_bytes(b"mock geo_em")
                     if log_text is not None:
                         (cwd / "geogrid.log").write_text(log_text, encoding="utf-8")
+                    return 0.0
 
                 with (
                     self.subTest(dem=dem, log=log),
                     patch(
                         "av_wrf.runner.solver_exec._resolve_solver_exe", return_value=root / "bin"
                     ),
-                    patch("av_wrf.runner.solver.subprocess.run", side_effect=fake_geogrid),
-                    patch("av_wrf.runner.solver_exec._validate_geo_em") as validate,
+                    patch("av_wrf.runner.solver_exec._run_native", side_effect=fake_geogrid),
+                    patch("av_wrf.runner.solver_exec.validate_geo_em") as validate,
                 ):
                     if error is None:
                         self.assertEqual(run(), (geo, sha256_file(geo)))
-                        validate.assert_called_once_with(geo, domain, repair_rotation=True)
+                        validate.assert_called_once_with(geo, domain, lake_depth=True, repair=True)
                     else:
                         with self.assertRaisesRegex(error[0], error[1]):
                             run()
@@ -192,7 +228,8 @@ class TestSolverCompletion(TestCase):
                         validate.assert_not_called()
 
     def test_gfs_metgrid_requires_temperature_and_pressure(self) -> None:
-        bundle = bundle_for_recipe(CONFIG, GFS)
+        primary = bundle_for_recipe(CONFIG, GFS).product.product_id
+        bundle = load_bundle(CONFIG, primary)
         origin = f"2026-11-12T{bundle.product.publish_origin_hour_utc:02d}:00:00Z"
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -210,9 +247,9 @@ class TestSolverCompletion(TestCase):
             _, cycle, hours = resolve_forcing_window(
                 lock, bundle.primary_source, domain=bundle.domain
             )
-            for hour in hours:
+            for tag, hour in [*(("d01", hour) for hour in hours), ("d02", hours[0])]:
                 stamp = (cycle + timedelta(hours=hour)).strftime("%Y-%m-%d_%H:%M:%S")
-                path = root / f"met_em.d01.{stamp}.nc"
+                path = root / f"met_em.{tag}.{stamp}.nc"
                 with netCDF4.Dataset(str(path), "w") as ds:
                     ds.createDimension("Time", 1)
                     ds.createDimension("DateStrLen", 19)
@@ -220,19 +257,24 @@ class TestSolverCompletion(TestCase):
                     ds.createDimension("num_st_layers", 4)
                     ds.createDimension("num_sm_layers", 4)
                     ds.setncattr("NUM_METGRID_SOIL_LEVELS", 4)
+                    ds.setncattr("FLAG_LAKE_DEPTH", 1)
                     times = ds.createVariable("Times", "S1", ("Time", "DateStrLen"))
                     times[0] = np.frombuffer(stamp.encode("ascii"), dtype="S1")
-                    for field in set(GFS.metgrid_fields) | {"TT", "PRES"}:
+                    for field in {*GFS.metgrid_fields, "LAKE_DEPTH"}:
                         ds.createVariable(field, "f4", ("Time",))[:] = 1.0
             with patch("av_wrf.runner.solver_exec.verify_grid_against_domain"):
                 self.assertEqual(_inspect_metgrid_dims(root, bundle, lock), (2, 4))
-                for field in ("TT", "PRES"):
+                for field in ("TT", "PRES", "LAKE_DEPTH"):
                     with netCDF4.Dataset(str(path), "a") as ds:
                         ds.renameVariable(field, "unavailable")
                     with self.assertRaisesRegex(ValueError, f"Missing required WPS field {field}"):
                         _inspect_metgrid_dims(root, bundle, lock)
                     with netCDF4.Dataset(str(path), "a") as ds:
                         ds.renameVariable("unavailable", field)
+                with netCDF4.Dataset(str(path), "a") as ds:
+                    ds.setncattr("FLAG_LAKE_DEPTH", 0)
+                with self.assertRaisesRegex(ValueError, "FLAG_LAKE_DEPTH=1"):
+                    _inspect_metgrid_dims(root, bundle, lock)
 
     def test_receipt_requires_f000_and_every_lead(self) -> None:
         origin = "2026-11-12T00:00:00Z"
@@ -274,7 +316,9 @@ class TestSolverCompletion(TestCase):
                 build_manifest=BuildManifest("sha256:" + "b" * 64, "w", "p", (), "gcc", "mpi"),
                 bundle=bundle,
             )
-            with netCDF4.Dataset(str(root / "wrfout_d01_times.nc"), "w") as ds:
+            with netCDF4.Dataset(
+                str(root / f"wrfout_d{lock.active_domain_id:02d}_times.nc"), "w"
+            ) as ds:
                 ds.createDimension("Time", len(stamps))
                 ds.createDimension("DateStrLen", 19)
                 times = ds.createVariable("Times", "S1", ("Time", "DateStrLen"))

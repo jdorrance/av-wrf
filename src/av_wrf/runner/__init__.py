@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from av_wrf.core import parse_cycle_arg
+from av_wrf.runner.acquire import acquire_forcing
 from av_wrf.runner.bundle import (
     LoadedBundle,
     load_bundle,
@@ -23,6 +24,7 @@ from av_wrf.runner.mirrors import (
 )
 from av_wrf.runner.post import post_cycle_from_inputs
 from av_wrf.runner.publish import load_ready_receipt, publish_cycle_receipt
+from av_wrf.runner.s3 import S3Config
 from av_wrf.runner.solver import (
     load_build_manifest,
     parse_build_manifest,
@@ -58,6 +60,8 @@ __all__ = [
     "LoadedBundle",
     "LocalFileStore",
     "ObjectStore",
+    "S3Config",
+    "acquire_forcing",
     "attempt_stage_prefix",
     "check_all_products",
     "check_product_config",

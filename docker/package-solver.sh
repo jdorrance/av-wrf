@@ -12,6 +12,10 @@ find -L WRF/run -maxdepth 1 -type f ! -name '*.exe' ! -name 'namelist*' ! -name 
     -exec cp -L -t "$wrf_run" -- {} +
 find WRF/phys/noahmp/parameters -maxdepth 1 -type f -name '*.TBL' \
     -exec cp -t "$wrf_run" -- {} +
+for table in qr_acr_qg_V4.dat qr_acr_qsV2.dat freezeH2O.dat; do
+    test -s "thompson/$table"
+    install -m 444 "thompson/$table" "$wrf_run/$table"
+done
 cp -L WPS/geogrid/GEOGRID.TBL.ARW WPS/metgrid/METGRID.TBL.ARW "$wps_tables/"
 cp -L WPS/ungrib/Variable_Tables/Vtable.* "$wps_tables/Variable_Tables/"
 for table in RRTMG_LW_DATA RRTMG_SW_DATA LANDUSE.TBL NoahmpTable.TBL; do

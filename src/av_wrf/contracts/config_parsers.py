@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import re
 from collections.abc import Mapping
@@ -16,9 +17,14 @@ from av_wrf.contracts.config import (
 from av_wrf.contracts.zarr_schema import validate_zarr_output
 
 
-def _check_keys(name: str, expected: frozenset[str], raw: Mapping[str, object]) -> None:
+def _check_keys(
+    name: str,
+    expected: frozenset[str],
+    raw: Mapping[str, object],
+    optional: frozenset[str] = frozenset(),
+) -> None:
     unknown = sorted(set(raw.keys()) - expected)
-    missing = sorted(expected - set(raw.keys()))
+    missing = sorted(expected - optional - set(raw.keys()))
     if unknown:
         raise ValueError(f"{name} received unknown keys: {', '.join(unknown)}")
     if missing:
@@ -90,8 +96,27 @@ def _req_str_tuple(raw: Mapping[str, object], key: str) -> tuple[str, ...]:
     return tuple(x for x in items if isinstance(x, str))
 
 
+def _opt_str(raw: Mapping[str, object], key: str, default: str) -> str:
+    return _req_str(raw, key) if key in raw else default
+
+
+def _opt_int(raw: Mapping[str, object], key: str, default: int) -> int:
+    return _req_int(raw, key) if key in raw else default
+
+
+def _opt_float(raw: Mapping[str, object], key: str, default: float) -> float:
+    return _req_float(raw, key) if key in raw else default
+
+
+def _opt_bool(raw: Mapping[str, object], key: str, default: bool) -> bool:
+    return _req_bool(raw, key) if key in raw else default
+
+
 def parse_domain_profile(raw: Mapping[str, object]) -> DomainProfile:
-    _check_keys("DomainProfile", frozenset(DomainProfile.__dataclass_fields__), raw)
+    optional = frozenset(
+        f.name for f in dataclasses.fields(DomainProfile) if f.default is not dataclasses.MISSING
+    )
+    _check_keys("DomainProfile", frozenset(DomainProfile.__dataclass_fields__), raw, optional)
     dom = DomainProfile(
         profile_id=_req_str(raw, "profile_id"),
         earth_radius_m=_req_float(raw, "earth_radius_m"),
@@ -118,16 +143,32 @@ def parse_domain_profile(raw: Mapping[str, object]) -> DomainProfile:
         dem_source=_req_str(raw, "dem_source"),
         landuse_source=_req_str(raw, "landuse_source"),
         geog_data_path=_req_str(raw, "geog_data_path"),
+        lai_source=_opt_str(raw, "lai_source", DomainProfile.lai_source),
+        varsso_source=_opt_str(raw, "varsso_source", DomainProfile.varsso_source),
+        parent_grid_ratio=_opt_int(raw, "parent_grid_ratio", DomainProfile.parent_grid_ratio),
+        parent_halo_cells=_opt_int(raw, "parent_halo_cells", DomainProfile.parent_halo_cells),
+        nest_trigger_ratio=_opt_float(raw, "nest_trigger_ratio", DomainProfile.nest_trigger_ratio),
     )
     if dom.earth_radius_m <= 0.0 or dom.dx_m <= 0.0 or dom.dy_m <= 0.0 or dom.p_top_pa <= 0.0:
         raise ValueError("Domain radius, grid spacing, and p_top_pa must be positive")
-    if any(elev < 0.0 for elev in dom.terrain_elevations_m):
-        raise ValueError("terrain_elevations_m entries must be >= 0.0 m")
+    # Sub-sea basins (Caspian, Death Valley, Dead Sea) are valid; thermo handles them.
+    if any(elev < -500.0 for elev in dom.terrain_elevations_m):
+        raise ValueError("terrain_elevations_m entries must be >= -500.0 m")
+    if dom.parent_grid_ratio not in (1, 2, 3) or dom.parent_halo_cells < 0:
+        raise ValueError("parent_grid_ratio must be 1, 2 or 3 and parent_halo_cells >= 0")
+    if dom.parent_grid_ratio > 1:
+        if dom.parent_halo_cells < 1 or (dom.e_we - 1) % dom.parent_grid_ratio:
+            raise ValueError("Nested domains require halo cells and divisible e_we/e_sn")
+        if (dom.e_sn - 1) % dom.parent_grid_ratio:
+            raise ValueError("Nested domains require halo cells and divisible e_we/e_sn")
     return dom
 
 
-def parse_science_profile(raw: Mapping[str, object]) -> ScienceProfile:
-    _check_keys("ScienceProfile", frozenset(ScienceProfile.__dataclass_fields__), raw)
+def _parse_science_core(raw: Mapping[str, object]) -> ScienceProfile:
+    optional = frozenset(
+        f.name for f in dataclasses.fields(ScienceProfile) if f.default is not dataclasses.MISSING
+    )
+    _check_keys("ScienceProfile", frozenset(ScienceProfile.__dataclass_fields__), raw, optional)
     return ScienceProfile(
         profile_id=_req_str(raw, "profile_id"),
         wrf_version=_req_str(raw, "wrf_version"),
@@ -175,17 +216,39 @@ def parse_science_profile(raw: Mapping[str, object]) -> ScienceProfile:
     )
 
 
+def parse_science_profile(raw: Mapping[str, object]) -> ScienceProfile:
+    core = _parse_science_core(raw)
+    return dataclasses.replace(
+        core,
+        bl_mynn_edmf=_opt_int(raw, "bl_mynn_edmf", ScienceProfile.bl_mynn_edmf),
+        icloud=_opt_int(raw, "icloud", ScienceProfile.icloud),
+        icloud_bl=_opt_int(raw, "icloud_bl", ScienceProfile.icloud_bl),
+        sf_lake_physics=_opt_int(raw, "sf_lake_physics", ScienceProfile.sf_lake_physics),
+        use_lakedepth=_opt_int(raw, "use_lakedepth", ScienceProfile.use_lakedepth),
+        lakedepth_default_m=_opt_float(
+            raw, "lakedepth_default_m", ScienceProfile.lakedepth_default_m
+        ),
+        lake_min_elev_m=_opt_float(raw, "lake_min_elev_m", ScienceProfile.lake_min_elev_m),
+        diff_6th_slopeopt=_opt_int(raw, "diff_6th_slopeopt", ScienceProfile.diff_6th_slopeopt),
+        diff_6th_thresh=_opt_float(raw, "diff_6th_thresh", ScienceProfile.diff_6th_thresh),
+        use_adaptive_time_step=_opt_bool(
+            raw, "use_adaptive_time_step", ScienceProfile.use_adaptive_time_step
+        ),
+        target_cfl=_opt_float(raw, "target_cfl", ScienceProfile.target_cfl),
+        target_hcfl=_opt_float(raw, "target_hcfl", ScienceProfile.target_hcfl),
+        min_time_step_s=_opt_int(raw, "min_time_step_s", ScienceProfile.min_time_step_s),
+        max_time_step_s=_opt_int(raw, "max_time_step_s", ScienceProfile.max_time_step_s),
+    )
+
+
 def parse_forcing_profile(raw: Mapping[str, object]) -> ForcingProfile:
     levels_key = "metgrid_levels" if "metgrid_levels" in raw else "pressure_level_count"
     soil_key = "metgrid_soil_levels" if "metgrid_soil_levels" in raw else "soil_layer_centers_cm"
     keys = frozenset(ForcingProfile.__dataclass_fields__) - {
         "metgrid_levels",
         "metgrid_soil_levels",
-        "use_sh_qv",
     }
-    if "use_sh_qv" in raw:
-        keys |= {"use_sh_qv"}
-    _check_keys("ForcingProfile", keys | {levels_key, soil_key}, raw)
+    _check_keys("ForcingProfile", keys | {levels_key, soil_key}, raw, frozenset({"use_sh_qv"}))
     soil_levels = (
         _req_int(raw, soil_key)
         if soil_key == "metgrid_soil_levels"
@@ -202,7 +265,7 @@ def parse_forcing_profile(raw: Mapping[str, object]) -> ForcingProfile:
         source_ready_lag_p95_hours=_req_float(raw, "source_ready_lag_p95_hours"),
         mirrors=_req_str_tuple(raw, "mirrors"),
         fail_closed=_req_bool(raw, "fail_closed"),
-        use_sh_qv=_req_bool(raw, "use_sh_qv") if "use_sh_qv" in raw else False,
+        use_sh_qv=_opt_bool(raw, "use_sh_qv", ForcingProfile.use_sh_qv),
     )
     if not re.fullmatch(r"Vtable\.[A-Za-z0-9][A-Za-z0-9_.-]*", prof.vtable_name):
         raise ValueError("ForcingProfile.vtable_name must be a single WPS Vtable filename")

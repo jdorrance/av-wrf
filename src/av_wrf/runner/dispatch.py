@@ -9,6 +9,7 @@ import re
 import time
 import uuid
 from collections.abc import Callable
+from time import monotonic
 
 import httpx
 
@@ -113,8 +114,8 @@ def _claim_dispatch_slot(
             **identity,
         }
     )
+    raw, expected_tok = store.get_with_token(key)
     for _ in range(4):
-        raw, expected_tok = store.get_with_token(key)
         if raw is not None:
             doc = json.loads(raw.decode("utf-8"))
             if not isinstance(doc, dict) or doc.get("state") not in (
@@ -130,7 +131,10 @@ def _claim_dispatch_slot(
         try:
             return store.compare_and_swap(key, claim_bytes, expected_tok)
         except CASConflict:
-            continue
+            # A conditional retry can conflict with our own already committed claim.
+            raw, expected_tok = store.get_with_token(key)
+            if raw == claim_bytes:
+                return expected_tok
     raise CASConflict("Dispatch state changed repeatedly while claiming delivery")
 
 
@@ -144,6 +148,7 @@ def reconcile_dispatch(
     now_unix_s: float | None = None,
 ) -> bool:
     """Single-flight per-destination webhook delivery with expiring lease recovery."""
+    started = monotonic()
     now_s = time.time() if now_unix_s is None else now_unix_s
     if not math.isfinite(now_s) or not math.isfinite(lease_seconds) or lease_seconds <= 0:
         raise ValueError("Dispatch requires a finite clock and a positive finite lease")
@@ -157,6 +162,8 @@ def reconcile_dispatch(
     claim_tok = _claim_dispatch_slot(store, key, identity, now_s, lease_seconds)
     if claim_tok is None:
         return False
+    if monotonic() - started >= lease_seconds:
+        raise RuntimeError("Dispatch lease expired while claiming delivery; retry reconcile")
     try:
         status_code = send_webhook(receipt)
         if not (200 <= status_code < 300):
@@ -177,5 +184,17 @@ def reconcile_dispatch(
             "status_code": status_code,
         }
     )
-    store.compare_and_swap(key, delivered_doc, claim_tok)
+    try:
+        store.compare_and_swap(key, delivered_doc, claim_tok)
+    except CASConflict:
+        if store.get_bytes(key) != delivered_doc:
+            raise
     return True
+
+
+__all__ = [
+    "dispatch_idempotency_key",
+    "dispatch_receipt_key",
+    "post_webhook_json",
+    "reconcile_dispatch",
+]

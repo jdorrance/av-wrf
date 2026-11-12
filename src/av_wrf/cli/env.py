@@ -7,6 +7,8 @@ import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
+from av_wrf.runner import S3Config
+
 
 @dataclass(frozen=True)
 class RuntimeEnv:
@@ -20,6 +22,7 @@ class RuntimeEnv:
     solver_prefix: str
     webhook_token: str = field(default="", repr=False)
     native_timeout_s: int | None = None
+    s3: S3Config | None = None
 
 
 def load_runtime_env(environ: Mapping[str, str] | None = None) -> RuntimeEnv:
@@ -42,6 +45,14 @@ def load_runtime_env(environ: Mapping[str, str] | None = None) -> RuntimeEnv:
     native_timeout_s = int(timeout) if timeout else None
     if native_timeout_s is not None and native_timeout_s < 1:
         raise ValueError("AV_WRF_NATIVE_TIMEOUT_S must be positive")
+    region = env.get("AWS_REGION", "us-east-1").strip()
+    s3 = S3Config(
+        endpoint=env.get("AV_WRF_S3_ENDPOINT", "").strip() or f"https://s3.{region}.amazonaws.com",
+        region=region,
+        access_key=env.get("AWS_ACCESS_KEY_ID", "").strip(),
+        secret_key=env.get("AWS_SECRET_ACCESS_KEY", "").strip(),
+        session_token=env.get("AWS_SESSION_TOKEN", "").strip(),
+    )
     return RuntimeEnv(
         store_uri=store_uri,
         stage_store_uri=stage_uri,
@@ -53,4 +64,5 @@ def load_runtime_env(environ: Mapping[str, str] | None = None) -> RuntimeEnv:
         solver_prefix=solver_prefix,
         webhook_token=env.get("AV_WRF_WEBHOOK_TOKEN", "").strip(),
         native_timeout_s=native_timeout_s,
+        s3=s3,
     )

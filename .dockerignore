@@ -1,0 +1,16 @@
+**
+!.python-version
+!LICENSE
+!README.md
+!pyproject.toml
+!uv.lock
+!config/
+!config/**
+!docker/
+!docker/**
+!scripts/
+!scripts/**
+!src/
+!src/**
+**/__pycache__/
+**/*.py[cod]

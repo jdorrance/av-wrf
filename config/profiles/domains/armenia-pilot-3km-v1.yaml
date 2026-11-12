@@ -1,8 +1,8 @@
-# Fast-building Central Armenia 3 km pilot domain (100x100 mass-cell domain policy floor).
+# Fast-building Central Armenia 3 km pilot domain (102x102 computational mass cells).
 # Assumptions & Local Turnaround Design:
-# - `e_we: 101, e_sn: 101` provides `100 x 100` computational mass cells (`300 x 300 km`),
+# - `e_we: 103, e_sn: 103` provides `102 x 102` computational mass cells (`306 x 306 km`),
 #   satisfying NCAR WPS >= 100x100 domain-sizing guidance enforced by `av-wrf` domain policy
-#   and yielding an `84 x 84` (`252 x 252 km`) published interior after 8-cell sponge trim.
+#   and yielding an `84 x 84` (`252 x 252 km`) published interior after 9-cell boundary trim.
 # - Centered at `40.35N, 44.60E` (Mount Ara / Hrazdan corridor), framing Yerevan, Aparan,
 #   Mount Aragats (`4,090 m`), Tsaghkadzor, Dilijan, Lake Sevan (`1,900 m`), Garni/Azat,
 #   Vedi, Vayots Dzor, and Mount Ararat (`5,137 m`) in 3.2x fewer columns than `armenia-3km-v1`.
@@ -20,9 +20,9 @@ std_parallel_2_deg: 41.20
 central_meridian_deg: 44.60
 dx_m: 3000.0
 dy_m: 3000.0
-e_we: 101
-e_sn: 101
-bdy_trim_cells: 8
+e_we: 103
+e_sn: 103
+bdy_trim_cells: 9
 e_vert: 55
 exported_levels_k: 38
 p_top_pa: 5000.0
@@ -35,4 +35,9 @@ min_bl_levels_2km_agl: 17
 terrain_elevations_m: [800.0, 4090.0, 5137.0]
 dem_source: default
 landuse_source: default
+lai_source: modis_lai
+varsso_source: 30s
+parent_grid_ratio: 3
+parent_halo_cells: 33
+nest_trigger_ratio: 3.5
 geog_data_path: /opt/av-wrf/geog

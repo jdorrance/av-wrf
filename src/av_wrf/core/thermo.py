@@ -107,9 +107,29 @@ def clamp_spfh_2m_vec(
     q = np.maximum(0.0, spfh_2m_kgkg)
     es_pa = 611.2 * np.exp((17.67 * (t2_k - ZERO_CELSIUS_K)) / np.maximum(1.0, t2_k - 29.65))
     es_pa = np.minimum(es_pa, psfc_pa)
-    eps = WATER_DRY_AIR_MOLAR_MASS_RATIO
-    q_sat = eps * es_pa / (psfc_pa - (1.0 - eps) * es_pa)
+    q_sat = _spfh_from_vapor_pressure(es_pa, psfc_pa)
     return np.minimum(q, q_sat * (1.0 - 2.0**-14))
+
+
+def _spfh_from_vapor_pressure(
+    vapor_pa: npt.NDArray[np.float64], pressure_pa: npt.NDArray[np.float64]
+) -> npt.NDArray[np.float64]:
+    eps = WATER_DRY_AIR_MOLAR_MASS_RATIO
+    return eps * vapor_pa / (pressure_pa - (1.0 - eps) * vapor_pa)
+
+
+def ifs_dewpoint_to_spfh_vec(
+    dewpoint_k: npt.NDArray[np.float64], psfc_pa: npt.NDArray[np.float64]
+) -> npt.NDArray[np.float64]:
+    """Recover IFS 2 m specific humidity (kg/kg) using surface pressure (Pa)."""
+    if np.any(dewpoint_k <= 32.19):
+        raise ValueError("IFS dewpoint must be above the Tetens singularity")
+    # IFS reports dewpoint relative to liquid water, including below freezing.
+    # https://confluence.ecmwf.int/pages/viewpage.action?pageId=247890552
+    vapor_pa = 611.21 * np.exp(17.502 * (dewpoint_k - 273.16) / (dewpoint_k - 32.19))
+    if np.any(vapor_pa >= psfc_pa):
+        raise ValueError("IFS vapor pressure must be below surface pressure")
+    return _spfh_from_vapor_pressure(vapor_pa, psfc_pa)
 
 
 def geometric_w_to_omega_vec(

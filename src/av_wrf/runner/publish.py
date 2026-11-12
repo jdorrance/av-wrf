@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,12 +28,14 @@ from av_wrf.runner.bundle import LoadedBundle, load_bundle
 from av_wrf.runner.publish_verify import (
     validate_post_manifest,
     verify_published_objects,
-    verify_staged_objects,
+    write_verified_payload,
 )
+from av_wrf.runner.s3 import S3Store
 from av_wrf.runner.solver import verify_solver_receipt
 from av_wrf.runner.stages import load_run_lock, verify_producer_sha256
 from av_wrf.runner.store import (
     CASConflict,
+    LocalFileStore,
     ObjectStore,
     attempt_stage_prefix,
     json_bytes,
@@ -88,8 +91,10 @@ def _advance_latest_pointer_with_retry(
         if current_raw is not None:
             current, current_key = _latest_pointer(current_raw, receipt.model_id)
             if origin < current:
+                store.ensure_durable(latest_key)
                 return "newer"
             if origin == current and current_key == ready_key:
+                store.ensure_durable(latest_key)
                 return "current"
         try:
             store.compare_and_swap(latest_key, next_payload, expected_tok)
@@ -112,18 +117,27 @@ def _read_ready(
     receipt = ReadyReceipt.from_doc(doc)
     if (receipt.model_id, receipt.cycle_partition) != (model_id, cycle_partition):
         raise ValueError(f"Published receipt identity does not match {ready_key}")
-    if (receipt.schema_id, receipt.schema_version, receipt.zarr_relpath) != (
-        ZARR_SCHEMA_ID,
-        ZARR_SCHEMA_VERSION,
-        _FORECAST,
-    ):
+    if (receipt.schema_id, receipt.schema_version) != (ZARR_SCHEMA_ID, ZARR_SCHEMA_VERSION):
         raise ValueError(f"Unsupported publication schema at {ready_key}")
+    ready_forecast_relpath(receipt)
     if (receipt.forcing_profile_id == _FIXTURE, receipt.oci_digest == _FIXTURE) != (
         synthetic,
         synthetic,
     ):
         raise ValueError(f"Published receipt execution mode does not match {ready_key}")
     return receipt
+
+
+def ready_forecast_relpath(receipt: ReadyReceipt) -> str:
+    """Validate the Zarr path relative to its cycle receipt."""
+    path = receipt.zarr_relpath
+    if path != _FORECAST:
+        match = re.fullmatch(
+            rf"attempts/([A-Za-z0-9][A-Za-z0-9_.-]*)/[0-9a-f]{{64}}/{re.escape(_FORECAST)}", path
+        )
+        if match is None or match[1] != receipt.attempt_id:
+            raise ValueError("Invalid attempt-scoped forecast path in ready receipt")
+    return path
 
 
 def _check_existing_published_ready(
@@ -134,6 +148,7 @@ def _check_existing_published_ready(
     window: CycleWindow,
     synthetic: bool,
     pm: StagedPostManifest | None = None,
+    pm_sha256: str | None = None,
 ) -> ReadyReceipt | None:
     committed = _read_ready(store, root, lock.model_id, lock.cycle_partition, synthetic=synthetic)
     if committed is None:
@@ -143,9 +158,13 @@ def _check_existing_published_ready(
             f"Cycle {lock.cycle_partition} already published by {committed.attempt_id}"
         )
     digests = committed.shard_sha256s if pm is None else (*pm.meta_sha256s, *pm.shard_sha256s)
-    if committed != _build_ready_receipt(lock, b, window, digests, synthetic):
+    path = committed.zarr_relpath
+    if path != _FORECAST and pm_sha256 is not None and path.split("/")[2] != pm_sha256:
+        raise ValueError("Published forecast path differs from the staged manifest")
+    if committed != _build_ready_receipt(lock, b, window, digests, synthetic, path):
         raise ValueError("Published receipt provenance or inventory does not match the RunLock")
     verify_published_objects(store, root, committed, b, window, lock)
+    store.ensure_durable(f"{root}/_ready.json")
     return committed
 
 
@@ -189,6 +208,7 @@ def _build_ready_receipt(
     window: CycleWindow,
     digests: tuple[tuple[str, str], ...],
     is_synth: bool,
+    zarr_relpath: str,
 ) -> ReadyReceipt:
     grid_meta = {
         **published_lambert_grid_metadata(b.domain),
@@ -202,7 +222,7 @@ def _build_ready_receipt(
         lock.cycle_partition,
         lock.publish_origin_utc,
         lock.attempt_id,
-        _FORECAST,
+        zarr_relpath,
         grid_meta,
         b.domain.exported_levels_k,
         window.lead_hours,
@@ -230,37 +250,33 @@ def _promote_under_cycle_lock(
 ) -> ReadyReceipt:
     pub_root = _destination_prefix(lock, is_synth)
     ready_key = f"{pub_root}/_ready.json"
-    pub_zarr = f"{pub_root}/{pm.zarr_relpath}"
     with dst_store.cycle_lock(pub_root):
         already = _check_existing_published_ready(
-            dst_store, pub_root, lock, b, window, is_synth, pm
+            dst_store, pub_root, lock, b, window, is_synth, pm, pm_sha256
         )
         if already is not None:
             return already
         if not is_synth and lock.producer_sha256 is None:
             raise ValueError("Live publication requires a producer SHA-256; plan a new attempt")
         verify_producer_sha256(lock)
-        owner_key = f"{pub_root}/_promotion_owner.json"
-        owner_doc = json_bytes({"attempt_id": lock.attempt_id, "post_manifest_sha256": pm_sha256})
-        prior_owner, owner_tok = dst_store.get_with_token(owner_key)
-        if prior_owner != owner_doc:
-            if prior_owner is not None:
-                dst_store.delete_prefix(pub_zarr)
-                dst_store.delete_prefix(f"{pub_root}/_diagnostics.json")
-            dst_store.compare_and_swap(owner_key, owner_doc, owner_tok)
-
-        def push_verified(rel_key: str, payload: bytes) -> None:
-            put_idempotent(dst_store, f"{pub_zarr}/{rel_key}", payload)
-
-        diag_raw = verify_staged_objects(
-            stage_store, stage_root, pm, b, window, lock, on_verified_object=push_verified
-        )
-        put_idempotent(dst_store, f"{pub_root}/_diagnostics.json", diag_raw)
+        payload_prefix = f"attempts/{lock.attempt_id}/{pm_sha256}"
+        local = dst_store if isinstance(dst_store, LocalFileStore) else None
+        zarr_relpath = _FORECAST if local is not None else f"{payload_prefix}/{_FORECAST}"
         receipt = _build_ready_receipt(
-            lock, b, window, (*pm.meta_sha256s, *pm.shard_sha256s), is_synth
+            lock, b, window, (*pm.meta_sha256s, *pm.shard_sha256s), is_synth, zarr_relpath
         )
-        put_idempotent(dst_store, ready_key, json_bytes(receipt.to_doc()))
-        dst_store.delete_prefix(owner_key)
+        ready_raw = json_bytes(receipt.to_doc())
+        if local is not None:
+            with local._cycle_writer(pub_root) as write:
+                write_verified_payload(stage_store, stage_root, pm, b, window, lock, write)
+                write("_ready.json", ready_raw)
+        else:
+            # A paused writer owns only its payload; the first complete ready PUT wins.
+            def write(rel_key: str, payload: bytes) -> None:
+                put_idempotent(dst_store, f"{pub_root}/{payload_prefix}/{rel_key}", payload)
+
+            write_verified_payload(stage_store, stage_root, pm, b, window, lock, write)
+            put_idempotent(dst_store, ready_key, ready_raw)
     return receipt
 
 
@@ -280,6 +296,8 @@ def publish_cycle_receipt(
 ) -> ReadyReceipt:
     """Publish a verified cycle and report the latest pointer decision to `on_latest`."""
     stg = store if stage_store is None else stage_store
+    if prune_stage and isinstance(stg, S3Store):
+        raise ValueError("Cannot safely prune a cloud stage with concurrent writers")
     b = load_bundle(config_root, product_id) if bundle is None else bundle
     lock = load_run_lock(stg, product_id, cycle_partition, attempt_id, bundle=b)
     stage_root = attempt_stage_prefix(product_id, cycle_partition, attempt_id)
@@ -323,4 +341,9 @@ def load_ready_receipt(store: ObjectStore, model_id: str, cycle_partition: str) 
     receipt = _read_ready(store, root, model_id, cycle_partition)
     if receipt is None:
         raise FileNotFoundError(f"Missing _ready.json for {model_id} {cycle_partition}")
+    if isinstance(store, LocalFileStore):
+        store.ensure_durable(f"{root}/_ready.json")
     return receipt
+
+
+__all__ = ["load_ready_receipt", "publish_cycle_receipt", "ready_forecast_relpath"]

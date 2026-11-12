@@ -1,435 +1,181 @@
 # Review remediation
 
-This plan consolidates all 42 numbered findings from the three reviews against
-`bb221b0`. A is the read-only review beginning with the ICON image extra.
-B is the cross-repo review beginning with the producer-consumer split.
-C is the review beginning with late publication. IDs preserve the source
-priorities; related findings share an entry. D and E are the two follow-up
-reviews below. The [project plan](plan.md) owns release gates.
+This page records implemented review decisions and remaining qualification.
+The [project plan](plan.md) owns release gates; [review evidence](review-plan.md)
+owns the paired pilot, albedo replay, and publication benchmarks.
 
-## Execution order
+## Implemented foundation
 
-1. Backport the upstream Noah-MP albedo guard. Rebuild the pinned image and
-   replay both full pilots with identical geography, inputs, ranks, and leads.
-   Compare native radiation and published output before and after the patch.
-2. Exercise recovery after native failure, interruption before receipt write,
-   publication corruption, late completion, and competing destinations.
-3. Verify forcing admission, image dependencies, grid and schedule policy,
-   and the separate real and WRF namelists.
-4. Re-run repository checks and record remaining release dependencies.
+- **Native admission and recovery.** Attempts use private scratch and serialized
+  execution. Solver receipts bind forcing, active-domain geography, native outputs,
+  and stage wall times. Recovery verifies completed output before reuse. Image
+  checks cover dependency imports, native namelist parsing, ICON conversion,
+  and synthetic single-domain and nested WPS/WRF execution.
+- **Publication.** Fresh promotion decodes every required shard and checks native
+  column gates. Recovery verifies committed hashes and canonical metadata.
+  Local writes retain data and ancestor-directory sync; promotion installs a
+  complete sibling tree under the cycle lock. S3 uses immutable attempt payloads,
+  conditional ready creation, and conditional latest updates. Pruning and post
+  share an attempt lock. Remote service qualification remains below.
+- **Forcing.** GFS and IFS support indexed byte-range acquisition with snapshot
+  checks. NOAA's paced regional filter remains optional. ICON validates donors,
+  reuses grid weights and static fields, and can write direct WPS v5 intermediates.
+  Each recipe verifies its time, grid, vertical and soil inventory before solve.
+  Candidate profiles identify comparison inputs; scheduled runs use the primary.
+- **Nesting.** Resolved locks freeze one-way parent buffers for coarse GFS/IFS
+  forcing. WPS, geography, initialization and receipts cover active domains;
+  published coordinates describe the fine domain. ICON can retain the same fine
+  coordinates without a parent. Nested skill and full-horizon cost need measurement.
+- **Science.** The pinned Noah-MP albedo guard, native radiation checks, AFWA
+  MUCAPE admission, Shuell MSLP fallback, WRF constants, humidity conversion,
+  rainfall windows, hybrid coordinate and wind rotation are implemented.
+  Coupled MYNN output uses the current total `CLDFRA_BL`; `CLDFRA` is the older
+  radiation snapshot. Lake, mixing and drag arrays carry per-domain values.
+  Sampled Courant diagnostics use saved `DT`, face thickness and Lambert scale.
+- **Cost and scope.** Thompson tables are prebaked and checked with read-only
+  reuse. The solver defaults to a portable ISA with explicit optimized targets.
+  CI persists native BuildKit layers and cancels superseded PR jobs. Base images
+  and action revisions are pinned. Encoding and uploads have bounded parallelism;
+  post releases full volumes before reading the next lead. Shards encode exactly
+  one time step. Parcel diagnostics remain in the consumer.
+- **Configuration.** Typed profiles own optional defaults. Individual checks and
+  planning reject duplicate model namespaces and mismatched preloaded identities.
+  The geography bundle digest owns lock identity; the unused digest list was removed.
 
-## Verification
+## Archived science evidence (2026-11)
 
-- Both full pilots passed the radiation and publication gates. See
-  [paired evidence](review-plan.md#albedo-replay) for the matched inputs,
-  saved-frame checks, and remaining local disagreements.
-- `uv run verify` passed all 86 tests and the lint, typing, schema, and
-  architecture gates. `git diff HEAD --check` covered the full change.
-- The offline image test exercises real ecCodes re-encoding across a UTC
-  date rollover, coastal surface weights, invalid mirror responses, and
-  WPS ungrib. The archived host reconstruction reproduced the normalized
-  ICON files and their acquisition inventory byte for byte.
-- The hardened ARM64 image cold-started two ICON leads offline as UID
-  65534. All 80 Zarr object hashes matched, and solve and pruned publish
-  retries passed. The WPS floating-point status note also appears in
-  the old build; the intermediates match and checked fields are finite.
-- Recovery tests cover failed native execution, interruption before a
-  solver receipt is stored, an incomplete published receipt, corrupt Zarr,
-  producer drift, malformed latest pointers, and competing destinations.
+These experiments used the archived profiles and geometry. They establish
+specific numerical behavior; current-profile operational qualification remains
+separate. [Science conventions](science.md) records the physical assumptions.
 
-## Changes in this pass
+- **Radiation.** The patched pair replayed identical native inputs and removed
+  all negative shortwave samples. The three-minute dawn replay checked all
+  21 saved frames. Preserve the full [albedo replay](review-plan.md#albedo-replay)
+  and its native audit command when comparing future solver builds.
+- **CAPE.** Five positive cold ICON cells were below 0.4 J/kg. The pinned AFWA
+  routine returned 2,871 J/kg for an ideal convective sounding. A July GFS hour
+  produced positive MUCAPE in 13,777 of 26,640 published columns, peaking at
+  462 J/kg; Zarr retained every positive value. Sounding skill remains unscored.
+- **Vertical sensitivity.** A uniform 4% reference-column stretch reduced the
+  original minimum count below 2 km from 17 to 16, failing 861 production cells,
+  including 530 land cells. Lower stretch values 1.10 and 1.09 passed that stress
+  at the cost of lower exported tops. These are artificial sensitivity checks.
+- **Native vertical cases.** Cold initialization with lower stretch 1.11, 1.10,
+  and 1.09 passed all 26,640 columns, with minimum counts 17/18/18 and exported
+  tops 7.54/6.76/5.84 km AGL. The lowest midpoint was 21.49 m in all three.
+  July initialization at up to 33.0 °C also passed: counts 17/17/18 and tops
+  8.29/7.47/6.48 km. Lower stretch 1.09 retained 18 levels and a 6.49 km top
+  after one hour. Pairing lower 1.09 with upper 1.08 retained 18 levels in cold
+  and warm initialization, with minimum tops 7.44/8.20 km. In July the highest
+  17th level moved from 1,973 to 1,788 m. After an hour it retained 18 levels
+  and an 8.21 km top, 97 m below the archived shipped setting. MUCAPE mean
+  absolute difference was 0.57 J/kg; six cells exceeded 100 J/kg and one reached
+  268 J/kg. Full-horizon comparison is required before selecting a new grid.
+- **Terrain.** The archived production WPS maximum was 4,203 m, below the
+  5,137 m subgrid summit checkpoint. Lowest-level clearance therefore needs both
+  initialized-grid checks and downstream terrain qualification.
+- **Hydrology.** Noah-MP runoff options 1/1 select TOPMODEL groundwater; the
+  upstream 3/3 defaults use free drainage. Cold initialization sets a 2.5 m water
+  table and 4,900 mm aquifer storage. Both 22-hour pilots retained a median
+  2.5 m water table. The first July hour had land medians of 236 W/m² sensible
+  heat, 88 W/m² latent heat and 1,057 m PBL depth; water-table change was at most
+  0.6 mm. A matched 3/3 versus 1/1 hour changed land mean absolute sensible heat,
+  latent heat and PBL depth by 0.06 W/m², 0.03 W/m² and 0.11 m; the largest PBL
+  change was 70 m. Warm land-state cycling and longer wet/dry cases remain open.
+  [WRF options](https://github.com/wrf-model/WRF/blob/v4.8.0/run/README.namelist)
+  · [Cold initialization](https://github.com/NCAR/noahmp/blob/5da0b241e48ecfd9a2a1bd667ed554765856d589/drivers/wrf/NoahmpInitMainMod.F90#L164-L167)
+- **Gust convention.** Noah-MP supplies sensible heat from actual temperatures,
+  supporting the existing gust buoyancy algebra. Replacing `LH/Lv` with native
+  vapor flux `QFX` changed archived gusts by under 0.001 m/s at p99 and at most
+  0.072 m/s. Frozen cases need separate evaluation because sublimation changes
+  the energy-to-mass conversion. The exported gust is an uncalibrated endpoint
+  estimate; published surface fluxes are interval means.
+  [Noah-MP sensible heat](https://github.com/NCAR/noahmp/blob/5da0b241e48ecfd9a2a1bd667ed554765856d589/src/SurfaceEnergyFluxBareGroundMod.F90#L150-L154)
+  · [Vapor flux](https://github.com/NCAR/noahmp/blob/5da0b241e48ecfd9a2a1bd667ed554765856d589/drivers/wrf/WaterVarOutTransferMod.F90#L62-L65)
+- **MSLP.** The retired surface-based fallback differed from native AFWA by
+  0.96–1.02 hPa mean absolute and up to 11.52 hPa. The implemented lowest-level
+  Shuell fallback agreed within 0.2 Pa mean absolute and 4.5 Pa maximum after
+  storage rounding across both corrected pilots. Positive native values remain
+  authoritative; absent or nonpositive cells use the fallback.
+  [AFWA reduction](https://github.com/wrf-model/WRF/blob/v4.8.0/phys/module_diag_functions.F#L911-L962)
+- **Cloud snapshot correction.** Reprocessing archived native frames with current
+  MYNN cloud selection removed total-cloud excesses up to 52.08 percentage points
+  in GFS and 23.57 points in ICON. Both exported outputs matched quantized current
+  `CLDFRA_BL` overlap exactly. This validates snapshot selection; cloud skill
+  still requires observations.
+  [WRF snapshot copy](https://github.com/wrf-model/WRF/blob/v4.8.0/phys/module_radiation_driver.F#L1403-L1416)
 
-- **A P0-1 · ICON image.** Install the ICON extra in the solver image and
-  smoke-test acquisition dependencies. The previous local pilot acquired on
-  the host, then solved in Docker, so that run did not test in-image acquisition.
-- **A P0-2, A P1-6 · Native coverage.** Test real ecCodes re-encoding and
-  validate point count, validity, packing, and values. The offline image
-  smoke exercises the normalized records through WPS ungrib. Local native
-  pilots cover metgrid, real, WRF, and NetCDF. A full WRF CI case remains
-  a coverage gap.
-- **A P0-3 · Solver recovery.** Serialize each attempt, solve in private
-  scratch, and install completed output with a local receipt for crash
-  recovery. Keep earlier scratch for diagnosis. The path equality check
-  detects symlinked descendants even when the work root is canonical.
-- **A P0-4, A P0-5 · Publication recovery.** Validate committed receipt
-  identity against the lock and the live or fixture namespace. Derive the
-  Zarr keys from the profile and leads, rehash each object, and check
-  canonical metadata and coordinate bytes before advancing latest or
-  pruning staging. Validate diagnostics identity; the current ready
-  receipt carries no diagnostics digest after pruning. Fresh live
-  promotion requires the running producer SHA to match the lock.
-  Committed recovery verifies archived bytes across deployments.
-- **A P1-1, A P1-2 · ICON weights and cache admission.** Check finite
-  weights and encoded values. Before cache commit, unpack each new
-  donor and verify its cycle, valid time, process, time template,
-  selector, and level. Try the next mirror on rejection. Assembly checks
-  the common mesh and vertical ordering. A corrupt legacy cache entry
-  names the object to remove. The 475-object f000 inventory check took
-  0.84 s with eight workers, including reads.
-- **A P1-4 · Grid spacing.** Require positive finite spacing in the domain
-  validator as well as the YAML parser.
-- **A P1-5, B P2-11 · Horizon and prep.** Use a single effective live age
-  in validation and publication. Check January and July briefing margins
-  in product preflight and the exact date when planning. Emit a separate
-  real template with the full boundary bracket. Validate the model,
-  cycle, and ready key before comparing latest timestamps in UTC.
-- **B P2-8 · GRIB and process bounds.** Validate latitude scan metadata
-  against endpoints and unpack GFS data to check missing values. Local
-  native deadlines are opt-in with `AV_WRF_NATIVE_TIMEOUT_S`; the default
-  has no deadline. Remote schedulers own their job limits and cancellation.
-- **B P1-7 · Native decoder.** Remove the legacy JasPer build and unused
-  PNG codec. Retain WPS's built-in GRIB2 templates. The Linux ARM64
-  decoder produced byte-identical WPS intermediates for all 46 archived
-  inputs and the two complex packing controls. JPEG2000 and PNG inputs
-  now exit with a packing error.
-- **C P1-1 · Late publication.** Report each destination's live pointer
-  outcome alongside archival publication. Webhook reconciliation remains
-  a separate retryable command.
-- **A P3-1 · Dead surface.** Remove unused scalar and 2D staggered
-  types. Keep the documented verification commands, source profile keys
-  used by archived locks, and output controls validated by shard codecs.
+## Archived forcing and cost evidence (2026-11)
 
-## Claims already covered or ruled out
+- **GFS inventory.** WPS retained 33 isobars plus the surface, excluding eight
+  isobars below its 100 Pa `pmin`; the metgrid total was 34. The historical
+  regional-filter set held 55 files and 59 MB. Acquiring 53 missing files took
+  about 24 minutes under NOAA pacing; manifest sealing and re-verification each
+  took about 11 s. This timing predates the default indexed acquisition path.
+- **ICON upper air.** The production cutout matched 15,794 DWD regular-grid
+  points at f000. At levels 55/74, temperature mean absolute differences were
+  0.04/0.17 K, wind-component differences 0.07–0.18 m/s and humidity differences
+  0.006/0.034 g/kg. Pressure differences 0.99/4.14 hPa fell to 0.08/0.19 hPa
+  at common geometric heights. Across 26,640 initialized columns, GFS/ICON
+  temperature MAE at 250/1,000/2,000 m AGL was 1.38/0.38/0.34 K and vector wind
+  differences were 1.29/1.97/1.58 m/s. This measures source disagreement.
+- **Acquisition admission.** The historical 475-object ICON f000 cache check
+  took 0.84 s with eight workers, including reads. Subsequent remapping fixes
+  use float64 seam geometry, normalized weights and positive-land soil donors.
+  The 2026-11-12 optimization reuses cropped invariants and binds admission to
+  exact source hashes. An archived three-hour replay took 14.77 → 13.56 s in one
+  trial, with 1,417 → 1,267 value decodes and about 4.2 MiB of invariant storage.
+  WPS outputs and provenance inventories were byte-identical.
+- **SLA estimates.** Historical pilot extrapolations gave 5.35 and 6.06 hours
+  against a 5.25-hour delivery budget. Identical ICON pilot solves took 24 and
+  45 minutes under different host load. These estimates predate current nesting
+  and cannot establish its SLA. The short native and publication measurements
+  remain in [measured tradeoffs](review-plan.md#measured-tradeoffs).
+- **Table reuse and diagnostics.** Five archived runs produced byte-identical
+  374 MB Thompson tables, motivating current prebaking. Area weighting changed
+  hourly pilot flux means by under 0.0005 W/m²; diagnostics retain grid-cell means.
 
-- **A P1-3, B P0-2 · MPI floor and terrain shadows.** The pinned WRF
-  check divides `e_we` and `e_sn` by the MPI mesh dimensions. Plan
-  applies that rule and rejects an oversized mesh. WRF also iterates
-  terrain shadow propagation across patches with `HALO_TOPOSHAD`.
-  [MPI guard](https://github.com/wrf-model/WRF/blob/v4.8.0/share/module_check_a_mundo.F#L2773-L2799)
-  · [Terrain shadows](https://github.com/wrf-model/WRF/blob/v4.8.0/phys/module_radiation_driver.F#L3395-L3461)
-- **B P1-3 · Interrupted promotion.** Promotion streams each object
-  after it verifies. A late failure can leave verified objects without
-  `_ready.json`. The owner binds the attempt and post-manifest SHA-256;
-  a retry reuses matching objects or clears partial output when the
-  manifest changes. Changing immutable staged bytes requires a new
-  attempt or explicit cleanup. `_ready.json` is the commit boundary.
-- **B P1-4, B P1-5 · Store lock and pruning.** Stable locks live outside
-  the deletable data tree. Prefix deletion syncs the parent. Pruning
-  removes the post manifest and staged bytes together under the attempt
-  lock. A verified ready cycle can be recovered after pruning.
-- **B P1-6, A P2-4 · Native columns and bounds.** Post and publish require
-  pressure below surface pressure, physical temperature and pressure,
-  monotonic heights, lowest-level clearance, and valid vertical spacing.
-  Real uses the configured spacing ceiling. The surface humidity cap
-  covers low pressure. Cloud fraction and friction velocity are bounded.
-- **B P1-7 · Image pins and CI.** WRF and WPS commits are pinned and
-  recorded alongside patch digests. CI observes producer and build
-  changes. Archived manifests still parse their historical JasPer pin.
-- **B P2-8 · Existing GRIB checks.** The ecCodes command has a timeout.
-  GFS rejects reversed i scanning and missing required values, with
-  explicit masked soil and snow exceptions. Process IDs are part of
-  the admitted NOAA feed identity; qualify a new ID before accepting it.
-- **B P2-10 · Grid geometry.** The producer checks longitude bounds,
-  a nonzero cone, full-grid registration, and rotation. Unsupported
-  projections fail at admission. The writer still uses one spatial shard
-  per frame, capped at 64 inner tiles (512 × 512 cells for a square).
-- **B P3-12 · Static checks.** The checker covers qualified dataclasses,
-  `builtins.open`, `typing.Any`, and `abc.ABC`. The image digest binds
-  its time-zone data. A wheel pin alone would still permit host
-  `zoneinfo` data to take precedence.
-- **B P3-13 · Producer lock.** The run lock detects local source drift.
-  `manifest.lock` pins vendor, oracle, and patch files separately.
-  Pin deployment by digest to bind its installed dependency environment.
-  The CLI records the supplied solver OCI digest; it does not attest the
-  running image. The broad source scope preserves the code identity.
-- **C P2-6 · Accumulation windows.** Tail rates and fluxes use the declared
-  interval and publish the real start and end. Gust is an instantaneous
-  endpoint field. Consumer integration must preserve that distinction.
-- **C P2-7 · Gust interpretation.** The referenced IFS stable-air formula
-  keeps the neutral turbulent coefficient. The buoyancy input is
-  instantaneous and the published surface flux is a window mean.
-  This WRF adaptation uses native boundary-layer depth and remains an
-  uncalibrated endpoint gust estimate.
-  [IFS physical processes](https://www.ecmwf.int/sites/default/files/elibrary/2016/79989-ifs-documentation-cy43r1-part-iv-physical-processes_1.pdf)
-- **C P3-12 · Webhook destination.** HTTPS, redirect rejection, URL
-  sanitization, and bearer authentication already exist. The operator
-  selects the destination and supplies its credential. Private HTTPS
-  endpoints support self-hosted deployments.
+## Remaining qualification
 
-## Remaining decisions and qualification
+1. **Consumer and remote publication.** Complete a real Zarr provider, shared
+   receipt/identity agreement, authenticated trigger replay and served tile,
+   sample and profile checks. Read across inner tiles and reject corrupt ranges
+   and mismatched receipts. Exercise private R2 with competing attempts, lost
+   commit responses, interrupted transfers, and consumer range reads. Local and
+   stubbed S3 tests establish application behavior; live service behavior needs
+   this deployment test.
+   [R2 conditional operations](https://developers.cloudflare.com/r2/api/s3/conditional-operations/)
+2. **Current full-horizon delivery.** Time acquisition, initialization, nested
+   WRF, post, publish and consumer work for a complete forecast on intended
+   hardware. Repeat enough cycles to measure arrival variability and retry
+   margin. Test mount permissions for the deployment UID and bind both runtime
+   and solver image digests when deploying separate images.
+3. **Observation scorecard.** Score cold and warm cycles, lowlands and high
+   terrain, snow/lake cases, shallow cloud, surface fluxes, CAPE and gusts.
+   Compare source, vertical grid, land initialization and physics changes
+   separately. The 9 km parent's convection choice also needs a controlled
+   comparison. Publication gates check physical admissibility.
+4. **Vertical references and velocity.** Qualify native/subgrid terrain datum
+   conversion and the consumer inverse of moist hydrostatic `omega`; version
+   the wire contract if geometric velocity becomes necessary.
+5. **Long integrations and new donors.** Measure accumulation rounding in warm
+   long forecasts against higher-precision sums; evaluate radiation interpolation
+   separately. Qualify actual ice coverage before accepting ice-bearing donors.
+   Observe complete source inventories over multiple cycles before changing
+   primary forcing or dissemination allowances.
 
-- **A P2-1, B P0-1 · Consumer contract.** The adjacent consumer has a
-  draft Zarr schema and only registers GRIB readers. It still needs a
-  Zarr provider, trigger integration, shared ready/latest/diagnostic
-  schemas, and a versioned producer identity. First read an archived
-  producer cycle offline across two inner tiles and reject a corrupt
-  range or mismatched receipt. Then deliver and replay one authenticated
-  ready event in staging and verify a served tile, sample, and profile.
-  Producer HTTPS authentication and error redaction are already present.
-- **B P3-13 · Split-image provenance.** Post and publish verify source
-  identity. A separate runtime image has its own dependencies and digest.
-  Bind that digest alongside the solver digest when qualifying a split
-  deployment and its shared receipts.
-- **A P2-2 · Same-store copies.** Keep independent staged and published
-  copies. Copy-on-write took 2.92 s versus 2.61 s for independent writes.
-  Revisit with a backend whose copy preserves digest validation and
-  retry behavior.
-- **A P2-3, C P2-11 · Remote fencing.** Local filesystem publication is
-  supported on one kernel. For R2, isolate each attempt's payloads and
-  use a conditional ready commit and latest update. The v1 ready receipt
-  fixes `forecast.zarr` under the cycle prefix; attempt-scoped paths need
-  a consumer contract change or a single publisher with exclusive writes.
-  Exercise racing attempts, a lost commit response, interrupted promotion,
-  and range reads before enabling a remote backend. Read the latest
-  pointer without caching; cache immutable forecast bytes.
-  [R2 conditional operations](https://developers.cloudflare.com/r2/api/s3/conditional-operations/)
-- **B P2-9 · Accumulation precision and radiation interpolation.**
-  WRF's optional `bucket_J` covers radiation, which is outside the
-  published accumulation fields. At 2 J/m² spacing, rounding one
-  addition per 15 s step contributes up to 0.067 W/m² of mean flux
-  error with either sign. Measure the actual long warm run against
-  a higher-precision accumulator. Evaluate `swint_opt` separately.
-- **B P1-7 · Runtime user.** The solver and post images default to root.
-  The nonroot image smoke and two-lead end-to-end run pass. Configure
-  the deployment's mount owner and permissions before changing image
-  defaults.
-- **B P2-10 · Larger domains.** Introduce multiple spatial shards with
-  the consumer when a grid exceeds the current tile budget. Compare
-  cross-shard reads against a full-frame decode before enabling one.
-- **C P1-2 · Donor revisions.** The measured DWD timestamps were object
-  modification times. They did not establish repeated rewrites of the
-  same key. Preserve reproducible cached bytes and use a fresh cache
-  for explicit source re-acquisition.
-- **C P1-3 · Vertical velocity.** The existing wire field is documented
-  as a moist hydrostatic conversion of geometric velocity. Qualify the
-  consumer inverse or version the wire field for geometric velocity.
-- **C P1-4, C P2-10 · Land spin-up and shallow cloud.** Qualify a warm
-  land-state run and a shallow-cloud physics alternative against
-  observations before changing the operational physics. Publication
-  checks physical admissibility; it has no observation gate.
-- **C P1-5 · Ice-bearing donors.** Current admission fails closed because
-  ice thickness alone cannot give fractional coverage. The public feed
-  lists thickness and lake fraction. Its ice-fraction endpoint returned
-  HTTP 404. The pilot uses lake donors around Lake Sevan, which freezes
-  irregularly. Qualify a lake-only conversion or a source with actual
-  ice fraction before accepting icy donors.
-  [DWD feed](https://opendata.dwd.de/weather/nwp/v1/m/icon-eu/p/)
-  · [Lake Sevan observations](https://doi.org/10.1029/2023WR036511)
-- **C P2-8 · Lowest-level margin.** The native initialized grid and
-  published columns are checked. Measure the clearance on warmer
-  high-terrain cases before selecting a different vertical grid.
-- **C P2-9 · Late arrivals.** Measure full inventories and runtime across
-  cycles. The full product allows 27 minutes between its stated p95
-  GFS arrival and planned daily trigger. Alternate launch schedules require
-  product and consumer qualification. The publisher now distinguishes
-  a late archived cycle.
-- **C P3-13 · Height datum.** Producer AGL uses a common native datum.
-  Qualify datum conversion with the downstream Copernicus terrain before
-  mixing the two vertical references.
-  [Datum details](science.md#1-physical-constants-wrf-inversion-vs-consumer-parcel-evaluation)
+## Infrastructure decisions
 
-## D · Follow-up science tasks
+Boto3/botocore owns S3 signing, credentials, pools and retries. HTTPX and Tenacity
+own shared HTTP transport and bounded transient retries. Source adapters retain
+provider index parsing, coherent byte-range snapshots and weather admission.
+Selected-message SHA-256 values identify downloaded bytes. An official provider
+client can replace an adapter when it preserves those guarantees with a smaller
+reachable surface.
 
-1. **P1 · Test the vertical gates on the production domain (C P2-8).**
-   The sea-level reference puts level 17 at 1,929.58 m AGL. A uniform
-   4% stretch drops the count to 16. Raising the reference base
-   temperature by 10 K gives 1,995.12 m and still passes; 12 K crosses
-   2 km. The 1.09 stretch alternative gives 18 levels at sea level
-   and 19 at 800 m. It also lowers the 40th level over high terrain.
-   Production geogrid found 406 published land cells below 25 m MSL.
-   With its exact terrain and an artificial 4% stretch, the current
-   profile fails 861 cells, including 530 land cells. Both 1.10 and
-   1.09 pass that stress;
-   their minimum reference tops fall from 7.99 km to 7.20 and 6.24 km.
-   Test warm lowland and cold high-terrain forcing with all three. Record
-   minimum level-0 clearance, count below 2 km, maximum gap, and the
-   exported top. Keep the existing wire gates. The old pilot reached
-   a 20.95 m minimum over terrain no higher than 4,072 m. The 21.87 m
-   reference summit clearance and 246 K crossing are sensitivity
-   estimates at a fixed pressure profile. The highest production WPS
-   terrain cell is 4,203 m; the actual summit is subgrid.
-2. **P1 · Qualify runoff and land initialization (C P1-4).** The shipped
-   Noah-MP options select TOPMODEL groundwater. The pinned WRF defaults
-   are 3/3, with free drainage below the soil column. Cold starts set
-   a 2.5 m water table and 4,900 mm aquifer storage by default. Both
-   archived pilots retained a median 2.5 m water table after 22 h.
-   The flux effect on a warm 48-hour forecast remains unmeasured.
-   Compare 1/1 and 3/3 with the same inputs
-   across dry and wet cases. Measure water-table/soil evolution,
-   sensible and latent heat, boundary-layer depth, and observed cloud
-   base. Test warm land state separately.
-   [WRF namelist](https://github.com/wrf-model/WRF/blob/v4.8.0/run/README.namelist)
-   · [Cold initialization](https://github.com/NCAR/noahmp/blob/5da0b241e48ecfd9a2a1bd667ed554765856d589/drivers/wrf/NoahmpInitMainMod.F90#L164-L167)
-   · [Noah-MP groundwater evaluation](https://doi.org/10.1029/2010JD015140)
-3. **P1 · Time the production grid (C P2-9).** The short pilot and a
-   linear column-hour scale give 5.35 h. Scaling the archived full
-   pilot gives 6.06 h on its host. Both are estimates against a 5.25 h
-   deadline, before downstream work. Two identical ICON pilot solves
-   took 24 and 45 minutes under different host loads. Run the full
-   54 h on candidate hardware, record acquire/solve/publish/consumer
-   durations, and measure enough cycles to set a retry margin. Track cold
-   initialization separately. Five runs generated byte-identical Thompson
-   tables (374 MB); measure the startup and transfer tradeoff before
-   packaging or reusing them by solver digest.
-4. **P2 · Compare forcing and nesting separately.** GFS's grid step is
-   about 20.5–21.9 km east–west and 27.8 km north–south over the
-   production domain. DWD's native grid is nominally 6.5 km; its
-   normalized grid adds no resolved detail. The archived mesh remapped
-   the 149 × 106 production forcing rectangle with all 75 height
-   interfaces and no ice on the 23 available hours. Test same-cycle
-   GFS and ICON-EU on the same production domain first. For nesting, try a
-   one-way 9 km parent with a 3 km child using the native build. Test
-   aligned dimensions, parent forcing coverage, domain-qualified
-   geography and solver receipts, and child-only export with the same
-   Zarr schema before adding configuration or changing the product.
-   Peer workflows show precedent, not a quality result for this grid.
-   [WPS nest guidance](https://www2.mmm.ucar.edu/wrf/site/documentation/namelist.wps_best_practices.html)
-   · [Alpine nested design](https://soarwrf4.soaringmeteo.org/soarWRFEN.pdf)
-   · [Dutch 1.2 km nest](https://gitlab.com/DavidRasp/blipmaps.nl/-/blob/master/rasp/NL1KMICON/namelist.wps)
-   · [Dutch 4 km nest](https://gitlab.com/DavidRasp/blipmaps.nl/-/blob/master/rasp/NL4KMGFS/namelist.wps)
-5. **P2 · Isolate damping and top-down mixing (C P2-10).** Vertical
-   damping is conditional on the local Courant number; the pinned
-   threshold is 1.0. YSU uses `ysu_topdown_pblmix` and the Shin-Hong
-   switches only reach scheme 11. Compare each change separately,
-   checking stability, vertical motion, and cloud/PBL observations.
-   NCAR's 4 km example uses different physics and `diff_opt=1`.
-   `km_opt=4` is horizontal Smagorinsky; correct the profile comment
-   with the next profile revision because comments enter run identity.
-   [NCAR example](https://github.com/wrf-model/WRF/blob/v4.8.0/test/em_real/namelist.input.4km)
-   · [YSU dispatch](https://github.com/wrf-model/WRF/blob/06d4240ae989cc3e50af412bb472df3d9048783c/phys/module_pbl_driver.F#L1232-L1258)
-   · [WRF damping](https://github.com/wrf-model/WRF/blob/06d4240ae989cc3e50af412bb472df3d9048783c/dyn_em/module_big_step_utilities_em.F#L2601-L2615)
-6. **P3 · Gust temperature claim ruled out for the shipped land scheme.**
-   The pinned Noah-MP bare and vegetated paths compute sensible heat
-   using actual temperatures and transfer that flux to WRF `HFX`.
-   The reported 0.38 m/s shift assumes a different input convention.
-   Keep the endpoint gust algebra. Evaluate `QFX` for its moisture
-   term: `LH` can include sublimation energy and a single vaporization
-   constant does not recover the exact vapor mass flux. Using native
-   `QFX` instead changes the archived gust by under 0.001 m/s at p99
-   and at most 0.072 m/s. Qualify the change on frozen cases.
-   [Noah-MP bare-ground flux](https://github.com/NCAR/noahmp/blob/5da0b241e48ecfd9a2a1bd667ed554765856d589/src/SurfaceEnergyFluxBareGroundMod.F90#L150-L154)
-   · [Vapor flux transfer](https://github.com/NCAR/noahmp/blob/5da0b241e48ecfd9a2a1bd667ed554765856d589/drivers/wrf/WaterVarOutTransferMod.F90#L62-L65)
-7. **P3 · Preserve native MSLP provenance.** Native AFWA reduces the
-   lowest model level with the Shuell correction. The optional
-   producer fallback uses surface diagnostics and a different plateau
-   adjustment. Against the archived published leads it differs by
-   0.96–1.02 hPa mean absolute and up to 11.52 hPa. All those leads
-   had positive native MSLP; the unpublished baseline had zeros.
-   Track fallback use on qualification cases before deciding whether
-   live runs should require native AFWA throughout.
-   [AFWA reduction](https://github.com/wrf-model/WRF/blob/v4.8.0/phys/module_diag_functions.F#L911-L962)
-8. **P3 · Treat broader physics and geometry as separate changes.**
-   The current pins and single Lambert domain define the supported
-   surface. The pinned defaults are `icloud=1` and positive-definite
-   advection. WRF forces four Noah-MP soil layers, and the Registry
-   defaults to 21 land categories. Make a choice explicit when a new
-   scheme, source, projection, nest, or solver revision needs it.
-   The existing checks for theta/THM, humidity, rainfall windows,
-   cloud overlap, rotation, hybrid coordinate, and source soil/height
-   inventories hold. E P1-5 records the upper-air remap check.
-
-## E · Full producer review
-
-- **P0-1 · Albedo.** The cited audit was the unpatched baseline. Both
-  corrected 16-lead runs are documented in [paired evidence](review-plan.md#albedo-replay).
-  All four corrected nighttime frames from each run have valid albedo
-  throughout the computational grid. Native admission checks illuminated albedo and
-  coincident bottom-of-atmosphere downwelling and reflected shortwave.
-  It passed all corrected leads and rejected ten leads from each original
-  run. A three-minute GFS dawn replay found the first positive shortwave
-  at 03:45Z and valid albedo across the grid at 03:42Z. At first light,
-  reflected divided by incoming shortwave matched preceding albedo within
-  3.6 × 10⁻⁷. All 21 frames passed and the 04Z radiation matched the
-  hourly archive exactly.
-  [WRF RRTMG albedo inputs](https://github.com/wrf-model/WRF/blob/v4.8.0/phys/module_ra_rrtmg_sw.F#L10289-L10310)
-- **P0-2 · Deadline.** The 54-hour SLA remains a measurement gate on
-  the intended host. Solver receipts now store wall times for input
-  staging, ungrib, metgrid, real, and WRF. The 196 × 164 production
-  computational grid completed a cold nighttime GFS hour with four ranks,
-  a 15 s step, and a scratch zero-spin-up override. The local ARM64
-  Docker solve took 215.6 s including 208.8 s in WRF. Post and local
-  publication took 0.92 s and 0.23 s. Separately, the full 54-hour
-  production bracket passed ungrib, all 55 metgrid frames, real, and
-  boundary validation in 206.1 s. Complete the timed WRF integration
-  and measure delivery margin before scheduling it.
-- **P0-3 · CAPE.** Corrected ICON-EU has five positive native cells,
-  all below 0.4 J/kg. Tests preserve distinct positive MUCAPE through
-  the NetCDF reader and published Zarr. The pinned AFWA routine returned
-  2,871 J/kg on an ideal convective sounding. A daytime July GFS
-  production-grid hour produced positive MUCAPE in 13,777 of 26,640
-  columns, peaking at 462 J/kg. Zarr preserved all positives. Observed
-  sounding comparison remains open.
-- **P1-1 · Vertical margin.** Native cold initialization passed for
-  1.11, 1.10, and 1.09 across all 26,640 published columns. Minimum
-  counts below 2 km AGL were 17, 18, and 18. Minimum exported tops
-  were 7.54, 6.76, and 5.84 km AGL. The lowest midpoint was 21.49 m
-  AGL in all three. The shipped profile also passed after an hour.
-  July initialization at up to 33.0 °C passed all three. The minimum
-  counts were 17, 17, and 18, and the minimum tops were 8.29, 7.47,
-  and 6.48 km AGL. After an hour, the lower-only 1.09 setting kept 18
-  levels and a 6.49 km minimum top. Pairing 1.09 lower stretch with
-  1.08 upper stretch kept 18 levels at cold and warm initialization
-  with minimum tops of 7.44 and 8.20 km AGL. In July that pairing
-  lowered the highest 17th level from 1,973 to 1,788 m AGL. At the
-  next hour it still had 18 levels and a minimum exported top of
-  8.21 km AGL, 97 m below the shipped setting. Mean absolute MUCAPE
-  difference was 0.57 J/kg, with six cells above 100 J/kg and one
-  reaching 268 J/kg. Qualify the paired stretch across the full
-  forecast before changing production.
-- **P1-2, P2-2, P2-3 · Forcing operations.** GFS can now acquire the
-  planned regional subset from NOAA NOMADS. Existing staged inputs
-  remain supported. The 55-file production set was 59 MB. With two
-  files already staged, acquisition took about 24 minutes at NOAA's
-  request pacing. Manifest seal and independent re-verification took
-  about 11 s each. Candidate profiles record comparison inputs. The
-  scheduled run uses the primary. Qualify ICON-EU over a full production
-  horizon before changing the primary or adopting a fallback.
-- **P1-3 · AFWA pressure.** An absent field or nonpositive cells use the
-  pinned Shuell reduction from the lowest model level. Positive native values
-  remain authoritative. Across both corrected pilots the replacement
-  was within 0.2 Pa mean absolute difference and 4.5 Pa at the worst
-  cell after storage rounding. The two full post replays matched the
-  published arrays.
-- **P1-4 · GFS metgrid count.** Actual pilot and production inputs
-  contain 33 retained isobars plus the surface. WPS excludes eight
-  isobars below its 100 Pa `pmin`. The prep total of 34 is
-  correct. GFS admission now checks that exact retained inventory.
-- **P1-5 · ICON upper air.** Compared the production cutout with DWD's
-  matching regular grid at f000 over 15,794 collocated cells. At levels
-  55 and 74, mean absolute differences were 0.04 and 0.17 K for
-  temperature, 0.07–0.18 m/s for wind components, and 0.006 and
-  0.034 g/kg for humidity. Raw pressure differences were 0.99 and
-  4.14 hPa. Comparing at common geometric heights reduced them to
-  0.08 and 0.19 hPa. Both sources initialized successfully on the
-  production grid. Across its 26,640 published columns, temperature
-  MAE at 250, 1,000, and 2,000 m AGL was 1.38, 0.38, and 0.34 K.
-  Mean vector wind differences were 1.29, 1.97, and 1.58 m/s.
-  Compare additional cycles and full integrations before switching.
-- **P1-6 · Hydrology and ice.** D2 tracks the paired runoff and warm
-  land-state tests. C P1-5 tracks lake ice. The current donor check
-  rejects ice thickness without a qualified coverage fraction.
-  At the first July 1.11 lead, instantaneous land medians were 236 W/m²
-  sensible heat, 88 W/m² latent heat, and 1,057 m PBL height. Initial
-  water table depth was 2.5 m and changed by at most 0.6 mm. The matched
-  3/3 versus 1/1 replay used byte-identical initial and boundary files.
-  Land mean absolute differences were 0.06 W/m² sensible heat,
-  0.03 W/m² latent heat, and 0.11 m PBL height, with one 70 m PBL
-  difference. The one-hour test covers early sensitivity.
-- **P1-7 · Cloud and gust.** An asymmetric four-layer test exercises
-  adjacent MAX-RAN overlap and its sensitivity to vertical order.
-  The operational IFS cloud diagnostic uses a different overlap.
-  Shallow cloud and endpoint gust still need observation scoring.
-- **P2-1 · Fixed shard settings.** Config loading and metadata generation
-  share the wire layout check. Published time shards hold one frame.
-- **P2-4 · Unused verification code.** Removed the disconnected sounding
-  prototype and its soaring proxies. The live spin-up pressure
-  tendency diagnostic remains in the producer. A real observation
-  scorecard belongs in the separate verification layer.
-- **P2-5 · Profile parsing and compatibility.** Parsers pass typed fields
-  by name. Preflight checks the WRF TEMF pairing and the SMS-3DTKE
-  scheme restrictions. WRF selects four soil layers for Noah-MP. Its
-  shortwave scheme and topographic shading are independent controls.
-- **P2-6 · Reproducible evidence.** The checked-in forecast audit verifies
-  committed object hashes and compares two stores. It can verify
-  native radiation when supplied the matching solver output and receipt.
-  Its integration test builds a small forecast and native NetCDF fixture.
-  A full solver CI case still requires pinned geography and forcing.
-- **P2-7 · Consistency and cost.** Removed unused scalar types and
-  documented configured versus effective horizon. The forcing footprint
-  encloses the outer cell faces. Shared prep-plan verification serves
-  both acquirers. Path and producer-digest checks use named runner
-  interfaces. Receipt recovery checks committed hashes while fresh
-  promotion decodes staged arrays. Diagnostic means are per grid cell.
-  Area weighting changed hourly pilot flux means by under 0.0005 W/m².
-  Benchmark repeated GRIB decoding and unused history frames in a full
-  production run before changing either integrity check or output cadence.
+The bounded WPS v5 codec and strict ZEP-0002 checks remain producer boundaries.
+Numcodecs owns compression; publication verifies the complete shard inventory.
+Independent staging and published copies preserve replay: measured APFS
+copy-on-write took 2.92 s versus 2.61 s for independent writes. Revisit backend
+copying only with equivalent digest and recovery behavior. Extend spatial
+sharding with the consumer when a real grid exceeds the wire budget.

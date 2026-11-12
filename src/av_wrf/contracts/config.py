@@ -32,6 +32,15 @@ class DomainProfile:
     dem_source: str
     landuse_source: str
     geog_data_path: str
+    # WPS GEOGRID.TBL.ARW field-specific tokens; `default` silently selects the coarse
+    # 10-arcminute (18.5 km) LAI/VAR_SSO tables even when 30s tiles are staged.
+    lai_source: str = "modis_lai"
+    varsso_source: str = "30s"
+    # 1-way concentric parent buffer: d01 covers the child plus `parent_halo_cells` coarse
+    # cells on every side, so a fine nest is never forced directly from a >3.5x source grid.
+    parent_grid_ratio: int = 1
+    parent_halo_cells: int = 0
+    nest_trigger_ratio: float = 3.5
 
 
 @dataclass(frozen=True)
@@ -79,6 +88,25 @@ class ScienceProfile:
     afwa_buoy_opt: int
     history_interval_min: int
     bucket_mm: float
+    # MYNN2.5-EDMF subgrid clouds and lake physics replace the YSU-only defaults; when
+    # bl_pbl_physics=5 the matching surface layer is 5 and topo_wind/ysu_topdown_pblmix are 0.
+    bl_mynn_edmf: int = 0
+    icloud: int = 1
+    icloud_bl: int = 0
+    sf_lake_physics: int = 0
+    use_lakedepth: int = 0
+    lakedepth_default_m: float = 50.0
+    lake_min_elev_m: float = 5.0
+    # Tilted-eta 6th-order filtering mixes theta/qv across valley inversions without the
+    # slope-aware limiter (WRF phys/module_diffusion.F).
+    diff_6th_slopeopt: int = 0
+    diff_6th_thresh: float = 0.1
+    # WRF adaptive RK3 stepping (dyn_em/module_em.F); caps wall-clock on calm days.
+    use_adaptive_time_step: bool = False
+    target_cfl: float = 1.2
+    target_hcfl: float = 0.84
+    min_time_step_s: int = 6
+    max_time_step_s: int = 17
 
 
 @dataclass(frozen=True)

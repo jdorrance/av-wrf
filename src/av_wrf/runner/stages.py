@@ -19,18 +19,27 @@ from av_wrf.contracts import (
 from av_wrf.core import (
     compile_wps_namelist_sections,
     compile_wrf_run_namelist,
+    nesting_active,
+    parent_domain_shape,
     published_grid_origin_xy_m,
     published_grid_shape,
     render_fortran_namelist,
     resolve_cycle_window,
 )
-from av_wrf.runner.bundle import LoadedBundle, load_bundle, require_path_segment, validate_bundle
+from av_wrf.runner.bundle import (
+    LoadedBundle,
+    _product_namespaces,
+    load_bundle,
+    require_path_segment,
+    validate_bundle,
+)
 from av_wrf.runner.mirrors import find_forcing_recipe, forcing_subset
 from av_wrf.runner.store import ObjectStore, json_bytes, run_lock_key, sha256_file
 
 
 def check_product_config(config_root: Path, product_id: str) -> ProductCheckSummary:
     """Load, cross-reference, and validate a product, vertical stretch, and Zarr v3 store."""
+    _product_namespaces(config_root)
     return _check_bundle(load_bundle(config_root, product_id))
 
 
@@ -55,13 +64,9 @@ def _check_bundle(b: LoadedBundle) -> ProductCheckSummary:
 
 def check_all_products(config_root: Path) -> tuple[ProductCheckSummary, ...]:
     """Discover and validate all configured product YAMLs under config_root/products."""
-    product_files = sorted((config_root / "products").glob("*.yaml"))
-    if not product_files:
-        raise FileNotFoundError(f"No product YAML files found under {config_root / 'products'}")
-    bundles = [load_bundle(config_root, path.stem) for path in product_files]
-    if len({b.product.model_id for b in bundles}) != len(bundles):
-        raise ValueError("Configured products must have distinct model_id publication namespaces")
-    return tuple(_check_bundle(b) for b in bundles)
+    return tuple(
+        _check_bundle(load_bundle(config_root, p)) for p in _product_namespaces(config_root)
+    )
 
 
 def plan_product_cycle(
@@ -76,9 +81,12 @@ def plan_product_cycle(
     geog_bundle_sha256: str | None = None,
     bundle: LoadedBundle | None = None,
 ) -> tuple[str, RunLock]:
-    """Persist an immutable RunLock and accept an identical retry."""
+    """Check namespace ownership, persist an immutable RunLock, and accept identical retries."""
     require_path_segment(attempt_id, "attempt_id")
+    namespaces = _product_namespaces(config_root)
     b = load_bundle(config_root, product_id) if bundle is None else bundle
+    if b.product.product_id != product_id or namespaces.get(product_id) != b.product.model_id:
+        raise ValueError("Bundle product identity differs from configured publication namespace")
     window = resolve_cycle_window(b.product, b.output, publish_origin_utc)
     validate_bundle(b, publish_origin_utc=window.publish_origin_utc)
     lock = _build_run_lock(
@@ -116,6 +124,17 @@ def verify_producer_sha256(lock: RunLock) -> None:
         raise ValueError("Producer code SHA-256 drifted from frozen RunLock")
 
 
+def _validate_mpi_mesh(mpi_ranks: int, e_we: int, e_sn: int) -> None:
+    # WRF chooses the closest factor pair, with the smaller factor in X.
+    # https://github.com/wrf-model/WRF/blob/v4.8.0/external/RSL_LITE/module_dm.F
+    max_x, max_y = e_we // 10, e_sn // 10
+    if mpi_ranks > max_x * max_y:
+        raise ValueError("RunLock mpi_ranks exceeds WRF's 10-cell minimum patch width")
+    ranks_x = next(x for x in range(isqrt(mpi_ranks), 0, -1) if mpi_ranks % x == 0)
+    if ranks_x > max_x or mpi_ranks // ranks_x > max_y:
+        raise ValueError("RunLock mpi_ranks creates a WRF patch narrower than 10 cells")
+
+
 def _build_run_lock(
     b: LoadedBundle,
     window: CycleWindow,
@@ -127,15 +146,10 @@ def _build_run_lock(
 ) -> RunLock:
     if isinstance(mpi_ranks, bool) or mpi_ranks < 1:
         raise ValueError("RunLock mpi_ranks must be >= 1")
-    # WRF chooses the closest factor pair, with the smaller factor in X.
-    # https://github.com/wrf-model/WRF/blob/v4.8.0/external/RSL_LITE/module_dm.F#L90-L161
-    # https://github.com/wrf-model/WRF/blob/v4.8.0/share/module_check_a_mundo.F#L2773-L2799
-    max_x, max_y = b.domain.e_we // 10, b.domain.e_sn // 10
-    if mpi_ranks > max_x * max_y:
-        raise ValueError("RunLock mpi_ranks exceeds WRF's 10-cell minimum patch width")
-    ranks_x = next(x for x in range(isqrt(mpi_ranks), 0, -1) if mpi_ranks % x == 0)
-    if ranks_x > max_x or mpi_ranks // ranks_x > max_y:
-        raise ValueError("RunLock mpi_ranks creates a WRF patch narrower than 10 cells")
+    nested = nesting_active(b.domain, b.primary_source.grid_spacing_deg)
+    _validate_mpi_mesh(mpi_ranks, b.domain.e_we, b.domain.e_sn)
+    if nested:
+        _validate_mpi_mesh(mpi_ranks, *parent_domain_shape(b.domain))
     if build_manifest.oci_digest != "host-dev-unpinned" and (
         not re.fullmatch(r"sha256:[0-9a-f]{64}", build_manifest.oci_digest)
         or not re.fullmatch(r"[0-9a-f]{64}", geog_bundle_sha256)
@@ -162,6 +176,8 @@ def _build_run_lock(
         build_manifest=build_manifest,
         mpi_ranks=mpi_ranks,
         producer_sha256=producer_sha256,
+        max_dom=2 if nested else 1,
+        active_domain_id=2 if nested else 1,
     )
 
 

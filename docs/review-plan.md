@@ -1,8 +1,9 @@
 # Review evidence
 
-The [project plan](plan.md) owns the release gates. This page records pilot
-evidence and the tradeoffs behind the current implementation.
-The [remediation plan](review-remediation.md) tracks the follow-up reviews.
+The [project plan](plan.md) owns release gates. This page preserves the November
+2026 pilot evidence; [remediation](review-remediation.md) records current status
+and remaining qualification. Archived timings predate current nesting and
+profile changes unless stated.
 
 ## Native pilot
 
@@ -18,7 +19,8 @@ Across those leads, mean absolute differences from the paired GFS run were
 1.00 K at 2 m and 0.56–0.63 m/s for 10 m wind components.
 
 The image gate runs both native executables through namelist parsing for every
-product. Real archived inputs exercise WPS and initialization. GFS yielded 34
+product and checks resolved per-domain options. Synthetic single-domain and
+nested inputs exercise WPS, WRF and postprocessing. Archived GFS inputs yielded 34
 atmospheric levels and four soil layers. ICON-EU yielded 75 atmospheric levels
 and eight soil temperature and moisture layers. WRF 4.8 accepts
 `history_begin_h` from [its I/O registry](https://github.com/wrf-model/WRF/blob/v4.8.0/Registry/registry.io_boilerplate).
@@ -69,8 +71,10 @@ regular-grid feed to end after November 30, 2026.
 The [acquirer](../src/av_wrf/runner/README.md) reuses grid weights and static
 fields across forecast hours. It remaps to a regular cutout, checks that
 pressure brackets the WRF model top, and averages the 75 height interfaces
-onto 74 full levels. The paired pilot used 9,187 donor objects and produced
-236 MB of normalized GRIB2 across 23 boundary files.
+onto 74 full levels. The archived paired pilot used 9,187 donor objects and
+produced 236 MB of normalized GRIB2 across 23 boundary files. Direct WPS v5
+intermediates now provide an implemented route with the same remapping and
+admission checks; the archived byte count describes the GRIB route.
 [DWD ICON reference](https://dwd.de/DWD/forschung/nwv/fepub/icon_database_main.pdf)
 
 A same-cycle check matched 7,176 cutout points to DWD's regular grid.
@@ -87,26 +91,28 @@ allowance remains provisional until complete inventories are observed over
 more cycles.
 [DWD v1 listing](https://opendata.dwd.de/weather/nwp/v1/m/icon-eu/p/P/lvt1/150/lv1/74/r/2026-11-11T18%3A00/s/)
 
-The stock WPS table emits `FLAG_SOIL_LEVELS`. DWD's GRIB center selects
-volumetric soil moisture conversion. The pilot requires zero ice thickness
-across the donor cutout. Ice-bearing regions need an ice-fraction source.
+The archived GRIB route used stock WPS `FLAG_SOIL_LEVELS` and DWD's center code
+for volumetric soil moisture conversion. The pilot donor cutout had zero ice
+thickness. Ice-bearing regions require qualified coverage fractions.
 [WPS conversion](https://github.com/wrf-model/WPS/blob/v4.7.0/ungrib/src/rrpr.F#L793-L802)
 
 ## Measured tradeoffs
 
 - **History stream.** Trimming the consumed fields reduced a representative
   frame from 19.76 to 14.72 MB and increased a 30-minute replay from 55.50 to
-  62.52 s. The pilot uses the default stream.
+  62.52 s. Broad field pruning was rejected for that replay. Current MYNN runs
+  add `CLDFRA_BL` through `iofields_filename` to the standard history stream.
 - **Solver.** Four, eight, and 16 ranks took 55.50, 60.66, and 65.75 s in
   single 30-minute replays on one ARM64 image. Ten-minute radiation took
   55.61 s and changed the frame. The current configuration uses the
   three-minute setting.
-- **Production geometry.** A cold GFS hour on the 196 × 164 computational
+- **Archived production geometry.** A cold GFS hour on the 196 × 164 computational
   grid took 215.6 s to solve with four ranks and a 15 s time step.
   The WRF process took 208.8 s, including 149.1 s in integration steps.
   Post and local publication took 0.92 s and 0.23 s. This nighttime
-  scratch run used a zero-spin-up override. The full delivery budget
-  remains a target-host measurement. All 55 GFS forcing files passed
+  scratch run used a zero-spin-up override and predates the current parent
+  buffer and geometry. The full delivery budget remains a target-host
+  measurement. All 55 GFS forcing files passed
   native initialization for the full 54-hour bracket in 206.1 s.
 - **Publish.** A retiled 40-lead fixture held 878 objects and 825 MB. ARM64
   Docker Desktop median publish took 3.13 s, including 1.01 s for decode and
@@ -114,16 +120,18 @@ across the donor cutout. Ice-bearing regions need an ice-fraction source.
   Retry took 2.44 s and all hashes matched. On APFS, verified copy-on-write
   took 2.92 s versus 2.61 s for independent writes.
 
-## Remaining qualification
+## Reference systems and implemented decisions (2026-11)
 
-- **Remote publication.** Test the archived pilot in private R2 with immutable
-  attempt payloads, a conditional ready commit, and tile range reads through
-  the consumer. Exercise competing attempts and interrupted transfers.
-  [R2 S3 API](https://developers.cloudflare.com/r2/api/s3/api/)
-- **Consumer integration.** Register AFWA CAPE provenance and agree on the
-  published producer identity. Qualify a moist inverse or a versioned
-  geometric-velocity field when the consumer uses vertical velocity.
-  [Science conventions](science.md)
-- **Source and physics expansion.** Measure dissemination lag across cycles
-  before scheduling ICON-EU. Use paired forecast and observation archives
-  to evaluate solver settings, gust calibration, and physics changes.
+Reference systems inspected: `soaringmeteo/soarWRF` (18/6/2 km 3:1),
+`sfalmo/rasp-from-scratch` (MYNN2.5, adaptive CFL, SRTM/CORINE),
+`DavidRasp/blipmaps.nl` (GFS+ICON, sidecar post), `canadarasp.ca` (S3 `.idx`
+byte ranges), `raspit`/`raspnw` (ephemeral VMs, legacy NCL). Lessons applied
+here: 3:1 parent buffers, MYNN-EDMF with subgrid cloud fraction, 30s static
+fields and adaptive RK3. Local publication retains per-object directory sync
+and durable commit/recovery fences.
+
+Thompson table prebaking, GFS/IFS indexed range fetching, direct ICON WPS
+intermediates, and S3 conditional writes are implemented. Competitor designs
+provide architectural references; the paired replays measure numerical behavior
+and source disagreement. Full-horizon timing, live R2/consumer delivery and
+observation scoring remain [qualification gates](review-remediation.md#remaining-qualification).

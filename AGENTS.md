@@ -28,12 +28,14 @@ move fewer bytes, allocate fewer arrays, and burn fewer core-hours.
   `samples.bin`, `profiles.bin`, and `.pmtiles` belong exclusively to
   `windy-av-layer`.
 - Obey the 5-layer one-way import DAG (`L0 contracts <- L1 core <- L2 codecs <-
-  {L3a runner | L3b verify} <- L4 cli`):
+  L3 runner <- L4 cli`):
   - `contracts` and `core` are pure deterministic functions: zero file I/O,
     network, subprocesses, `netCDF4`/`zarr` handles, RNG, or wall-clock calls.
   - `cli/env.py` is the sole module permitted to read `os.environ`.
-  - `runner` and `verify` never import each other; relative imports and dynamic
-    `importlib`/`__import__` calls are forbidden.
+  - Relative imports and dynamic `importlib`/`__import__` calls are forbidden.
+  - `core` foundations (`grid`, `thermo`, `vertical`, `nesting`, `namelist`,
+    `physics_namelist`, `post_3d`) are the only peer modules other `core`
+    modules may import.
 - Enforce subtractive budgets (`scripts/check_repo.py`):
   - At most `350` lines per `.py` file, `60` lines per function, and `100`
     columns per line (`E501`).
@@ -44,9 +46,13 @@ move fewer bytes, allocate fewer arrays, and burn fewer core-hours.
   - Delete unreached stubs, exports, config fields, and comments in the change
     that leaves them unreached. Cite upstream WRF/weather docs in comments where
     physical conventions or solver workarounds matter.
-- Validate every change with `uv run verify` and `git diff --check`. Never edit
-  `vendor/producer-contract/`, rewrite `manifest.lock`, or loosen
-  `tests/oracle/` tolerances to silence a failing check.
+  - Annotate every non-obvious physical convention, upstream Fortran quirk,
+    IEEE-754 edge case, and concurrency invariant with one or two inline lines
+    stating *why*, so a future reviewer does not have to re-derive it.
+- Validate every change with `uv run verify` and `git diff --check`. Update
+  `vendor/producer-contract/` only through
+  `scripts/sync_contract.py --allow-lock-rewrite` while the schema remains
+  provisional, and never loosen `tests/oracle/` tolerances to silence a check.
 
 ## Documentation
 

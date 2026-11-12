@@ -36,7 +36,6 @@ def _to_f32_array(arr: npt.NDArray[np.float32]) -> array[float]:
 def validate_domain_profile(domain: DomainProfile) -> None:
     """Enforce the WPS Lambert coordinate and computational domain limits."""
     # WPS geogrid passes one Lambert spacing and uses its default spherical radius.
-    # https://github.com/wrf-model/WPS/blob/v4.7.0/geogrid/src/llxy_module.F#L340-L389
     if domain.dx_m != domain.dy_m or not 0.0 < domain.dx_m < math.inf:
         raise ValueError("WPS Lambert grid spacing must be equal, finite and positive")
     if domain.earth_radius_m != WRF_SPHERE_RADIUS_M:
@@ -45,7 +44,6 @@ def validate_domain_profile(domain: DomainProfile) -> None:
         raise ValueError("Lambert longitudes must lie in [-180, 180] degrees")
     p1, p2 = domain.std_parallel_1_deg, domain.std_parallel_2_deg
     # WPS uses one hemisphere (selected by TRUELAT1) for both standard parallels.
-    # https://github.com/wrf-model/WPS/blob/v4.7.0/geogrid/src/module_map_utils.F#L1124-L1157
     if not (abs(domain.center_lat_deg) < 90.0 and max(abs(p1), abs(p2)) < 90.0 and p1 * p2 > 0):
         raise ValueError("WPS Lambert standard parallels must share a hemisphere between the poles")
     _cone_constants(p1, p2, domain.center_lat_deg, domain.earth_radius_m)
@@ -64,7 +62,6 @@ def _wrap_lon_rad(delta_rad: float) -> float:
 
 def _effective_second_parallel(p1: float, p2: float) -> float:
     # WPS lc_cone selects tangent geometry using default REAL arithmetic.
-    # https://github.com/wrf-model/WPS/blob/v4.7.0/geogrid/src/module_map_utils.F#L1130-L1157
     return p1 if abs(np.float32(p1) - np.float32(p2)) <= np.float32(0.1) else p2
 
 
@@ -245,7 +242,7 @@ def computational_latlon_bounds(
     if not math.isfinite(halo_deg) or not math.isfinite(snap_deg) or halo_deg < 0 or snap_deg <= 0:
         raise ValueError("Forcing halo must be nonnegative and snap spacing must be positive")
     cx_m, cy_m = _domain_center_xy_m(domain)
-    # The outer cell faces lie half a cell beyond the first and last mass centers.
+    # Outer cell faces lie half a cell beyond the first/last mass centers.
     hx, hy = (
         0.5 * max(1, domain.e_we - 1) * domain.dx_m,
         0.5 * max(1, domain.e_sn - 1) * domain.dy_m,
@@ -259,8 +256,7 @@ def computational_latlon_bounds(
     )
     if x_min <= 0.0 <= x_max and y_min <= cone_y <= y_max:
         raise ValueError("A regional Lambert cutout cannot contain the projection pole")
-    # Latitude is monotonic with distance from the cone apex. Extrema occur at a corner
-    # or at the point on the rectangle nearest the apex. Longitudes are radial lines.
+    # Latitude is monotonic from the cone apex; extrema lie at a corner or nearest point.
     points = [(x, y) for x in (x_min, x_max) for y in (y_min, y_max)]
     points.append((min(x_max, max(x_min, 0.0)), min(y_max, max(y_min, cone_y))))
     lats, lons_u = [], []

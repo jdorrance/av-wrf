@@ -102,7 +102,6 @@ def build_synthetic_wrf_step(
         return CompMass3D(Slab3DF32(nz=nz, ny=ny, nx=nx, buf=array("f", [val]) * (nz * n2)))
 
     pb, ph, phb, u_s, v_s, w_s = _synthetic_base_3d(domain)
-    zeros = ci(0)
     return RawWrfStepInput(
         valid_time_utc=valid_time_utc,
         valid_time_unix_s=valid_time_unix_s,
@@ -122,9 +121,9 @@ def build_synthetic_wrf_step(
         achfx_j_m2=c2(float(lead_hour) * 240.0 * 3600.0),
         aclhf_j_m2=c2(float(lead_hour) * 80.0 * 3600.0),
         rainc_mm=c2(0.0),
-        i_rainc=zeros,
+        i_rainc=ci(0),
         rainnc_mm=c2(float(lead_hour) * 0.25),
-        i_rainnc=zeros,
+        i_rainnc=ci(0),
         p_pert_pa=c3(0.0),
         pb_pa=pb,
         ph_stag_m2s2=ph,
@@ -135,6 +134,8 @@ def build_synthetic_wrf_step(
         u_stag_mps=u_s,
         v_stag_mps=v_s,
         w_stag_mps=w_s,
+        cldfra_bl=c3(0.25),
+        dt_s=15,
     )
 
 

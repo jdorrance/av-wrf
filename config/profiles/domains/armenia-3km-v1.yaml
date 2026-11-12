@@ -25,9 +25,9 @@ std_parallel_2_deg: 41.80
 central_meridian_deg: 44.50
 dx_m: 3000.0
 dy_m: 3000.0
-e_we: 197
-e_sn: 165
-bdy_trim_cells: 8
+e_we: 199
+e_sn: 169
+bdy_trim_cells: 9
 e_vert: 55
 exported_levels_k: 40
 p_top_pa: 5000.0
@@ -40,4 +40,9 @@ min_bl_levels_2km_agl: 17
 terrain_elevations_m: [800.0, 4090.0, 5137.0]
 dem_source: default
 landuse_source: default
+lai_source: modis_lai
+varsso_source: 30s
+parent_grid_ratio: 3
+parent_halo_cells: 30
+nest_trigger_ratio: 3.5
 geog_data_path: /opt/av-wrf/geog

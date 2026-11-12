@@ -1,7 +1,9 @@
 """Recovery of interrupted native solver attempts."""
 
+import signal
 import subprocess
 import sys
+import time
 from functools import partial
 from pathlib import Path
 from unittest.mock import patch
@@ -89,7 +91,7 @@ def test_native_retry_recovers_output_after_receipt_write_failure(tmp_path: Path
         patch("av_wrf.runner.solver_exec._execute_solver_binaries", side_effect=native),
         patch(
             "av_wrf.runner.solver_exec._hash_complete_wrfout",
-            side_effect=lambda p, _: ((OUTPUT, sha256_file(p / OUTPUT)),),
+            side_effect=lambda p, *_: ((OUTPUT, sha256_file(p / OUTPUT)),),
         ),
     ):
         with pytest.raises(RuntimeError, match="native failed"):
@@ -111,3 +113,28 @@ def test_native_retry_recovers_output_after_receipt_write_failure(tmp_path: Path
 def test_native_stage_times_out(tmp_path: Path) -> None:
     with pytest.raises(subprocess.TimeoutExpired):
         _run_native([sys.executable, "-c", "import time; time.sleep(60)"], tmp_path, 1)
+
+
+@pytest.mark.parametrize("timeout", [None, 30])
+def test_native_stage_forwards_sigterm(tmp_path: Path, timeout: int | None) -> None:
+    launcher = (
+        "import sys; from pathlib import Path; from av_wrf.runner.solver import _run_native; "
+        f"_run_native([sys.executable, '-c', sys.argv[1]], Path.cwd(), {timeout!r})"
+    )
+    worker = (
+        "import signal, sys, time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM, lambda *_: (Path('stopped').touch(), sys.exit(0))); "
+        "Path('started').touch(); time.sleep(15)"
+    )
+    with subprocess.Popen([sys.executable, "-c", launcher, worker], cwd=tmp_path) as process:
+        try:
+            deadline = time.monotonic() + 5
+            while not (tmp_path / "started").exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert (tmp_path / "started").exists()
+            process.send_signal(signal.SIGTERM)
+            assert process.wait(timeout=10) == 128 + signal.SIGTERM
+        finally:
+            if process.poll() is None:
+                process.kill()
+    assert (tmp_path / "stopped").exists()

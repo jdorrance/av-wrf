@@ -3,7 +3,7 @@
 import json
 from dataclasses import replace
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest.mock import patch
 
 import httpx
@@ -11,7 +11,7 @@ import pytest
 
 from av_wrf.core import resolve_cycle_window
 from av_wrf.runner.forcing_gfs import GFS
-from av_wrf.runner.gfs_acquire import _acquire
+from av_wrf.runner.gfs_acquire import _acquire, _cgi_fetch, _FetchMode
 from av_wrf.runner.mirrors import forcing_subset
 from av_wrf.runner.store import sha256_hex
 from tests.integration import bundle_for_recipe
@@ -19,7 +19,27 @@ from tests.integration import bundle_for_recipe
 CONFIG = Path(__file__).resolve().parents[2] / "config"
 
 
-def test_gfs_subset_retry_reuses_only_verified_files(tmp_path: Path) -> None:
+def test_cgi_paces_every_attempt_without_retrying_permanent_failure() -> None:
+    calls: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(404)
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        patch("av_wrf.runner.gfs_acquire.sleep") as pacing,
+        patch("av_wrf.runner.http_request.sleep") as retry_sleep,
+        pytest.raises(httpx.HTTPStatusError),
+    ):
+        _cgi_fetch(client, [0, 0, 1, 1], PurePosixPath("dir/file"))
+    assert len(calls) == 1
+    pacing.assert_called_once_with(10)
+    retry_sleep.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["regional", "fallback"])
+def test_gfs_subset_retry_reuses_only_verified_files(tmp_path: Path, mode: _FetchMode) -> None:
     bundle = bundle_for_recipe(CONFIG, GFS)
     product = bundle.product
     window = resolve_cycle_window(
@@ -57,14 +77,19 @@ def test_gfs_subset_retry_reuses_only_verified_files(tmp_path: Path) -> None:
 
     with (
         httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        patch(
+            "av_wrf.runner.gfs_acquire.fetch_ranges", side_effect=ValueError("mirrors unavailable")
+        ) as ranges,
         patch("av_wrf.runner.gfs_acquire.GFS", replace(GFS, validate_file=validate)),
         patch("av_wrf.runner.gfs_acquire.sleep") as wait,
     ):
         with pytest.raises(ValueError, match="invalid forcing"):
-            _acquire(client, bundle, cycle, plan, tmp_path, second)
+            _acquire(client, bundle, cycle, plan, tmp_path, second, mode=mode)
         assert not list(tmp_path.glob("*.json"))
-        files = _acquire(client, bundle, cycle, plan, tmp_path, second)
-        wait.assert_called_once_with(10)
+        files = _acquire(client, bundle, cycle, plan, tmp_path, second, mode=mode)
+        assert wait.call_count == 3
+        if mode == "regional":
+            ranges.assert_not_called()
     assert calls == [first_key, second_key, second_key]
     manifest = json.loads(next(tmp_path.glob("*.sources-*.json")).read_bytes())
     assert manifest["normalized_sha256s"] == {

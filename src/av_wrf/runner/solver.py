@@ -11,9 +11,11 @@ from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import Path
 from tempfile import mkdtemp
+from threading import current_thread, main_thread
 from time import perf_counter
+from types import FrameType
 
-from av_wrf.codecs import select_cycle_wrfout_slices
+from av_wrf.codecs import domain_tag, select_cycle_wrfout_slices
 from av_wrf.contracts import BuildManifest, CycleWindow, RunLock, SolverReceipt
 from av_wrf.runner.store import (
     ObjectStore,
@@ -28,23 +30,53 @@ _LOCAL_SOLVER_RECEIPT = ".solver-receipt.json"
 
 
 def _run_native(command: list[str], cwd: Path, timeout_s: int | None) -> float:
-    """Return native stage wall seconds and cancel its process group on timeout."""
+    """Return native wall seconds and stop the process group on timeout or cancellation."""
     started = perf_counter()
-    if timeout_s is None:
-        subprocess.run(command, cwd=cwd, check=True)
-        return perf_counter() - started
-    if timeout_s < 1:
+    if timeout_s is not None and timeout_s < 1:
         raise ValueError("Native stage timeout must be positive")
-    with subprocess.Popen(command, cwd=cwd, start_new_session=True) as process:
-        try:
-            code = process.wait(timeout=timeout_s)
-        except (subprocess.TimeoutExpired, KeyboardInterrupt):
-            with suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-            raise
+    process: subprocess.Popen[bytes] | None = None
+    stopping = False
+
+    def terminate(signum: int, _frame: FrameType | None) -> None:
+        nonlocal stopping
+        if not stopping:
+            stopping = True
+            # During Popen the PID may already exist. Wait until we hold the child handle.
+            if process is not None:
+                raise SystemExit(128 + signum)
+
+    previous = (
+        signal.signal(signal.SIGTERM, terminate) if current_thread() is main_thread() else None
+    )
+    try:
+        with subprocess.Popen(command, cwd=cwd, start_new_session=True) as child:
+            try:
+                process = child
+                if stopping:
+                    raise SystemExit(128 + signal.SIGTERM)
+                code = child.wait(timeout=timeout_s)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt, SystemExit):
+                stopping = True
+                _stop_native(child)
+                raise
+            finally:
+                process = None
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
     if code:
         raise subprocess.CalledProcessError(code, command)
     return perf_counter() - started
+
+
+def _stop_native(process: subprocess.Popen[bytes]) -> None:
+    # Let MPI clean up its ranks before forcing the local group to exit.
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGTERM)
+    with suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=5)
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
 
 
 def _exec_mpi_step(
@@ -177,21 +209,30 @@ def _verify_runtime_build_manifest(
         raise ValueError("Installed solver and runtime build manifests must match the RunLock")
 
 
-def _wrfout_files(wrfout_dir: Path) -> list[Path]:
-    return sorted(wrfout_dir.glob("wrfout_d01_*"))
+def _wrfout_files(wrfout_dir: Path, domain_id: int = 1) -> list[Path]:
+    return sorted(wrfout_dir.glob(f"wrfout_{domain_tag(domain_id)}_*"))
 
 
-def _hash_complete_wrfout(wrfout_dir: Path, window: CycleWindow) -> tuple[tuple[str, str], ...]:
-    select_cycle_wrfout_slices(wrfout_dir, window.publish_origin_utc, window.valid_times_utc)
-    return tuple((p.name, sha256_file(p)) for p in _wrfout_files(wrfout_dir))
+def _hash_complete_wrfout(
+    wrfout_dir: Path, window: CycleWindow, domain_id: int = 1
+) -> tuple[tuple[str, str], ...]:
+    select_cycle_wrfout_slices(
+        wrfout_dir, window.publish_origin_utc, window.valid_times_utc, domain_id=domain_id
+    )
+    return tuple((p.name, sha256_file(p)) for p in _wrfout_files(wrfout_dir, domain_id))
 
 
 def _verify_wrfout_files(
-    wrfout_dir: Path, expected: tuple[tuple[str, str], ...], selected: set[Path] | None
+    wrfout_dir: Path,
+    expected: tuple[tuple[str, str], ...],
+    selected: set[Path] | None,
+    domain_id: int = 1,
 ) -> None:
-    outputs = _wrfout_files(wrfout_dir)
+    outputs = _wrfout_files(wrfout_dir, domain_id)
     if tuple(p.name for p in outputs) != tuple(name for name, _ in expected):
-        raise ValueError("wrfout_d01_* inventory does not match SolverReceipt filenames")
+        raise ValueError(
+            f"wrfout_{domain_tag(domain_id)}_* inventory does not match SolverReceipt filenames"
+        )
     if selected is not None and not selected.issubset(outputs):
         raise ValueError("Selected wrfout files must belong to the SolverReceipt inventory")
     for p, (_, digest) in zip(outputs, expected, strict=True):
@@ -242,7 +283,7 @@ def _verify_solver_receipt_bytes(
     if not rec.wrfout_sha256s or not rec.forcing_sha256s:
         raise ValueError("SolverReceipt missing forcing or wrfout digests")
     if wrfout_dir is not None:
-        _verify_wrfout_files(wrfout_dir, rec.wrfout_sha256s, selected)
+        _verify_wrfout_files(wrfout_dir, rec.wrfout_sha256s, selected, lock.active_domain_id)
     return rec
 
 
@@ -255,7 +296,7 @@ def _recover_solved_attempt(
         return None
     receipt = _verify_solver_receipt_bytes(raw, lock, None)
     try:
-        _verify_wrfout_files(attempt, receipt.wrfout_sha256s, None)
+        _verify_wrfout_files(attempt, receipt.wrfout_sha256s, None, lock.active_domain_id)
     except (OSError, ValueError):
         return None
     put_idempotent(store, key, raw)

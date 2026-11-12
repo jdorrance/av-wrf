@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.check_repo import audit_repo  # noqa: E402
+from scripts.generate_reference import check_markdown_files  # noqa: E402
 
 
 class TestCheckRepoHarness(unittest.TestCase):
@@ -33,7 +34,11 @@ class TestCheckRepoHarness(unittest.TestCase):
             (clone / ".env").write_text("AV_WRF_MPI_RANKS=8\n", encoding="utf-8")
             (clone / "output" / "test").mkdir(parents=True)
             (clone / "runs" / "test").mkdir(parents=True)
+            local_plan = clone / ".kilo" / "plans" / "local-review.md"
+            local_plan.parent.mkdir(parents=True, exist_ok=True)
+            local_plan.write_text("Local editor notes.\n", encoding="utf-8")
             self.assertEqual(audit_repo(clone), [])
+            self.assertEqual(check_markdown_files(clone), [])
 
             # 1. Dumping-ground utils.py is rejected
             bad_utils = clone / "src" / "av_wrf" / "core" / "utils.py"

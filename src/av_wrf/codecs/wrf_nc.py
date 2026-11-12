@@ -13,9 +13,7 @@ from av_wrf.codecs.wrf_nc_grid import (
     extract_clean_i32_nc,
     parse_wrf_timestamp,
     rotation_sine_needs_flip,
-    select_cycle_wrfout_slices,
     slice_nc_var,
-    validate_wrfinput_nc,
     verify_local_wrf_nc,
     verify_wrfout_grid_against_domain,
 )
@@ -34,7 +32,7 @@ from av_wrf.contracts import (
     Slab2DI32,
     Slab3DF32,
 )
-from av_wrf.core import verify_t_thm_consistency
+from av_wrf.core import MYNN_CLOUD_FIELD, verify_t_thm_consistency
 
 RRTMG_SHORTWAVE_TOLERANCE_WM2 = 0.01
 
@@ -91,8 +89,6 @@ def _verify_surface_shortwave(
         if required:
             raise ValueError(f"{label} missing {', '.join(missing)}")
         return
-    # RRTMG stores contemporaneous fluxes at the same bottom plane.
-    # https://github.com/wrf-model/WRF/blob/v4.8.0/phys/module_ra_rrtmg_sw.F#L10790-L10799
     down = extract_clean_f32_nc(v, nc_path, "SWDNB", time_index, shape)
     up = extract_clean_f32_nc(v, nc_path, "SWUPB", time_index, shape)
     tol_wm2 = RRTMG_SHORTWAVE_TOLERANCE_WM2
@@ -211,28 +207,26 @@ def _read_2d_fields(
             "silent fallback to surface AFWA_CAPE is forbidden)"
         )
     afwa_mslp = _r2_nc(v, nc_path, "AFWA_MSLP", t_i, ny, nx) if "AFWA_MSLP" in v else None
-    s2 = {
-        k: _r2_nc(v, nc_path, k, t_i, ny, nx)
-        for k in (
-            "HGT",
-            "COSALPHA",
-            "SINALPHA",
-            "PSFC",
-            "T2",
-            "Q2",
-            "U10",
-            "V10",
-            "HFX",
-            "LH",
-            "UST",
-            "PBLH",
-            "ACHFX",
-            "ACLHF",
-            "RAINC",
-            "RAINNC",
-            "AFWA_CAPE_MU",
-        )
-    }
+    keys = (
+        "HGT",
+        "COSALPHA",
+        "SINALPHA",
+        "PSFC",
+        "T2",
+        "Q2",
+        "U10",
+        "V10",
+        "HFX",
+        "LH",
+        "UST",
+        "PBLH",
+        "ACHFX",
+        "ACLHF",
+        "RAINC",
+        "RAINNC",
+        "AFWA_CAPE_MU",
+    )
+    s2 = {k: _r2_nc(v, nc_path, k, t_i, ny, nx) for k in keys}
     return (
         s2,
         afwa_mslp,
@@ -248,6 +242,7 @@ def _assemble_step_from_vars(
     t_i: int,
     dims: tuple[int, int, int, int],
     science: ScienceProfile,
+    dt_s: float | None = None,
 ) -> RawWrfStepInput:
     ny, nx, _, _ = dims
     p_p, pb, t_d, qv, cld, ph, phb, u_s, v_s, w_s = _read_3d_fields(v, nc_path, t_i, dims, science)
@@ -285,6 +280,10 @@ def _assemble_step_from_vars(
         v_s,
         w_s,
         afwa_mslp_pa=afwa_mslp,
+        dt_s=dt_s,
+        cldfra_bl=_r3_nc(v, nc_path, MYNN_CLOUD_FIELD, t_i, dims[3], ny, nx, crop=False)
+        if MYNN_CLOUD_FIELD in v
+        else None,
     )
 
 
@@ -296,8 +295,9 @@ def read_wrfout_step_nc(
     time_index: int = 0,
     expected_valid_utc: str | None = None,
     require_surface_shortwave: bool = False,
+    require_mynn_clouds: bool = False,
 ) -> RawWrfStepInput:
-    """Read one wrfout time and verify RRTMG shortwave if present or required by the caller."""
+    """Read one wrfout time and check native radiation and MYNN fields when required."""
     verify_local_wrf_nc(nc_path)
     import netCDF4
 
@@ -308,6 +308,11 @@ def read_wrfout_step_nc(
         stamp = parse_wrf_timestamp(raw_t)
         if expected_valid_utc is not None and stamp[0] != expected_valid_utc:
             raise ValueError(f"wrfout Times {stamp[0]} != expected {expected_valid_utc}")
+        required_clouds = (
+            require_mynn_clouds and science.bl_pbl_physics == 5 and science.icloud_bl > 0
+        )
+        if required_clouds and MYNN_CLOUD_FIELD not in ds.variables:
+            raise ValueError(f"{nc_path}: Missing required MYNN history field {MYNN_CLOUD_FIELD}")
         _verify_surface_shortwave(
             ds.variables,
             nc_path,
@@ -316,7 +321,16 @@ def read_wrfout_step_nc(
             science,
             required=require_surface_shortwave,
         )
-        step = _assemble_step_from_vars(ds.variables, nc_path, stamp, time_index, dims, science)
+        if require_surface_shortwave and science.ra_sw_physics == 4:
+            slope = extract_clean_f32_nc(ds.variables, nc_path, "SWDOWN", time_index, dims[:2])
+            if not -1.0 <= slope.min() <= slope.max() <= 1500.0:
+                raise ValueError(f"{nc_path}: slope-corrected SWDOWN outside [-1, 1500] W/m²")
+        dt_s = float(ds.getncattr("DT")) if "DT" in ds.ncattrs() else None
+        if dt_s is not None and (not np.isfinite(dt_s) or dt_s <= 0):
+            raise ValueError("WRF DT must be finite and positive")
+        step = _assemble_step_from_vars(
+            ds.variables, nc_path, stamp, time_index, dims, science, dt_s=dt_s
+        )
     cosine = np.frombuffer(step.cos_alpha.buf, np.float32).reshape(xlong.shape)
     sine = np.frombuffer(step.sin_alpha.buf, np.float32).reshape(xlong.shape)
     if rotation_sine_needs_flip(domain, xlong, cosine, sine, str(nc_path)):
@@ -330,8 +344,6 @@ __all__ = [
     "RawWrfStepInput",
     "read_wrfout_baseline_nc",
     "read_wrfout_step_nc",
-    "select_cycle_wrfout_slices",
-    "validate_wrfinput_nc",
     "verify_local_wrf_nc",
     "verify_wrfout_grid_against_domain",
 ]

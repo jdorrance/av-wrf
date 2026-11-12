@@ -68,11 +68,15 @@ class RawWrfStepInput:
     v_stag_mps: CompStagY3D
     w_stag_mps: CompStagZ3D
     afwa_mslp_pa: CompMass2D | None = None
+    # Current MYNN total cloud fraction; live MYNN radiation coupling requires this field.
+    cldfra_bl: CompMass3D | None = None
+    # WRF adaptive RK3 step length at this output time; falls back to science.time_step_s.
+    dt_s: float | None = None
 
 
 @dataclass(frozen=True)
 class NormalizedWrfFrame:
-    """All 22 Published-Grid arrays plus full-domain column and output-frame Courant invariants."""
+    """Published-Grid arrays plus column and output-frame Courant invariants."""
 
     valid_time_utc: str
     window_start_unix_s: int

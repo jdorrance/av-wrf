@@ -34,7 +34,7 @@ from av_wrf.runner import (
 )
 from av_wrf.runner.forcing_gfs import GFS
 from av_wrf.runner.publish import _advance_latest_pointer_with_retry
-from av_wrf.runner.store import synthetic_cycle_prefix
+from av_wrf.runner.store import CASConflict, synthetic_cycle_prefix
 from tests.integration import bundle_for_recipe, stage_sparse_config
 
 
@@ -309,6 +309,21 @@ def test_rejected_webhook_can_retry_delivery(tmp_path: Path, receipt: ReadyRecei
         reconcile_dispatch(store, receipt, lambda _: 503)
     assert reconcile_dispatch(store, receipt, lambda _: 204)
     assert not reconcile_dispatch(store, receipt, lambda _: pytest.fail("Already delivered"))
+
+
+def test_dispatch_adopts_both_lost_conditional_write_responses(
+    tmp_path: Path, receipt: ReadyReceipt
+) -> None:
+    store = LocalFileStore(tmp_path)
+    cas = store.compare_and_swap
+
+    def lose_response(key: str, payload: bytes, expected_token: str | None) -> str:
+        cas(key, payload, expected_token)
+        raise CASConflict("The retry hit the newly committed value")
+
+    with patch.object(store, "compare_and_swap", side_effect=lose_response):
+        assert reconcile_dispatch(store, receipt, lambda _: 204)
+        assert not reconcile_dispatch(store, receipt, lambda _: pytest.fail("Already delivered"))
 
 
 def test_webhook_tls_bearer_and_error_redaction(receipt: ReadyReceipt) -> None:

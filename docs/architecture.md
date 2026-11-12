@@ -5,20 +5,19 @@
 during `prep`, verifies `forcing_manifest.json` and runs `WPS` + `WRF-ARW` inside
 a pinned Linux container, stages `Times`-indexed native model-level shards with
 `[64, 64]` inner chunks under an attempt prefix, verifies the complete `RunLock`
-horizon under an exclusive per-cycle lock before promoting `forecast.zarr`,
-`_diagnostics.json`, and `_ready.json`, advances `latest.json` via opaque-token
-compare-and-swap, and dispatches a consumer webhook with expiring leases.
+horizon, commits `_ready.json`, advances `latest.json` via compare-and-swap, and
+dispatches a consumer webhook with expiring leases.
 
 ```mermaid
 flowchart LR
-  cfg["config/ YAML"] --> geog["geog -> geo_em.d01.nc"]
+  cfg["config/ YAML"] --> geog["geog -> active-domain geography bundle"]
   geog --> plan["plan -> run.lock.json"]
   plan --> prep["prep -> namelists + forcing_subset.json"]
-  prep --> forcing["forcing-manifest -> verified local GRIB2 inventory"]
+  prep --> forcing["forcing-manifest -> verified GRIB2 or WPS inventory"]
   forcing --> solve["solve -> met_em + validated wrfinput + wrfout"]
   solve --> post["post -> attempt staged/forecast.zarr"]
   post --> pub["publish -> cycle_lock + verify horizon + _ready.json + CAS"]
-  pub --> av["windy-av-layer ModelLevelFrame"]
+  pub --> av["consumer reads _ready.json and forecast.zarr"]
 ```
 
 ## Five-layer acyclic package graph
@@ -41,39 +40,49 @@ flowchart TB
   `interval_seconds`), `OutputProfile`, `CycleWindow`, `RunLock`,
   `ForcingManifest`, `SolverReceipt`, `ReadyReceipt`, `DiagnosticsReceipt`,
   `WRF_ZARR_V3_FIELDS`, `Slab2DF32`/`Slab2DI32`/`Slab3DF32`, and nominal types.
-- [`src/av_wrf/core/`](../src/av_wrf/core/README.md): pure deterministic modules
-  (`grid.py`, `thermo.py`, `schedule.py`, `vertical.py`, `namelist.py`,
-  `post.py`, `metrics.py`). These modules perform pure array and scalar math.
+- [`src/av_wrf/core/`](../src/av_wrf/core/README.md): pure grid, thermodynamic,
+  schedule, vertical-coordinate, and metric calculations. `nesting.py` resolves
+  the parent buffer; `namelist.py`, `physics_namelist.py`, and `wps_namelist.py`
+  compile Registry-shaped solver and WPS settings. `post_3d.py` builds 3D fields
+  and the sampled Courant proxy; `post.py` assembles surface fluxes and frames.
 - [`src/av_wrf/codecs/`](../src/av_wrf/codecs/README.md): `wrf_nc.py` and
   `wrf_nc_grid.py` reject NetCDF masks/fills, slice `0:k_exp` hyperslabs, verify
   `ZNW` and `XLAT`/`XLONG`, and require `AFWA_CAPE_MU`.
   Live RRTMG post also checks native surface shortwave and daylight albedo.
-  `zarr_shard.py` and `zarr_v3.py` encode ZEP-0002
-  padded outer shards with exact `[64, 64]` inner spatial chunks.
+  `wps_intermediate.py` writes native WPS v5 records for remapped ICON inputs.
+  `zarr_shard.py` and `zarr_v3.py` encode ZEP-0002 padded outer shards with
+  exact `[64, 64]` inner spatial chunks.
 - [`src/av_wrf/runner/`](../src/av_wrf/runner/README.md): `store.py`
   (`ObjectStore`, `LocalFileStore`, `cycle_lock`, `get_with_token`,
   `sha256_file`), `stages.py` (`check`, `plan`, `prep`), `mirrors.py`
-  (forcing recipe registry and manifest verification), `forcing_gfs.py` and
-  `forcing_icon.py` (source availability, acquisition and WPS inventory), `post.py`,
+  (forcing recipe registry and manifest verification), source adapters for
+  GFS, ICON-EU, and IFS (acquisition and WPS inventory), `post.py`,
   `publish.py` + `publish_verify.py` (cycle-locked promotion, decoded column
   admission, committed object hash checks on recovery), `solver.py` +
-  `solver_exec.py` (native execution and stage wall times), and
+  `solver_exec.py` (active-domain validation, native execution, child history
+  hashes, and stage wall times), `geog.py` (deterministic geography bundles), and
   `dispatch.py` (expiring-lease webhook delivery).
-- A storage adapter must provide opaque conditional-write tokens and exclusive
-  cycle ownership through the ready commit. The implemented backend uses a
-  shared filesystem. A remote adapter needs equivalent fencing or a consumer
-  contract for committing an attempt-specific payload.
-- Local writes sync file contents and directory entries. Prefix deletion syncs
-  the surviving parent. Store-private lock files survive prefix replacement.
-  Before `_ready.json` commits, the staged manifest digest identifies which
-  attempt bytes own a partial promotion.
+- `runner/s3.py` uses boto3 for signing, credentials, connections and retries;
+  the adapter owns conditional operations and opaque ETags. `http_request.py`
+  shares Tenacity retries over HTTPX, while source adapters own index parsing,
+  snapshot checks and weather admission.
+- Local publication builds a sibling tree and atomically renames it under the
+  cycle lock. The ready receipt, diagnostics and Zarr group become visible
+  together. Object writes sync data and ancestor directories; recovery durably
+  adopts visible objects before advancing ready/latest fences.
+- S3 publication writes an immutable payload under
+  `attempts/<attempt>/<post-manifest-sha256>/`. A conditional create commits the
+  cycle's `_ready.json`. Read the Zarr group through its `zarr_relpath` and
+  diagnostics beside it. Retention must preserve payloads referenced by ready
+  receipts. AWS requires `s3:ListBucket` to distinguish absent keys from
+  denied reads.
+- The webhook receiver deduplicates by `Idempotency-Key` because an interrupted
+  delivery can be retried after its lease expires.
 - Published objects have independent storage from staged objects. Keep staging
   for replay to additional destinations. Pass `publish --prune-stage` on the
-  final promotion when no further replay needs the staged payload. Post,
-  promotion, and prune share an attempt lock acquired before the destination lock.
-- WRF boundary forcing enters through the GRIB recipe. A direct native model
-  needs its own reader and grid mapping into published fields before reusing
-  the Zarr and promotion path.
+  final promotion when local staging is no longer needed. Post, promotion
+  and prune share an attempt lock on local storage.
+- Source recipes admit GRIB or WPS intermediates over the resolved outer domain.
 - [`src/av_wrf/cli/`](../src/av_wrf/cli/README.md): `env.py` (`RuntimeEnv`) and
   `main.py` (`av-wrf` subcommands with lazy store handles and `--store-uri` /
   `--prune-stage`).

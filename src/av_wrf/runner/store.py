@@ -18,6 +18,9 @@ from typing import Protocol
 from urllib.parse import unquote, urlparse
 from weakref import WeakValueDictionary
 
+from av_wrf.runner.s3 import CASConflict as CASConflict
+from av_wrf.runner.s3 import S3Config, S3Store
+
 _INPROC_LOCKS_GUARD = threading.Lock()
 _INPROC_LOCKS: WeakValueDictionary[Path, threading.Lock] = WeakValueDictionary()
 
@@ -99,14 +102,11 @@ class ObjectStore(Protocol):
 
     def get_bytes(self, key: str) -> bytes | None: ...
     def get_with_token(self, key: str) -> tuple[bytes | None, str | None]: ...
+    def ensure_durable(self, key: str) -> None: ...
     def put_if_absent(self, key: str, payload: bytes) -> str: ...
     def delete_prefix(self, prefix: str) -> None: ...
     def compare_and_swap(self, key: str, payload: bytes, expected_token: str | None) -> str: ...
     def cycle_lock(self, prefix: str) -> AbstractContextManager[None]: ...
-
-
-class CASConflict(RuntimeError):
-    """The current object token differs from the expected token."""
 
 
 def put_idempotent(
@@ -189,14 +189,21 @@ class LocalFileStore:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._write_atomic(path, payload, replace=False)
         except FileExistsError as exc:
-            # A partial promotion from an earlier writer can be adopted on retry.
-            with path.open("rb") as existing:
-                os.fsync(existing.fileno())
-            self._sync_object_parents(path)
+            # A previous write may have installed the object before its directory sync failed.
+            self.ensure_durable(key)
             raise FileExistsError(f"Immutable object already exists: {key}") from exc
         return sha256_hex(payload)
 
+    def ensure_durable(self, key: str) -> None:
+        """Sync the existing object and its directories, serialized with CAS replacement."""
+        path = self._resolve(key)
+        # CAS may replace the inode after a read; sync the current inode while holding its lock.
+        with _exclusive_lock(self._lock_path("cas", path)), path.open("rb") as existing:
+            os.fsync(existing.fileno())
+            self._sync_object_parents(path)
+
     def _sync_object_parents(self, path: Path) -> None:
+        # Sync every ancestor bottom-up, including newly created intermediate directories.
         for parent in path.parents:
             _sync_directory(parent)
             if parent == self._root:
@@ -214,6 +221,41 @@ class LocalFileStore:
         finally:
             tmp.unlink(missing_ok=True)
         self._sync_object_parents(path)
+
+    @contextlib.contextmanager
+    def _cycle_writer(self, prefix: str) -> Iterator[Callable[[str, bytes], None]]:
+        """Prepare a cycle under its held lock and install it with one directory rename."""
+        target = self._resolve(prefix)
+        scratch = target.with_name(f".{target.name}.promotion")
+        if scratch.exists():
+            shutil.rmtree(scratch)
+        scratch.mkdir(parents=True)
+
+        def write(rel_key: str, payload: bytes) -> None:
+            path = scratch / rel_key
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("xb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+        def abort_walk(exc: OSError) -> None:
+            raise exc
+
+        try:
+            yield write
+            # The private tree can sync each directory once before the public rename.
+            for directory, _, _ in os.walk(scratch, topdown=False, onerror=abort_walk):
+                _sync_directory(Path(directory))
+            if (target / "_ready.json").exists():
+                raise FileExistsError(f"Cycle already committed: {prefix}")
+            if target.exists():
+                self.delete_prefix(prefix)
+            scratch.rename(target)
+            self._sync_object_parents(target / "_ready.json")
+        finally:
+            if scratch.exists():
+                shutil.rmtree(scratch)
 
     def delete_prefix(self, prefix: str) -> None:
         target = self._resolve(prefix)
@@ -250,9 +292,7 @@ class LocalFileStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         with _exclusive_lock(self._lock_path("cas", path)):
             _, actual_tok = self.get_with_token(key)
-            if expected_token != actual_tok and (
-                actual_tok is None or expected_token != actual_tok.removeprefix("etag:")
-            ):
+            if expected_token != actual_tok:
                 raise CASConflict(
                     f"CAS conflict on {key}: expected {expected_token}, found {actual_tok}"
                 )
@@ -260,8 +300,8 @@ class LocalFileStore:
         return _cas_token_for_bytes(payload)
 
 
-def open_store(store_uri: str) -> ObjectStore:
-    """Open an explicit local path or file:// URI."""
+def open_store(store_uri: str, *, s3: S3Config | None = None) -> ObjectStore:
+    """Open a local path or an explicitly configured S3-compatible store."""
     if not store_uri.strip():
         raise ValueError("Store path or URI is required")
     parsed = urlparse(store_uri)
@@ -270,4 +310,8 @@ def open_store(store_uri: str) -> ObjectStore:
             raise ValueError("Use a local path or a file:// URI with a local filesystem path")
         raw_path = unquote(parsed.path) if parsed.scheme == "file" else store_uri
         return LocalFileStore(Path(raw_path))
-    raise ValueError(f"Unsupported store scheme '{parsed.scheme}://'; use file://")
+    if parsed.scheme == "s3":
+        if s3 is None:
+            raise ValueError("S3 credentials and endpoint configuration are required")
+        return S3Store(store_uri, s3)
+    raise ValueError(f"Unsupported store scheme '{parsed.scheme}://'; use file:// or s3://")

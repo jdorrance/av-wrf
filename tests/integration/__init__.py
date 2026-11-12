@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import shutil
 from pathlib import Path
 
@@ -11,10 +12,13 @@ from av_wrf.runner.mirrors import find_forcing_recipe
 
 
 def bundle_for_recipe(config: Path, recipe: ForcingRecipe) -> LoadedBundle:
+    """Load a product wired to `recipe` as a single-domain bundle for solver stubs."""
     for path in sorted((config / "products").glob("*.yaml")):
         bundle = load_bundle(config, path.stem)
         if find_forcing_recipe(bundle.primary_source) is recipe:
-            return bundle
+            return dataclasses.replace(
+                bundle, domain=dataclasses.replace(bundle.domain, parent_grid_ratio=1)
+            )
     raise AssertionError(f"No configured product for {recipe.identity}")
 
 
@@ -29,6 +33,14 @@ def stage_sparse_config(src_cfg: Path, dst_cfg: Path) -> str:
         f"profile_id: {profile}\nschema_id: wrf-zarr-v3\nmap_end_hour: 6\n"
         "hourly_through_hour: 2\ntail_step_hours: 4\nshard_time_steps: 1\n"
         "inner_chunk_yx: [64, 64]\nzstd_level: 3\n",
+        encoding="utf-8",
+    )
+    domain_yaml = dst_cfg / "profiles" / "domains" / f"{bundle.domain.profile_id}.yaml"
+    domain_yaml.write_text(
+        domain_yaml.read_text(encoding="utf-8")
+        .replace("parent_grid_ratio: 3", "parent_grid_ratio: 1")
+        .replace("parent_halo_cells: 33", "parent_halo_cells: 0")
+        .replace("parent_halo_cells: 30", "parent_halo_cells: 0"),
         encoding="utf-8",
     )
     product = bundle.product

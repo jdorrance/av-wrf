@@ -7,12 +7,10 @@ import json
 from collections import defaultdict
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
-from email.utils import parsedate_to_datetime
+from datetime import datetime, timedelta
 from functools import partial
 from io import BytesIO
 from pathlib import Path
-from time import sleep
 
 import httpx
 
@@ -24,6 +22,9 @@ from av_wrf.runner.forcing_icon import (
     ICON_INVARIANT_FIELDS,
     icon_input_metadata,
 )
+from av_wrf.runner.http_request import _request
+from av_wrf.runner.icon_intermediate import write_icon_fields
+from av_wrf.runner.mirrors import ForcingSubset
 from av_wrf.runner.store import LocalFileStore, json_bytes, put_idempotent, sha256_hex
 
 _WORKERS = 24
@@ -31,36 +32,22 @@ type _Bounds = tuple[float, float, float, float]
 type _ObjectKeysByHour = dict[int, list[str]]
 
 
-def _retry_delay(error: httpx.HTTPError, delay: float) -> float | None:
-    if not isinstance(error, httpx.HTTPStatusError):
-        return delay
-    status = error.response.status_code
-    if status != 429 and not 500 <= status < 600:
-        return None
-    header = error.response.headers.get("Retry-After", "").strip()
-    if header.isascii() and header.isdecimal():
-        return float(header)
-    if header:
-        try:
-            retry_at = parsedate_to_datetime(header)
-        except (ValueError, OverflowError):
-            return delay
-        if retry_at.tzinfo is not None:
-            return max(delay, (retry_at - datetime.now(UTC)).total_seconds())
-    return delay
-
-
 def _read_plan(
     plan_path: Path, config_root: Path
 ) -> tuple[LoadedBundle, datetime, _Bounds, _ObjectKeysByHour]:
     bundle, cycle, expected = load_forcing_plan(plan_path, config_root, ICON_EU)
+    bounds, groups = _icon_plan(expected)
+    return bundle, cycle, bounds, groups
+
+
+def _icon_plan(plan: ForcingSubset) -> tuple[_Bounds, _ObjectKeysByHour]:
     groups: _ObjectKeysByHour = {}
-    for hour, keys in expected["file_keys"].items():
+    for hour, keys in plan["file_keys"].items():
         if isinstance(keys, str):
             raise ValueError("Expected an ICON-EU object inventory per boundary hour")
         groups[int(hour)] = keys
-    west, south, east, north = expected["bbox_wsen_deg"]
-    return bundle, cycle, (west, south, east, north), groups
+    west, south, east, north = plan["bbox_wsen_deg"]
+    return (west, south, east, north), groups
 
 
 def _has_grib2_frame(raw: bytes) -> bool:
@@ -96,36 +83,25 @@ def _download(
     mirrors: tuple[str, ...],
     cache: LocalFileStore,
     root: Path,
-) -> None:
+) -> tuple[str, str]:
     if (root / key).is_file():
-        return
+        raw = cache.get_bytes(key)
+        if raw is None or not _has_grib2_frame(raw):
+            raise ValueError(f"Missing or malformed cached ICON-EU object: {key}")
+        verify_icon_object(raw, key, cycle, *icon_input_metadata(key))
+        return key, sha256_hex(raw)
     last_error: httpx.HTTPError | ValueError | None = None
     for mirror in mirrors:
         url = f"{mirror.rstrip('/')}/{key}"
-        for backoff in (0.25, 0.5, None):
-            try:
-                response = client.get(url)
-                response.raise_for_status()
-            except httpx.HTTPError as exc:
-                last_error = exc
-                if backoff is None:
-                    break
-                delay = _retry_delay(exc, backoff)
-                if delay is None or delay > 30.0:
-                    break
-                sleep(delay)
-                continue
-            raw = response.content
+        try:
+            raw = _request(client, "GET", url).content
             if not _has_grib2_frame(raw):
-                last_error = ValueError(f"Expected one complete DWD GRIB2 message from {url}")
-                break
-            try:
-                verify_icon_object(raw, key, cycle, *icon_input_metadata(key))
-            except ValueError as exc:
-                last_error = exc
-                break
-            put_idempotent(cache, key, raw)
-            return
+                raise ValueError(f"Expected one complete DWD GRIB2 message from {url}")
+            verify_icon_object(raw, key, cycle, *icon_input_metadata(key))
+        except (httpx.HTTPError, ValueError) as exc:
+            last_error = exc
+            continue
+        return key, put_idempotent(cache, key, raw)
     raise RuntimeError(f"ICON-EU forcing object unavailable: {key}") from last_error
 
 
@@ -144,6 +120,8 @@ def _assemble(
     cache_root: Path,
     out: Path,
     workers: int,
+    *,
+    grib: bool = False,
 ) -> dict[int, str]:
     source = bundle.primary_source
     fixed_fields = {
@@ -159,16 +137,16 @@ def _assemble(
 
     def read_object(key: str) -> bytes:
         raw = cache.get_bytes(key)
-        if raw is None or not _has_grib2_frame(raw):
-            raise ValueError(f"Missing or malformed cached ICON-EU object: {key}")
-        raw_shas[key] = sha256_hex(raw)
+        # Admission decoded these exact bytes; a hash fence rejects cache replacement.
+        if raw is None or sha256_hex(raw) != raw_shas.get(key):
+            raise ValueError(f"Cached ICON-EU object changed after admission: {key}")
         return raw
 
     with httpx.Client(limits=limits, timeout=30) as client, ThreadPoolExecutor(workers) as pool:
         fetch = partial(
             _download, cycle, client=client, mirrors=source.mirrors, cache=cache, root=cache_root
         )
-        list(pool.map(fetch, fixed_set))
+        raw_shas.update(pool.map(fetch, fixed_set))
         cutout = IconGribCutout.from_native(
             fixed_fields,
             read_object,
@@ -177,7 +155,20 @@ def _assemble(
             source.grid_spacing_deg,
             ICON_INPUT_SELECTORS,
         )
-        list(pool.map(fetch, hourly_keys))
+        raw_shas.update(pool.map(fetch, hourly_keys))
+    return _write_outputs(bundle, cycle, keys_by_hour, fixed_set, cutout, raw_shas, out, grib)
+
+
+def _write_outputs(
+    bundle: LoadedBundle,
+    cycle: datetime,
+    keys_by_hour: _ObjectKeysByHour,
+    fixed_set: set[str],
+    cutout: IconGribCutout,
+    raw_shas: dict[str, str],
+    out: Path,
+    grib: bool,
+) -> dict[int, str]:
     dest = LocalFileStore(out)
     prefix = f"icon-eu.{cycle:%Y%m%d%H}"
     files: dict[int, str] = {}
@@ -185,8 +176,12 @@ def _assemble(
     for hour, keys in keys_by_hour.items():
         fields = _group_keys(key for key in keys if key not in fixed_set)
         stream = BytesIO()
-        cutout.write_hour(stream, fields, hour, bundle.domain.p_top_pa)
-        name = f"{prefix}.f{hour:03d}.grib2"
+        if grib:
+            cutout.write_hour(stream, fields, hour, bundle.domain.p_top_pa)
+            name = f"{prefix}.f{hour:03d}.grib2"
+        else:
+            name = f"FILE:{cycle + timedelta(hours=hour):%Y-%m-%d_%H}"
+            write_icon_fields(cutout, fields, stream, cycle, hour, bundle.domain.p_top_pa)
         normalized_shas[name] = put_idempotent(dest, name, stream.getvalue())
         files[hour] = name
     inventory = {
@@ -207,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--grib-dir", type=Path, required=True, help="Write normalized GRIB2 here")
     parser.add_argument("--workers", type=int, default=_WORKERS, help="Concurrent DWD downloads")
     parser.add_argument("--through-hour", type=int, help="Last boundary lead for a smoke run")
+    parser.add_argument("--grib", action="store_true", help="Write historical normalized GRIB2")
     args = parser.parse_args(argv)
     if args.workers < 1:
         parser.error("--workers must be positive")
@@ -217,7 +213,9 @@ def main(argv: list[str] | None = None) -> int:
         }
         if not keys_by_hour:
             parser.error("--through-hour precedes the first required forecast hour")
-    files = _assemble(bundle, cycle, bounds, keys_by_hour, args.cache, args.grib_dir, args.workers)
+    files = _assemble(
+        bundle, cycle, bounds, keys_by_hour, args.cache, args.grib_dir, args.workers, grib=args.grib
+    )
     print(json.dumps(files))
     return 0
 

@@ -13,11 +13,11 @@ from unittest.mock import patch
 import httpx
 import numpy as np
 
-from av_wrf.codecs.icon_grib import _normalize_weights
+from av_wrf.codecs.wrf_nc_grid import normalize_rows
 from av_wrf.contracts import BuildManifest
 from av_wrf.runner.forcing_icon import _REQUIRED, _SOIL_TEMP, _SOIL_TEMP_SELECTORS, ICON_EU
 from av_wrf.runner.grib import GRIB_FIELD_KEYS
-from av_wrf.runner.icon_acquire import _download, _read_plan
+from av_wrf.runner.icon_acquire import _assemble, _download, _read_plan
 from av_wrf.runner.stages import plan_product_cycle, prep_cycle_namelists
 from av_wrf.runner.store import LocalFileStore
 from tests.integration import bundle_for_recipe
@@ -84,15 +84,42 @@ def _messages() -> list[dict[str, object]]:
 
 
 class TestIconForcing(TestCase):
+    def test_assemble_rechecks_cached_object_before_using_it(self) -> None:
+        bundle = bundle_for_recipe(CONFIG, ICON_EU)
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            key = _KEY.replace("/T_G/", "/CLAT/")
+            LocalFileStore(root / "cache").put_if_absent(key, _FRAME)
+
+            def read_cached(_fields: object, read: object, *_args: object) -> None:
+                assert callable(read)
+                (root / "cache" / key).write_bytes(_FRAME + b"changed")
+                read(key)
+
+            with (
+                patch(
+                    "av_wrf.runner.icon_acquire.verify_icon_object",
+                    side_effect=ValueError("wrong cached selector"),
+                ),
+                self.assertRaisesRegex(ValueError, "wrong cached selector"),
+            ):
+                _assemble(bundle, CYCLE, (0, 0, 1, 1), {0: [key]}, root / "cache", root, 1)
+            with (
+                patch("av_wrf.runner.icon_acquire.verify_icon_object"),
+                patch("av_wrf.runner.icon_acquire.IconGribCutout.from_native", read_cached),
+                self.assertRaisesRegex(ValueError, "changed after admission"),
+            ):
+                _assemble(bundle, CYCLE, (0, 0, 1, 1), {0: [key]}, root / "cache", root, 1)
+
     def test_surface_weights_require_positive_finite_support(self) -> None:
         for value in (0.0, float("nan"), float("inf")):
             with (
                 self.subTest(value=value),
                 self.assertRaisesRegex(
-                    ValueError, "Invalid ICON interpolation weights for the target land/sea class"
+                    ValueError, "Invalid interpolation weights for the target land/sea class"
                 ),
             ):
-                _normalize_weights(np.array([[value, 0.0, 0.0]]), "the target land/sea class")
+                normalize_rows(np.array([[value, 0.0, 0.0]]), "the target land/sea class")
 
     def test_download_honors_retry_after_and_reuses_cache(self) -> None:
         responses = iter(
@@ -104,7 +131,7 @@ class TestIconForcing(TestCase):
         with (
             TemporaryDirectory() as tmp,
             httpx.Client(transport=httpx.MockTransport(lambda _: next(responses))) as client,
-            patch("av_wrf.runner.icon_acquire.sleep") as delay,
+            patch("av_wrf.runner.http_request.sleep") as delay,
             patch("av_wrf.runner.icon_acquire.verify_icon_object") as verify,
         ):
             root = Path(tmp)
@@ -120,7 +147,7 @@ class TestIconForcing(TestCase):
                 )
                 self.assertEqual(cache.get_bytes(_KEY), _FRAME)
             delay.assert_called_once_with(2.0)
-            verify.assert_called_once()
+            self.assertEqual(verify.call_count, 2)
 
     def test_download_falls_back_from_malformed_mirrors(self) -> None:
         truncated = _FRAME[:8] + (len(_FRAME) + 4).to_bytes(8, "big") + _FRAME[16:]

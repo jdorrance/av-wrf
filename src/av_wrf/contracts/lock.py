@@ -115,6 +115,9 @@ class RunLock:
     build_manifest: BuildManifest
     mpi_ranks: int
     producer_sha256: str | None = None
+    # Frozen topology: retries must never silently switch between 1- and 2-domain runs.
+    max_dom: int = 1
+    active_domain_id: int = 1
 
     def to_doc(self) -> dict[str, object]:
         return dataclasses.asdict(self)
@@ -143,6 +146,8 @@ class RunLock:
             BuildManifest.from_doc(bm_raw),
             req_int(doc, "mpi_ranks"),
             req_str(doc, "producer_sha256") if doc.get("producer_sha256") is not None else None,
+            req_int(doc, "max_dom") if doc.get("max_dom") is not None else 1,
+            req_int(doc, "active_domain_id") if doc.get("active_domain_id") is not None else 1,
         )
 
 

@@ -29,7 +29,11 @@ _WPS_FIELD_LIMITS = {
     "SOILM": (0.0, 1.0),
     "SPECHUMD": (0.0, math.nextafter(1.0, 0.0)),
 }
-_WPS_FIELD_FLAGS = {"SOIL_LEVELS": "FLAG_SOIL_LEVELS", "SPECHUMD": "FLAG_SH"}
+_WPS_FIELD_FLAGS = {
+    "LAKE_DEPTH": "FLAG_LAKE_DEPTH",
+    "SOIL_LEVELS": "FLAG_SOIL_LEVELS",
+    "SPECHUMD": "FLAG_SH",
+}
 
 
 def verify_wps_fields(ds: netCDF4.Dataset, path: Path, fields: tuple[str, ...]) -> None:
@@ -132,11 +136,18 @@ def extract_clean_i32_nc(
     return np.ascontiguousarray(arr, dtype=np.int32)
 
 
-def _index_wrfout_times(wrfout_dir: Path) -> dict[str, tuple[Path, int]]:
+def domain_tag(domain_id: int) -> str:
+    """Return the WRF `dNN` filename tag for an active domain."""
+    if domain_id < 1 or domain_id > 99:
+        raise ValueError(f"Invalid active domain id {domain_id}")
+    return f"d{domain_id:02d}"
+
+
+def _index_wrfout_times(wrfout_dir: Path, domain_id: int) -> dict[str, tuple[Path, int]]:
     import netCDF4
 
     index: dict[str, tuple[Path, int]] = {}
-    for nc_path in sorted(wrfout_dir.glob("wrfout_d01_*")):
+    for nc_path in sorted(wrfout_dir.glob(f"wrfout_{domain_tag(domain_id)}_*")):
         verify_local_wrf_nc(nc_path)
         with netCDF4.Dataset(str(nc_path), mode="r") as ds:
             if "Times" not in ds.variables:
@@ -152,10 +163,14 @@ def _index_wrfout_times(wrfout_dir: Path) -> dict[str, tuple[Path, int]]:
 
 
 def select_cycle_wrfout_slices(
-    wrfout_dir: Path, publish_origin_utc: str, valid_times_utc: tuple[str, ...]
+    wrfout_dir: Path,
+    publish_origin_utc: str,
+    valid_times_utc: tuple[str, ...],
+    *,
+    domain_id: int = 1,
 ) -> tuple[tuple[Path, int], tuple[tuple[Path, int], ...]]:
-    """Index `wrfout_d01_*` by `Times` and return exact `(f000, lead_slices)` in UTC order."""
-    index = _index_wrfout_times(wrfout_dir)
+    """Index active-domain `wrfout_dNN_*` and return exact `(f000, lead_slices)` in UTC order."""
+    index = _index_wrfout_times(wrfout_dir, domain_id)
     if publish_origin_utc not in index:
         raise ValueError(f"Missing f000 wrfout frame for publish_origin_utc {publish_origin_utc}")
     missing = [vt for vt in valid_times_utc if vt not in index]
@@ -292,17 +307,39 @@ def verify_wrfout_grid_against_domain(
 
 
 def validate_wrfinput_nc(
-    wrfinput_path: Path, domain: DomainProfile, science: ScienceProfile
+    wrfinput_path: Path, domain: DomainProfile, science: ScienceProfile, *, published: bool = True
 ) -> None:
-    """Validate `wrfinput_d01` grid registration and `ZNW` immediately after `real.exe`."""
+    """Validate initialized grid registration, eta faces and the domain's column geometry."""
     verify_local_wrf_nc(wrfinput_path)
     import netCDF4
 
     with netCDF4.Dataset(str(wrfinput_path), mode="r") as ds:
         verify_wrfout_grid_against_domain(ds, domain, wrfinput_path, 0, science=science)
-        ny, nx, n_faces = domain.e_sn - 1, domain.e_we - 1, domain.exported_levels_k + 1
+        ny, nx = domain.e_sn - 1, domain.e_we - 1
+        n_faces = domain.exported_levels_k + 1 if published else domain.e_vert
         shape = (n_faces, ny, nx)
         ph = extract_clean_f32_nc(ds.variables, wrfinput_path, "PH", 0, shape, z_stop=n_faces)
         phb = extract_clean_f32_nc(ds.variables, wrfinput_path, "PHB", 0, shape, z_stop=n_faces)
         hgt = extract_clean_f32_nc(ds.variables, wrfinput_path, "HGT", 0, (ny, nx))
-        validate_wrfinput_columns(ph, phb, hgt, domain)
+        validate_wrfinput_columns(ph, phb, hgt, domain, published=published)
+
+
+def masked_weights(
+    base: npt.NDArray[np.float64], mask: npt.NDArray[np.bool_]
+) -> npt.NDArray[np.float64]:
+    """Zero non-matching interpolation donors, falling back to unmasked empty rows."""
+    masked = base * mask
+    empty = masked.sum(axis=1) < 1e-6
+    masked[empty] = base[empty]
+    support = masked.sum(axis=1, keepdims=True)
+    if not np.all(np.isfinite(support) & (support > 0.0)):
+        raise ValueError("Invalid interpolation donor support")
+    return masked / support
+
+
+def normalize_rows(weights: npt.NDArray[np.float64], context: str) -> None:
+    """Normalize barycentric rows in place, rejecting zero or non-finite support."""
+    support = weights.sum(axis=1, keepdims=True)
+    if not np.all(np.isfinite(support) & (support > 0.0)):
+        raise ValueError(f"Invalid interpolation weights for {context}")
+    weights /= support

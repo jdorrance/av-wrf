@@ -1,5 +1,4 @@
 # ECMWF IFS 0.1 deg Open Data candidate forcing profile (3-hourly, 14 pressure levels).
-# Candidate requires a qualified GRIB2 packing and field normalization recipe before solve.
 # References:
 # - ECMWF Open Data specification: https://www.ecmwf.int/en/forecasts/datasets/open-data
 # - ECMWF 0.1 deg release & dissemination schedule:
@@ -9,10 +8,11 @@ provider: ECMWF
 vtable_name: Vtable.ECMWF
 interval_seconds: 10800
 grid_spacing_deg: 0.1
-pressure_level_count: 14
-soil_layer_centers_cm: [3.5, 17.5, 64.0, 194.5]
+metgrid_levels: 15
+metgrid_soil_levels: 4
 source_ready_lag_p95_hours: 8.5
 mirrors:
   - https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com
   - https://data.ecmwf.int/forecasts
 fail_closed: true
+use_sh_qv: true

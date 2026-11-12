@@ -5,9 +5,7 @@ post-processing into [`wrf-zarr-v3`](../vendor/producer-contract/wrf-zarr-v3.sch
 Downstream `windy-av-layer` (`@av/thermodynamics`, `@av/soaring`, `@av/forecast`)
 owns dry-parcel ascent (`dry-lenschow-1p2-model-levels-v2`), Deardorff $w_*$,
 Lenschow & Stephens (1980) updraft profiles, Copernicus GLO-90 subgrid terrain
-columns, sample packs, and tiles. Every physical constant, approximation, and
-boundary assumption between the two repositories and published literature is
-documented below.
+columns, sample packs, and tiles. The producer/consumer conventions follow.
 
 ## 1. Physical Constants: WRF Inversion vs. Consumer Parcel Evaluation
 
@@ -53,11 +51,9 @@ their respective sides of the Zarr v3 contract:
    Model-level `rhPercent` is intentionally omitted because `windy-av-layer`
    (`packages/forecast/src/native-fields.ts`) computes dewpoint directly from
    `spfhKgKg` and `pressurePa`, matching `ICON-EU` and `RRFS`.
-3. **2 m Bolton liquid-saturation guard (`clamp_spfh_2m_vec`):** WRF's
-   Revised MM5 surface layer (`sf_sfclay_physics = 1`) diagnoses `Q2` from
-   Monin–Obukhov similarity without liquid-water saturation adjustment, so `Q2`
-   can exceed `105%` RH WRT liquid water in nocturnal radiation or freezing fog.
-   `av-wrf` caps `spfh_2m_kgkg` at consumer Bolton (1980) liquid saturation
+3. **2 m Bolton liquid-saturation guard (`clamp_spfh_2m_vec`):** The selected
+   MYNN surface layer (`sf_sfclay_physics = 5`) supplies native `Q2`.
+   `av-wrf` caps its converted `spfh_2m_kgkg` at consumer Bolton (1980) liquid saturation
    ($e_s = 6.112 \exp(17.67 T_c / (T_c + 243.5))\text{ hPa}$, $\epsilon = 0.622$)
    with $2^{-14}$ mantissa headroom so `keepbits = 15` rounding never exceeds `100%` RH.
 
@@ -129,9 +125,10 @@ their respective sides of the Zarr v3 contract:
 
 ## 5. Comparison Against Dr. Jack Glendening (RASP / BLIPMAP) & Operational Caveats
 
-- **Surface parcel excess (`T2` vs. RASP fixed $\Delta T$):** Revised MM5
-  (`sf_sfclay_physics = 1`) diagnoses `T2` along the Monin–Obukhov profile between
-  `TSK` and `temp_k[0]`, so `windy-av-layer` uses `parcelSurfaceDeltaTC = 0 K`.
+- **Surface parcel excess (`T2` vs. RASP fixed $\Delta T$):** The selected MYNN
+  surface layer (`sf_sfclay_physics = 5`) diagnoses `T2`.
+  `windy-av-layer` owns the parcel choice `parcelSurfaceDeltaTC = 0 K`;
+  its suitability requires observation scoring.
 - **Topographic radiation (`slope_rad = 1`, `topo_shading = 1`) vs. RASP `sfcsun`:**
   3 km slope aspect and `25 km` cast shadows enter Noah-MP's surface energy budget
   directly (`radt = 3 min`) without consumer double-counting.
@@ -143,3 +140,37 @@ their respective sides of the Zarr v3 contract:
   initializes Noah-MP soil layers from the selected forcing and integrates
   through the configured spin-up. Warm land-state cycling needs observation
   qualification.
+
+## 6. Second-Pass Physics & Wire Decisions (2026-11)
+
+- **MYNN-EDMF default:** WRF v4.8 couples subgrid cloud to radiation with
+  `icloud = 1` and `icloud_bl = 1`. `CLDFRA_BL` contains the current total cloud
+  fraction; coupled radiation copies it into `CLDFRA` at radiation calls.
+  Live post requires and uses `CLDFRA_BL` with MYNN and `icloud_bl > 0`, so
+  dissipated cloud clears between calls. Other schemes, disabled coupling and
+  sparse archives without `CLDFRA_BL` use `CLDFRA`.
+  [WRF radiation driver](https://github.com/wrf-model/WRF/blob/v4.8.0/phys/module_radiation_driver.F#L1403-L1416)
+- **Lake physics:** The CLM lake model uses `LAKE_DEPTH` through `geo_em` and
+  `met_em`. `sf_lake_physics`, `use_lakedepth`, `lakedepth_default`, and
+  `lake_min_elev` carry one value per active domain. The configured geography
+  resolution selects the LAI and VAR_SSO tables.
+- **Steep-eta 6th-order filtering (`diff_6th_slopeopt = 1`,
+  `diff_6th_thresh = 0.10`):** Suppresses cross-inversion mixing along tilted
+  eta surfaces over Ararat/Aragats while retaining the 6th-order filter on
+  flat terrain.
+- **Adaptive RK3 stepping (`use_adaptive_time_step = .true.`,
+  `target_cfl = 1.2`, `target_hcfl = 0.84`):** Registry `max_domains` arrays
+  (`target_cfl`, `target_hcfl`, `min/max_time_step`, `starting_time_step`) carry
+  one value per domain; `use_adaptive_time_step`, `step_to_output_time`, and
+  `adaptation_domain` stay scalar. `ICLOUD` and `ICLOUD_BL` are also scalar.
+  Shin-Hong mixing and gravity-wave drag options carry one value per domain.
+- **Concentric 1-way nest:** GFS `0.25°` and IFS `0.1°` exceed `3.5 x` the
+  `3 km` child spacing, so `parent_grid_ratio = 3` builds a `9 km` d01 buffer
+  with symmetric `parent_halo_cells`; ICON-EU `0.0625°` runs single-domain on
+  the same published child coordinates. d01 retains a positive history clock
+  for adaptive alignment and delays history writes past the run. WPS generates
+  only the initial child input.
+- **Output diagnostics:** `initial_dps_dt_hpa_hr` measures the first six
+  published intervals after spin-up. The sampled Courant proxy uses saved
+  `DT`, staggered face thickness and center Lambert scale. WRF solver logs
+  report integration stability.

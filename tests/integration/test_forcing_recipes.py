@@ -48,7 +48,7 @@ def _file_keys(cycle: datetime, hours: tuple[int, ...]) -> Mapping[str, tuple[st
 def _validate_file(
     path: Path, cycle: datetime, _source: ForcingProfile, _domain: DomainProfile, hour: int
 ) -> None:
-    if path.read_text(encoding="ascii") != (cycle + timedelta(hours=hour)).isoformat():
+    if path.read_text(encoding="ascii") != "GRIB" + (cycle + timedelta(hours=hour)).isoformat():
         raise ValueError("Fixture bundle does not match its forecast hour")
 
 
@@ -76,6 +76,7 @@ def _write_metgrid(
             ds.setncattr("NUM_METGRID_SOIL_LEVELS", reported_soil_layers)
         ds.setncattr("FLAG_SOIL_LEVELS", 1)
         ds.setncattr("FLAG_SH", 1)
+        ds.setncattr("FLAG_LAKE_DEPTH", 1)
         ds.createVariable("Times", "S1", ("Time", "DateStrLen"))[0] = np.frombuffer(
             stamp.encode("ascii"), dtype="S1"
         )
@@ -83,6 +84,7 @@ def _write_metgrid(
         ds.createVariable("SNOWH", "f4", ("Time",))[:] = 0.1
         ds.createVariable("SOIL_LEVELS", "f4", ("num_soilt_levels",))[:] = np.arange(8)
         ds.createVariable("SOILM", "f4", ("Time",))[:] = 0.2
+        ds.createVariable("LAKE_DEPTH", "f4", ("Time",))[:] = 10.0
 
 
 class TestForcingRecipes(TestCase):
@@ -112,7 +114,8 @@ class TestForcingRecipes(TestCase):
             ),
             encoding="utf-8",
         )
-        self.bundle = load_bundle(self.cfg, self.product)
+        loaded = load_bundle(self.cfg, self.product)
+        self.bundle = replace(loaded, domain=replace(loaded.domain, parent_grid_ratio=1))
         self.enterContext(patch.dict("av_wrf.runner.mirrors._RECIPES", {RECIPE.identity: RECIPE}))
         self.store = LocalFileStore(self.root / "store")
         self.geo = self.root / "geo_em.d01.nc"
@@ -135,7 +138,9 @@ class TestForcingRecipes(TestCase):
         grib.mkdir()
         files = {hour: grib / f"assembled.f{hour:03d}" for hour in reversed(HOURS)}
         for hour, path in files.items():
-            path.write_text((self.cycle + timedelta(hours=hour)).isoformat(), encoding="ascii")
+            path.write_text(
+                "GRIB" + (self.cycle + timedelta(hours=hour)).isoformat(), encoding="ascii"
+            )
         return files
 
     def test_prep_and_manifest_keep_grouped_assets_and_seal_one_file_per_step(self) -> None:
@@ -230,7 +235,7 @@ class TestForcingRecipes(TestCase):
 
         with (
             patch("av_wrf.runner.solver_exec._verify_runtime_build_manifest"),
-            patch("av_wrf.runner.solver_exec._validate_geo_em"),
+            patch("av_wrf.runner.solver_exec.validate_geo_em"),
             patch(
                 "av_wrf.runner.solver_exec._execute_solver_binaries", side_effect=execute
             ) as mock,

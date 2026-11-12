@@ -12,7 +12,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import numpy.typing as npt
 import zarr
+from zarr.abc.store import ByteRequest, RangeByteRequest, SuffixByteRequest
+from zarr.core.buffer import Buffer, BufferPrototype
+from zarr.storage import LocalStore
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT / "src") not in sys.path:
@@ -26,6 +30,7 @@ from av_wrf.codecs import (  # noqa: E402
 from av_wrf.contracts import (  # noqa: E402
     WRF_ZARR_V3_2D_NAMES,
     WRF_ZARR_V3_3D_NAMES,
+    WRF_ZARR_V3_COORDS,
     BuildManifest,
     PubMass3D,
     RawWrfStepInput,
@@ -47,6 +52,28 @@ from av_wrf.runner import (  # noqa: E402
 from av_wrf.runner.post import _stage_cycle  # noqa: E402
 from av_wrf.runner.store import sha256_file  # noqa: E402
 from tests.integration import stage_sparse_config  # noqa: E402
+
+
+def _read_pressure_column(
+    zarr_dir: Path,
+) -> tuple[npt.NDArray[np.float32], list[ByteRequest | None]]:
+    ranges: list[ByteRequest | None] = []
+    get = LocalStore.get
+
+    async def record_get(
+        store: LocalStore,
+        key: str,
+        prototype: BufferPrototype | None = None,
+        byte_range: ByteRequest | None = None,
+    ) -> Buffer | None:
+        if key.startswith("pressure_pa/c/"):
+            ranges.append(byte_range)
+        return await get(store, key, prototype, byte_range)
+
+    with patch.object(LocalStore, "get", record_get):
+        pressure = zarr.open_group(str(zarr_dir), mode="r")["pressure_pa"]
+        assert isinstance(pressure, zarr.Array)
+        return np.asarray(pressure[1, :, 65, 65], dtype=np.float32), ranges
 
 
 class TestZarrV3RoundTrip(unittest.TestCase):
@@ -84,7 +111,7 @@ class TestZarrV3RoundTrip(unittest.TestCase):
             nz, ny, nx = volume.shape
             slab = PubMass3D(Slab3DF32(nz, ny, nx, buffer))
             shard_key = "height_msl_m/c/0/0/0/0"
-            (staged / shard_key).write_bytes(encode_3d_shard_bytes([slab], b.output))
+            (staged / shard_key).write_bytes(encode_3d_shard_bytes(slab, b.output))
             pm = root / "store" / post_manifest_key(**identity)
             doc = json.loads(pm.read_bytes())
             doc["shard_sha256s"] = [
@@ -264,9 +291,12 @@ class TestZarrV3RoundTrip(unittest.TestCase):
                 / "synthetic"
                 / b.product.model_id
                 / win.cycle_partition
-                / "forecast.zarr"
+                / ready.zarr_relpath
             )
             grp = zarr.open_group(str(zarr_dir), mode="r")
+            self.assertEqual(
+                set(grp.array_keys()), set(ready.field_names) | {c.name for c in WRF_ZARR_V3_COORDS}
+            )
             self.assertEqual(ready.window_starts_utc, win.window_starts_utc)
             nj = b.domain.e_sn - 1 - 2 * b.domain.bdy_trim_cells
             ni = b.domain.e_we - 1 - 2 * b.domain.bdy_trim_cells
@@ -283,6 +313,17 @@ class TestZarrV3RoundTrip(unittest.TestCase):
                 arr3 = np.asarray(node3[:])
                 self.assertEqual(arr3.shape, (n_t, b.domain.exported_levels_k, nj, ni))
                 self.assertTrue(bool(np.all(np.isfinite(arr3))))
+
+            column, reads = _read_pressure_column(zarr_dir)
+            self.assertEqual(column.size, b.domain.exported_levels_k)
+            self.assertTrue(np.all(column[1:] < column[:-1]))
+            self.assertEqual(
+                [type(request) for request in reads],
+                [
+                    SuffixByteRequest,
+                    RangeByteRequest,
+                ],
+            )
 
             starts, ends, precip = (
                 grp[name] for name in ("window_start_unix_s", "window_end_unix_s", "precip_mm_hr")

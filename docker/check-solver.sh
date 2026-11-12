@@ -14,4 +14,7 @@ for program in real wrf geogrid metgrid ungrib; do
     esac
 done
 
+for table in qr_acr_qg_V4.dat qr_acr_qsV2.dat freezeH2O.dat; do
+    test -s "$prefix/share/wrf/run/$table"
+done
 grib_ls -V

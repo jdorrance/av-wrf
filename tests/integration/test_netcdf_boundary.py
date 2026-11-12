@@ -20,7 +20,6 @@ from av_wrf.codecs import (  # noqa: E402
     read_wrfout_baseline_nc,
     read_wrfout_step_nc,
     select_cycle_wrfout_slices,
-    synthetic_thm_from_dry_theta,
     validate_wrfinput_nc,
 )
 from av_wrf.contracts import DomainProfile, ScienceProfile  # noqa: E402
@@ -28,36 +27,12 @@ from av_wrf.core import (  # noqa: E402
     auto_eta_faces,
     build_accum_baseline,
     computational_grid_origin_xy_m,
-    estimate_auto_levels_agl_m,
     lambert_grid_to_earth_trig,
     lambert_xy_m_to_latlon,
     post_frame,
 )
 from av_wrf.runner import load_bundle  # noqa: E402
-
-
-def _populate_3d_nc_vars(
-    ds: netCDF4.Dataset, domain: DomainProfile, ny: int, nx: int, nz: int
-) -> None:
-    mids = estimate_auto_levels_agl_m(domain, terrain_m=1200.0, etac=0.2)
-    faces_agl = [0.0]
-    for m in mids:
-        faces_agl.append(faces_agl[-1] + 2.0 * (m - faces_agl[-1]))
-    pb = np.empty((1, nz, ny, nx), dtype=np.float32)
-    phb = np.empty((1, nz + 1, ny, nx), dtype=np.float32)
-    for k in range(nz):
-        pb[0, k] = np.float32(87_800.0 * (0.97**k))
-    for kw in range(nz + 1):
-        phb[0, kw] = np.float32((1200.0 + faces_agl[kw]) * 9.81)
-    thm_v = synthetic_thm_from_dry_theta(8.0, 0.005)
-    for nm, val in (("P", 0.0), ("T", 8.0), ("QVAPOR", 0.005), ("THM", thm_v), ("CLDFRA", 0.1)):
-        ds.createVariable(nm, "f4", ("Time", "bottom_top", "south_north", "west_east"))[:] = val
-    ds.createVariable("PB", "f4", ("Time", "bottom_top", "south_north", "west_east"))[:] = pb
-    ds.createVariable("PH", "f4", ("Time", "bottom_top_stag", "south_north", "west_east"))[:] = 0.0
-    ds.createVariable("PHB", "f4", ("Time", "bottom_top_stag", "south_north", "west_east"))[:] = phb
-    ds.createVariable("W", "f4", ("Time", "bottom_top_stag", "south_north", "west_east"))[:] = 0.1
-    ds.createVariable("U", "f4", ("Time", "bottom_top", "south_north", "west_east_stag"))[:] = 5.0
-    ds.createVariable("V", "f4", ("Time", "bottom_top", "south_north_stag", "west_east"))[:] = 2.0
+from tests.integration.nc_fixtures import populate_3d_nc_vars  # noqa: E402
 
 
 def _write_real_wrfout(
@@ -134,6 +109,7 @@ def _write_real_wrfout(
             "RAINC": 0.0,
             "RAINNC": 1.2,
             "AFWA_CAPE": 90.0,
+            "SWDOWN": 620.0,
         }
         if not omit_cape_mu:
             vals_2d["AFWA_CAPE_MU"] = 340.0
@@ -153,7 +129,7 @@ def _write_real_wrfout(
             if inm == "I_RAINNC" and mask_bucket:
                 islab[0, 1, 1] = -9999
             ivar[:] = islab
-        _populate_3d_nc_vars(ds, domain, ny, nx, nz)
+        populate_3d_nc_vars(ds, domain, ny, nx, nz)
 
 
 def _small_domain_and_science() -> tuple[DomainProfile, ScienceProfile]:
@@ -163,6 +139,20 @@ def _small_domain_and_science() -> tuple[DomainProfile, ScienceProfile]:
 
 
 class TestRealNetcdfBoundary(unittest.TestCase):
+    def test_reader_preserves_fractional_adaptive_timestep(self) -> None:
+        dom, sci = _small_domain_and_science()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "step.nc"
+            _write_real_wrfout(path, dom, "2026-11-12_01:00:00")
+            for value in (12.5, float("nan"), 0.0):
+                with netCDF4.Dataset(str(path), "a") as ds:
+                    ds.setncattr("DT", value)
+                if value > 0:
+                    self.assertEqual(read_wrfout_step_nc(path, dom, sci).dt_s, value)
+                else:
+                    with self.assertRaisesRegex(ValueError, "DT must be finite and positive"):
+                        read_wrfout_step_nc(path, dom, sci)
+
     def test_post_rejects_negative_cape_and_boundary_layer_height(self) -> None:
         dom, sci = _small_domain_and_science()
         with tempfile.TemporaryDirectory() as tmp:
@@ -257,7 +247,7 @@ class TestRealNetcdfBoundary(unittest.TestCase):
             _write_real_wrfout(origin, dom, "2026-11-12_00:00:00")
             _write_real_wrfout(lead, dom, "2026-11-12_01:00:00")
             with netCDF4.Dataset(str(lead), mode="a") as ds:
-                cld = ds.variables["CLDFRA"]
+                cld = ds.variables["CLDFRA_BL"]
                 cld[:] = 0.0
                 cld[0, 3, :, :] = 0.5
                 cld[0, 10, :, :] = 0.5
@@ -296,6 +286,19 @@ class TestRealNetcdfBoundary(unittest.TestCase):
                 ds.variables["PHB"][0, dom.exported_levels_k, :, :] += 600.0 * 9.81
             with self.assertRaisesRegex(ValueError, rf"violates \(0, {dom.max_dz_m}\] m"):
                 validate_wrfinput_nc(path, dom, sci)
+
+    def test_parent_requires_unfolded_faces_without_publication_limits(self) -> None:
+        dom, sci = _small_domain_and_science()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "wrfinput_d01"
+            _write_real_wrfout(path, dom, "2026-11-12_00:00:00")
+            stricter = dataclasses.replace(dom, min_bl_levels_2km_agl=dom.e_vert)
+            validate_wrfinput_nc(path, stricter, sci, published=False)
+            with netCDF4.Dataset(str(path), mode="a") as ds:
+                ds["PHB"][0, 1] = ds["PHB"][0, 0]
+                ds["PH"][0, 1] = ds["PH"][0, 0]
+            with self.assertRaisesRegex(ValueError, "folded geopotential column"):
+                validate_wrfinput_nc(path, stricter, sci, published=False)
 
     def test_sparse_tail_uses_full_accumulation_and_endpoint_gust(self) -> None:
         dom, sci = _small_domain_and_science()

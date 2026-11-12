@@ -131,8 +131,7 @@ class TestPublishRecoveryAndConcurrency(unittest.TestCase):
         self.bundle = load_bundle(self.cfg, self.prod_id)
 
     def test_solver_receipt_hashes_consumed_frames_and_checks_full_inventory(self) -> None:
-        prod_id, b = self.prod_id, self.bundle
-        root = self.root
+        prod_id, b, root = self.prod_id, self.bundle, self.root
         store, cfg = LocalFileStore(root / "store"), self.cfg
         origin = f"2026-11-12T{b.product.publish_origin_hour_utc:02d}:00:00Z"
         oci = "sha256:" + "b" * 64
@@ -171,7 +170,6 @@ class TestPublishRecoveryAndConcurrency(unittest.TestCase):
         origin_iso = f"2026-11-12T{b.product.publish_origin_hour_utc:02d}:00:00Z"
         part = _stage_attempt_with_t2(cfg, store, b, origin_iso, "att-A", 285.0)
         _stage_attempt_with_t2(cfg, store, b, origin_iso, "att-B", 308.0)
-
         barrier = threading.Barrier(2)
 
         def race_publish(att_id: str) -> str:
@@ -196,7 +194,6 @@ class TestPublishRecoveryAndConcurrency(unittest.TestCase):
         self.assertEqual(outcomes.count("lost"), 1)
         winner = next(x.split(":")[1] for x in outcomes if x.startswith("won:"))
         exp_t2 = 285.0 if winner == "att-A" else 308.0
-
         ready = load_ready_receipt(store, b.product.model_id, part)
         self.assertEqual(ready.attempt_id, winner)
         shard = "forecast.zarr/temp_2m_k/c/0/0/0"
@@ -205,9 +202,7 @@ class TestPublishRecoveryAndConcurrency(unittest.TestCase):
         assert pub_t2 is not None
         nj = b.domain.e_sn - 1 - 2 * b.domain.bdy_trim_cells
         ni = b.domain.e_we - 1 - 2 * b.domain.bdy_trim_cells
-        dec = decode_shard_f32_array(
-            pub_t2, shard_time_steps=1, nz=1, ny=nj, nx=ni, output=b.output
-        )
+        dec = decode_shard_f32_array(pub_t2, nz=1, ny=nj, nx=ni, output=b.output)
         self.assertAlmostEqual(dec.flat[0], exp_t2, delta=0.05)
         staged = store_dir / attempt_stage_prefix(prod_id, part, winner) / shard
         staged.write_bytes(b"damaged stage")
@@ -247,7 +242,6 @@ class TestPublishRecoveryAndConcurrency(unittest.TestCase):
         diag_raw = dst2.get_bytes(f"upstream/{b.product.model_id}/{part}/_diagnostics.json")
         assert diag_raw is not None
         self.assertGreaterEqual(DiagnosticsReceipt.from_doc(json.loads(diag_raw)).max_cfl, 0.0)
-
         wrong_part = f"20261113/{part.split('/')[1]}"
         dst2.put_if_absent(
             f"upstream/{rec2.model_id}/{wrong_part}/_ready.json", json_bytes(rec2.to_doc())
@@ -261,6 +255,7 @@ class TestPublishRecoveryAndConcurrency(unittest.TestCase):
         store_dir = self.root / "store"
         store = LocalFileStore(store_dir)
         stale_iso = f"2020-01-01T{b.product.publish_origin_hour_utc:02d}:00:00Z"
+        stage = store
         part = _stage_attempt_with_t2(cfg, store, b, stale_iso, "att-2020", 290.0)
         stg_2020 = attempt_stage_prefix(prod_id, part, "att-2020")
         coord_p = store_dir / stg_2020 / "forecast.zarr" / "time/c/0"
@@ -283,6 +278,7 @@ class TestPublishRecoveryAndConcurrency(unittest.TestCase):
                 cycle_partition=part,
                 attempt_id="att-2020",
                 bundle=b,
+                stage_store=stage,
             )
 
         with self.assertRaisesRegex(ValueError, "contradicts RunLock"):
@@ -291,20 +287,19 @@ class TestPublishRecoveryAndConcurrency(unittest.TestCase):
         pm_p.write_bytes(json_bytes(good_pm))
         with patch("av_wrf.runner.publish.datetime") as clock:
             clock.now.return_value = parse_iso_utc(stale_iso)
-            put = store.put_if_absent
+            sync = store._sync_object_parents
 
-            def finish_after_deadline(key: str, payload: bytes) -> str:
-                if key.endswith("/_ready.json"):
+            def finish_after_deadline(path: Path) -> None:
+                if path.name == "_ready.json":
                     clock.now.return_value += timedelta(days=1)
-                return put(key, payload)
+                sync(path)
 
-            with patch.object(store, "put_if_absent", side_effect=finish_after_deadline):
+            with patch.object(store, "_sync_object_parents", side_effect=finish_after_deadline):
                 publish()
         self.assertIsNone(store.get_bytes(f"upstream/{b.product.model_id}/latest.json"))
 
     def test_rejects_corrupt_zstd_payload_with_valid_index_and_manifest_hash(self) -> None:
-        prod_id, b = self.prod_id, self.bundle
-        root = self.root
+        prod_id, b, root = self.prod_id, self.bundle, self.root
         stage, dst = LocalFileStore(root / "stage"), LocalFileStore(root / "dst")
         attempt_id = "att-corrupt"
         origin = f"2026-11-12T{b.product.publish_origin_hour_utc:02d}:00:00Z"
@@ -316,35 +311,31 @@ class TestPublishRecoveryAndConcurrency(unittest.TestCase):
         corrupt_shard = bytes([valid_shard[0] ^ 1]) + valid_shard[1:]
         shard_file.write_bytes(corrupt_shard)
         manifest_key = post_manifest_key(prod_id, part, attempt_id)
-        manifest_file = root / "stage" / manifest_key
-        corrupt_manifest = json.loads(manifest_file.read_bytes())
+        corrupt_manifest = json.loads((root / "stage" / manifest_key).read_bytes())
         corrupt_manifest["shard_sha256s"] = [
             [key, sha256_hex(corrupt_shard) if key == shard else sha]
             for key, sha in corrupt_manifest["shard_sha256s"]
         ]
-        manifest_file.write_bytes(json_bytes(corrupt_manifest))
+        (root / "stage" / manifest_key).write_bytes(json_bytes(corrupt_manifest))
 
-        def publish() -> None:
-            publish_cycle_receipt(
+        def publish(attempt: str) -> ReadyReceipt:
+            return publish_cycle_receipt(
                 self.cfg,
                 dst,
                 product_id=prod_id,
                 cycle_partition=part,
-                attempt_id=attempt_id,
+                attempt_id=attempt,
                 bundle=b,
                 stage_store=stage,
             )
 
         with self.assertRaisesRegex(ValueError, "Corrupt Zstd payload"):
-            publish()
+            publish(attempt_id)
         pub_root = f"upstream/{b.product.model_id}/{part}"
         early_key = f"{pub_root}/forecast.zarr/temp_2m_k/c/0/0/0"
-        early_shard = dst.get_bytes(early_key)
-        self.assertIsNotNone(early_shard)
+        self.assertIsNone(dst.get_bytes(early_key))
         self.assertIsNone(dst.get_bytes(f"{pub_root}/_ready.json"))
-        stage.delete_prefix(manifest_key)
-        stage.delete_prefix(stage_prefix)
-        _stage_attempt_with_t2(self.cfg, stage, b, origin, attempt_id, 292.0)
-        publish()
-        self.assertNotEqual(dst.get_bytes(early_key), early_shard)
-        self.assertIsNotNone(dst.get_bytes(f"{pub_root}/_ready.json"))
+        dst.put_if_absent(f"{pub_root}/_promotion_owner.json", b"legacy interrupted promotion")
+        _stage_attempt_with_t2(self.cfg, stage, b, origin, "replacement", 292.0)
+        self.assertEqual(publish("replacement").attempt_id, "replacement")
+        self.assertIsNotNone(dst.get_bytes(early_key))

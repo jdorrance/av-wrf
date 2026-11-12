@@ -12,24 +12,11 @@ from typing import BinaryIO, cast
 import numpy as np
 from numpy.typing import NDArray
 
+from av_wrf.codecs.icon_grid import IconGrid, icon_grid
+from av_wrf.codecs.wrf_nc_grid import masked_weights
+
 type _FloatArray = NDArray[np.float64]
-type _IntArray = NDArray[np.intp]
 type _Field = tuple[int, int, int, int]
-
-
-@dataclass(frozen=True)
-class _Cutout:
-    west: float
-    south: float
-    east: float
-    north: float
-    spacing: float
-    nx: int
-    ny: int
-    uuid: str
-    count: int
-    donors: _IntArray
-    weights: _FloatArray
 
 
 @contextmanager
@@ -113,65 +100,7 @@ def _coordinates(
     return uuid, values
 
 
-def _normalize_weights(weights: _FloatArray, context: str) -> None:
-    support = weights.sum(axis=1, keepdims=True)
-    if not np.all(np.isfinite(support) & (support > 0.0)):
-        raise ValueError(f"Invalid ICON interpolation weights for {context}")
-    weights /= support
-
-
-def _cutout(
-    coordinates: tuple[str, str],
-    read_object: Callable[[str], bytes],
-    cycle: datetime,
-    bounds: tuple[float, float, float, float],
-    spacing: float,
-    selectors: Mapping[str, _Field],
-) -> _Cutout:
-    from scipy.spatial import Delaunay
-
-    lat_uuid, lat = _coordinates(coordinates[0], read_object, cycle, selectors["CLAT"])
-    lon_uuid, lon = _coordinates(coordinates[1], read_object, cycle, selectors["CLON"])
-    if lat_uuid != lon_uuid or lat.shape != lon.shape or np.max(np.abs(lat)) > 90.0:
-        raise ValueError("Mismatched ICON latitude and longitude grid")
-    west, south, east, north = bounds
-    middle = 0.5 * (west + east)
-    lon = middle + (lon - middle + 180.0) % 360.0 - 180.0
-    # Triangulate the nearby circumcenters in a local metric. DWD documents
-    # barycentric interpolation and Delaunay circumcenter meshes in ICON Tools.
-    # https://www.dwd.de/EN/ourservices/nwp_icon_tutorial/nwp_icon_tutorial.html
-    margin = 1.0
-    nearby = np.flatnonzero(
-        (lon >= west - margin)
-        & (lon <= east + margin)
-        & (lat >= south - margin)
-        & (lat <= north + margin)
-    )
-    if nearby.size < 3:
-        raise ValueError("ICON grid does not cover the WPS cutout")
-    lon_scale = float(np.cos(np.deg2rad(0.5 * (south + north))))
-    donors = np.column_stack((lon[nearby] * lon_scale, lat[nearby]))
-    nx, ny = round((east - west) / spacing) + 1, round((north - south) / spacing) + 1
-    gx, gy = np.meshgrid(west + spacing * np.arange(nx), south + spacing * np.arange(ny))
-    targets = np.column_stack((gx.ravel() * lon_scale, gy.ravel()))
-    mesh = Delaunay(donors)
-    simplex = np.asarray(mesh.find_simplex(targets), dtype=np.intp)
-    if np.any(simplex < 0):
-        raise ValueError("ICON grid does not cover the full WPS cutout")
-    vertices = np.asarray(mesh.simplices[simplex], dtype=np.intp)
-    separation = np.linalg.norm(donors[vertices] - targets[:, None, :], axis=2)
-    if np.max(separation) > 3.0 * spacing:
-        raise ValueError("ICON grid has a gap in the WPS cutout")
-    transforms = np.asarray(mesh.transform[simplex], dtype=np.float64)
-    local = np.einsum("nij,nj->ni", transforms[:, :2], targets - transforms[:, 2])
-    weights = np.maximum(np.column_stack((local, 1.0 - local.sum(axis=1))), 0.0)
-    _normalize_weights(weights, "the native grid")
-    return _Cutout(
-        west, south, east, north, spacing, nx, ny, lat_uuid, lat.size, nearby[vertices], weights
-    )
-
-
-def _values(gid: int, cutout: _Cutout, cycle: datetime, hour: int) -> _FloatArray:
+def _values(gid: int, cutout: IconGrid, cycle: datetime, hour: int) -> _FloatArray:
     import eccodes as ec
 
     if _identity(gid, cycle, hour) != (cutout.uuid, cutout.count):
@@ -185,11 +114,17 @@ def _values(gid: int, cutout: _Cutout, cycle: datetime, hour: int) -> _FloatArra
     return donors
 
 
-def _encode(gid: int, cutout: _Cutout, values: _FloatArray) -> bytes:
+def _encode(gid: int, cutout: IconGrid, values: _FloatArray) -> bytes:
     import eccodes as ec
 
     if not np.isfinite(values).all():
         raise ValueError("Nonfinite values in the normalized ICON field")
+    # ecCodes decodes surface 150 as a six-value general vertical coordinate.
+    if (
+        ec.codes_get_long(gid, "typeOfFirstFixedSurface") == 150
+        and ec.codes_get_long(gid, "NV") != 6
+    ):
+        raise ValueError("ICON hybrid field requires six vertical coordinate values")
     for key, value in {
         "gridType": "regular_ll",
         "Ni": cutout.nx,
@@ -204,9 +139,7 @@ def _encode(gid: int, cutout: _Cutout, values: _FloatArray) -> bytes:
         "jScansPositively": 1,
         "jPointsAreConsecutive": 0,
         "alternativeRowScanning": 0,
-        # DWD's cell-centered U/V are zonal and meridional; VN is edge-normal.
         "uvRelativeToGrid": 0,
-        # WPS 4.7's g2 reader lacks CCSDS unpacking.
         "packingType": "grid_simple",
         "bitsPerValue": 24,
         "bitmapPresent": 0,
@@ -221,13 +154,87 @@ def _weighted(donors: _FloatArray, weights: _FloatArray) -> _FloatArray:
 
 
 @dataclass(frozen=True)
-class IconGribCutout:
-    """Remapping weights and prepared invariant GRIB2 messages for one DWD cycle."""
+class IconField:
+    """One remapped slab and its original GRIB selector and grid metadata."""
 
-    _cutout: _Cutout
+    selector: _Field
+    level: float
+    bottom: float
+    raw_top: int
+    radius_km: float
+    grid: IconGrid
+    values: _FloatArray
+
+
+def _slab(gid: int, grid: IconGrid, values: _FloatArray) -> IconField:
+    import eccodes as ec
+
+    selector = _field(gid)
+    if selector[3] == 150 and ec.codes_get_long(gid, "NV") != 6:
+        raise ValueError("ICON hybrid field requires six vertical coordinate values")
+    if not np.isfinite(values).all():
+        raise ValueError("Nonfinite values in the normalized ICON field")
+    return IconField(
+        selector,
+        float(ec.codes_get_double(gid, "level")),
+        float(ec.codes_get_double(gid, "bottomLevel")),
+        int(ec.codes_get_long(gid, "scaledValueOfFirstFixedSurface")),
+        6371.229,  # ecCodes regular_ll template uses the WMO GRIB2 spherical Earth radius.
+        grid,
+        values.reshape(grid.ny, grid.nx),
+    )
+
+
+def _fixed_slabs(
+    fields: Mapping[str, Sequence[str]],
+    read: Callable[[str], bytes],
+    cycle: datetime,
+    grid: IconGrid,
+    selector: _Field,
+    land: _FloatArray,
+    terrain: _FloatArray,
+) -> tuple[tuple[bytes, IconField], ...]:
+    import eccodes as ec
+
+    slabs = []
+    previous: _FloatArray | None = None
+    keys = (fields["FR_LAND"][0], fields["HSURF"][0], *fields["HHL"])
+    for index, key in enumerate(keys):
+        with _message(read(key), key) as gid:
+            values = land if index == 0 else terrain
+            if index >= 2:
+                level = index - 1
+                height = _weighted(_values(gid, grid, cycle, 0), grid.weights)
+                if _field(gid) != selector or ec.codes_get_long(gid, "level") != level:
+                    raise ValueError(f"Wrong ICON height interface {level}")
+                if previous is None:
+                    previous = height
+                    continue
+                if np.any(height >= previous):
+                    raise ValueError("ICON height interfaces must descend toward the surface")
+                values, previous = 0.5 * (previous + height), height
+                ec.codes_set(gid, "scaledValueOfFirstFixedSurface", level - 1)
+                ec.codes_set(gid, "typeOfSecondFixedSurface", 150)
+                ec.codes_set(gid, "scaledValueOfSecondFixedSurface", level)
+            slab = _slab(gid, grid, values)
+            slab.values.setflags(write=False)
+            # Keep only cropped data and a constant-size template for legacy GRIB output.
+            ec.codes_set_values(gid, np.zeros(1))
+            slabs.append((cast(bytes, ec.codes_get_message(gid)), slab))
+    if previous is None or not np.allclose(previous, terrain, rtol=0.0, atol=0.25):
+        raise ValueError("ICON bottom height interface disagrees with source terrain")
+    return tuple(slabs)
+
+
+@dataclass(frozen=True)
+class IconGribCutout:
+    """Remapping weights and cropped immutable invariants for one DWD cycle."""
+
+    _cutout: IconGrid
     _cycle: datetime
     _surface_weights: _FloatArray
-    _constant: tuple[bytes, ...]
+    _soil_weights: _FloatArray
+    _fixed: tuple[tuple[bytes, IconField], ...]
     _selectors: Mapping[str, _Field]
     _read_object: Callable[[str], bytes]
 
@@ -242,30 +249,41 @@ class IconGribCutout:
         selectors: Mapping[str, _Field],
     ) -> IconGribCutout:
         """Read DWD invariant fields by object key and precompute interpolation weights."""
-        cutout = _cutout(
-            (fields["CLAT"][0], fields["CLON"][0]), read_object, cycle, bounds, spacing, selectors
-        )
+        lat_uuid, lat = _coordinates(fields["CLAT"][0], read_object, cycle, selectors["CLAT"])
+        lon_uuid, lon = _coordinates(fields["CLON"][0], read_object, cycle, selectors["CLON"])
+        if lat_uuid != lon_uuid or lat.shape != lon.shape or np.max(np.abs(lat)) > 90.0:
+            raise ValueError("Mismatched ICON latitude and longitude grid")
+        cutout = icon_grid(lat_uuid, lat, lon, bounds, spacing)
         land_key = fields["FR_LAND"][0]
         with _message(read_object(land_key), land_key) as gid:
             land = _values(gid, cutout, cycle, 0)
             if _field(gid) != selectors["FR_LAND"] or np.min(land) < 0.0 or np.max(land) > 1.0:
                 raise ValueError("Invalid ICON land fraction")
             target_land = _weighted(land, cutout.weights) >= 0.5
-            mask = _encode(gid, cutout, target_land.astype(np.float64))
         same_surface = (land >= 0.5) == target_land[:, None]
-        surface_weights = cutout.weights * same_surface
-        _normalize_weights(surface_weights, "the target land/sea class")
+        surface_weights = masked_weights(cutout.weights, same_surface.astype(bool))
+        soil_weights = masked_weights(cutout.weights, land > 0.0)
         terrain_key = fields["HSURF"][0]
         with _message(read_object(terrain_key), terrain_key) as gid:
             if _field(gid) != selectors["HSURF"]:
                 raise ValueError("Invalid ICON terrain field")
             terrain = _weighted(_values(gid, cutout, cycle, 0), cutout.weights)
-            terrain_grib = _encode(gid, cutout, terrain)
-        heights = _full_heights(
-            fields["HHL"], read_object, cutout, cycle, terrain, selectors["HHL"]
-        )
         return cls(
-            cutout, cycle, surface_weights, (mask, terrain_grib, *heights), selectors, read_object
+            cutout,
+            cycle,
+            surface_weights,
+            soil_weights,
+            _fixed_slabs(
+                fields,
+                read_object,
+                cycle,
+                cutout,
+                selectors["HHL"],
+                target_land.astype(np.float64),
+                terrain,
+            ),
+            selectors,
+            read_object,
         )
 
     def write_hour(
@@ -278,73 +296,55 @@ class IconGribCutout:
         """Write a normalized WPS GRIB2 stream for one boundary hour."""
         import eccodes as ec
 
-        for message in self._constant:
-            with _message(message) as gid:
-                # ICON encodes lead time in minutes, including analysis messages.
-                ec.codes_set(gid, "forecastTime", hour * 60)
-                ec.codes_write(gid, stream)
+        for gid, slab in self._slabs(fields, hour, top_pa):
+            ec.codes_set(gid, "indicatorOfUnitOfTimeRange", 0)
+            ec.codes_set(gid, "forecastTime", hour * 60)
+            stream.write(_encode(gid, self._cutout, slab.values.ravel()))
+
+    def fields(
+        self, fields: Mapping[str, Sequence[str]], hour: int, top_pa: float
+    ) -> Iterator[IconField]:
+        """Yield one remapped slab at a time for a boundary hour."""
+        for _, slab in self._slabs(fields, hour, top_pa):
+            yield slab
+
+    def _slabs(
+        self, fields: Mapping[str, Sequence[str]], hour: int, top_pa: float
+    ) -> Iterator[tuple[int, IconField]]:
+        import eccodes as ec
+
+        for template, slab in self._fixed:
+            with _message(template) as gid:
+                yield gid, slab
         last_pressure: _FloatArray | None = None
         for field, keys in fields.items():
             for key in keys:
                 with _message(self._read_object(key), key) as gid:
-                    values = self._remap(gid, field, hour)
+                    if _field(gid) != self._selectors[field]:
+                        raise ValueError(f"Wrong ICON GRIB2 selector for {field} at f{hour:03d}")
+                    donors = _values(gid, self._cutout, self._cycle, hour)
+                    if field == "H_ICE":
+                        if np.any(donors != 0.0):
+                            raise ValueError("ICON cutout requires fraction for nonzero sea ice")
+                        ec.codes_set(gid, "parameterNumber", 0)
+                    weights = (
+                        self._soil_weights
+                        if field in {"T_SO", "W_SO"}
+                        else self._surface_weights
+                        if field in {"T_G", "H_SNOW", "W_SNOW"}
+                        else self._cutout.weights
+                    )
+                    values = _weighted(donors, weights)
                     if field == "P":
-                        _check_pressure(values, last_pressure, top_pa)
+                        valid = (
+                            np.min(values) > 0.0 and np.max(values) < top_pa
+                            if last_pressure is None
+                            else np.all(values > last_pressure)
+                        )
+                        if not valid:
+                            raise ValueError("ICON pressures must bracket model top and increase")
                         last_pressure = values
-                    stream.write(_encode(gid, self._cutout, values))
-
-    def _remap(self, gid: int, field: str, hour: int) -> _FloatArray:
-        import eccodes as ec
-
-        if _field(gid) != self._selectors[field]:
-            raise ValueError(f"Wrong ICON GRIB2 selector for {field} at f{hour:03d}")
-        donors = _values(gid, self._cutout, self._cycle, hour)
-        if field == "H_ICE":
-            # Thickness cannot determine fractional coverage when any ice is present.
-            if np.any(donors != 0.0):
-                raise ValueError("ICON cutout requires sea-ice fraction for nonzero ice thickness")
-            ec.codes_set(gid, "parameterNumber", 0)
-        surface = field in {"T_G", "T_SO", "W_SO", "H_SNOW", "W_SNOW"}
-        weights = self._surface_weights if surface else self._cutout.weights
-        return _weighted(donors, weights)
+                    yield gid, _slab(gid, self._cutout, values)
 
 
-def _check_pressure(values: _FloatArray, previous: _FloatArray | None, top_pa: float) -> None:
-    if previous is None:
-        if np.min(values) <= 0.0 or np.max(values) >= top_pa:
-            raise ValueError("ICON upper pressure level does not bracket the WRF model top")
-    elif np.any(values <= previous):
-        raise ValueError("ICON pressure must increase toward the surface at each cutout cell")
-
-
-def _full_heights(
-    keys: Sequence[str],
-    read_object: Callable[[str], bytes],
-    cutout: _Cutout,
-    cycle: datetime,
-    terrain: _FloatArray,
-    selector: _Field,
-) -> tuple[bytes, ...]:
-    import eccodes as ec
-
-    messages = []
-    previous: _FloatArray | None = None
-    for level, key in enumerate(keys, start=1):
-        with _message(read_object(key), key) as gid:
-            height = _weighted(_values(gid, cutout, cycle, 0), cutout.weights)
-            if _field(gid) != selector or ec.codes_get_long(gid, "level") != level:
-                raise ValueError(f"Wrong ICON height interface {level}")
-            if previous is not None:
-                if np.any(height >= previous):
-                    raise ValueError("ICON height interfaces must descend toward the surface")
-                ec.codes_set(gid, "scaledValueOfFirstFixedSurface", level - 1)
-                ec.codes_set(gid, "typeOfSecondFixedSurface", 150)
-                ec.codes_set(gid, "scaledValueOfSecondFixedSurface", level)
-                messages.append(_encode(gid, cutout, 0.5 * (previous + height)))
-            previous = height
-    if previous is None or not np.allclose(previous, terrain, rtol=0.0, atol=0.25):
-        raise ValueError("ICON bottom height interface disagrees with source terrain")
-    return tuple(messages)
-
-
-__all__ = ["IconGribCutout", "verify_icon_object"]
+__all__ = ["IconField", "IconGribCutout", "verify_icon_object"]

@@ -1,6 +1,7 @@
 """Audit a receipt-backed forecast and saved WRF radiation with tiny local fixtures."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import netCDF4
@@ -82,11 +83,15 @@ def published_fixture(tmp_path: Path) -> tuple[ReadyReceipt, Path, int, int]:
     return ready, root / "_ready.json", bundle.domain.e_we - 1, bundle.domain.e_sn - 1
 
 
+@pytest.mark.parametrize("domain_id", (1, 2))
 def test_audit_reports_hashed_native_frames(
-    tmp_path: Path, published_fixture: tuple[ReadyReceipt, Path, int, int]
+    tmp_path: Path, published_fixture: tuple[ReadyReceipt, Path, int, int], domain_id: int
 ) -> None:
     ready, ready_path, nx, ny = published_fixture
-    wrfout, solver_path = tmp_path / "wrfout_d01_history", tmp_path / "solver_receipt.json"
+    wrfout = tmp_path / f"wrfout_d{domain_id:02d}_history"
+    solver_path = tmp_path / "solver_receipt.json"
+    if domain_id == 2:
+        (tmp_path / "wrfout_d01_unused").touch()
     output = tmp_path / "audit.json"
     args = [
         str(ready_path),
@@ -121,3 +126,18 @@ def test_audit_reports_hashed_native_frames(
     wrfout.write_bytes(b"tampered")
     with pytest.raises(ValueError, match="Object digest differs"):
         main(args)
+
+
+def test_audit_resolves_downloaded_attempt_payload(
+    tmp_path: Path, published_fixture: tuple[ReadyReceipt, Path, int, int]
+) -> None:
+    ready, ready_path, _, _ = published_fixture
+    relative = f"attempts/{ready.attempt_id}/{'a' * 64}/forecast.zarr"
+    destination = ready_path.parent / relative
+    destination.parent.mkdir(parents=True)
+    (ready_path.parent / ready.zarr_relpath).rename(destination)
+    ready_path.write_text(json.dumps(replace(ready, zarr_relpath=relative).to_doc()))
+    assert main([str(ready_path), "--output", str(tmp_path / "report.json")]) == 0
+    ready_path.write_text(json.dumps(replace(ready, zarr_relpath="../forecast.zarr").to_doc()))
+    with pytest.raises(ValueError, match="Invalid attempt-scoped forecast path"):
+        main([str(ready_path)])

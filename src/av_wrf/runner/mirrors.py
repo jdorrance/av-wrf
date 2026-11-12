@@ -17,9 +17,10 @@ from av_wrf.contracts import (
     RunLock,
     parse_iso_utc,
 )
-from av_wrf.core import computational_latlon_bounds, required_forcing_forecast_hours
+from av_wrf.core import computational_latlon_bounds, forcing_domain, required_forcing_forecast_hours
 from av_wrf.runner.forcing_gfs import GFS
 from av_wrf.runner.forcing_icon import ICON_EU
+from av_wrf.runner.forcing_ifs import IFS
 from av_wrf.runner.forcing_recipe import ForcingRecipe
 from av_wrf.runner.store import (
     LocalFileStore,
@@ -33,7 +34,7 @@ from av_wrf.runner.store import (
 FORCING_MANIFEST_FILENAME = "forcing_manifest.json"
 
 
-_RECIPES = {recipe.identity: recipe for recipe in (GFS, ICON_EU)}
+_RECIPES = {recipe.identity: recipe for recipe in (GFS, ICON_EU, IFS)}
 
 
 class ForcingSubset(TypedDict):
@@ -90,7 +91,10 @@ def forcing_subset(
             "mirrors": list(source.mirrors),
             "interval_seconds": source.interval_seconds,
             "bbox_wsen_deg": list(
-                computational_latlon_bounds(domain, snap_deg=source.grid_spacing_deg)
+                computational_latlon_bounds(
+                    forcing_domain(domain, source.grid_spacing_deg),
+                    snap_deg=source.grid_spacing_deg,
+                )
             ),
             "forecast_hours": list(hours),
             "file_keys": {

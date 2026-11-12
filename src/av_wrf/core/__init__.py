@@ -23,12 +23,21 @@ from av_wrf.core.grid import (
 )
 from av_wrf.core.metrics import pressure_tendency_abs_hpa_hr
 from av_wrf.core.namelist import (
-    compile_geogrid_namelist_sections,
-    compile_wps_namelist_sections,
+    MYNN_CLOUD_FIELD,
+    MYNN_HISTORY_FILE,
+    MYNN_HISTORY_TEXT,
     compile_wrf_namelist_sections,
     compile_wrf_run_namelist,
     render_fortran_namelist,
-    required_forcing_forecast_hours,
+)
+from av_wrf.core.nesting import (
+    forcing_domain,
+    nesting_active,
+    parent_domain_shape,
+)
+from av_wrf.core.physics_namelist import (
+    adaptive_domains,
+    physics_and_dynamics_sections,
 )
 from av_wrf.core.post import (
     NormalizedWrfFrame,
@@ -57,6 +66,7 @@ from av_wrf.core.thermo import (
     WRF_T0_K,
     afwa_mslp_vec,
     groom_f32_buf,
+    ifs_dewpoint_to_spfh_vec,
     validate_thermodynamic_field,
     verify_t_thm_consistency,
 )
@@ -75,6 +85,11 @@ from av_wrf.core.vertical import (
     validate_vertical_column,
     validate_wrfinput_columns,
 )
+from av_wrf.core.wps_namelist import (
+    compile_geogrid_namelist_sections,
+    compile_wps_namelist_sections,
+    required_forcing_forecast_hours,
+)
 
 __all__ = [
     "BL_CEILING_AGL_M",
@@ -90,12 +105,16 @@ __all__ = [
     "MIN_SPINUP_HOURS",
     "MIN_STABLE_DZBOT_M",
     "MOIST_THETA_COEFF",
+    "MYNN_CLOUD_FIELD",
+    "MYNN_HISTORY_FILE",
+    "MYNN_HISTORY_TEXT",
     "P0_PA",
     "R_DRY_J_KG_K",
     "WRF_T0_K",
     "NormalizedWrfFrame",
     "RawWrfBaselineInput",
     "RawWrfStepInput",
+    "adaptive_domains",
     "afwa_mslp_vec",
     "auto_eta_faces",
     "build_accum_baseline",
@@ -111,14 +130,19 @@ __all__ = [
     "crop_destagger_z_3d",
     "crop_sponge_2d",
     "estimate_auto_levels_agl_m",
+    "forcing_domain",
     "groom_f32_buf",
+    "ifs_dewpoint_to_spfh_vec",
     "is_cycle_live_fresh",
     "lambert_grid_to_earth_trig",
     "lambert_map_scale",
     "lambert_xy_m_to_latlon",
     "latlon_to_lambert_xy_m",
     "model_column_spacing",
+    "nesting_active",
+    "parent_domain_shape",
     "parse_cycle_arg",
+    "physics_and_dynamics_sections",
     "post_frame",
     "pressure_tendency_abs_hpa_hr",
     "published_crs_wkt",

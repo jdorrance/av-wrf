@@ -11,7 +11,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from av_wrf.contracts import BuildManifest, RunLock, parse_iso_utc
-from av_wrf.core import required_forcing_forecast_hours
+from av_wrf.core import computational_latlon_bounds, required_forcing_forecast_hours
 from av_wrf.runner import (
     LocalFileStore,
     check_product_config,
@@ -80,14 +80,54 @@ def _messages(lock: RunLock, fhr: int) -> list[dict[str, object]]:
 
 
 class TestForcingManifest(TestCase):
-    def test_candidate_without_recipe_is_reported_and_cannot_be_primary(self) -> None:
+    def test_nested_gfs_rejects_cutout_that_only_covers_child(self) -> None:
+        bundle = bundle_for_recipe(ROOT / "config", GFS)
+        domain = replace(bundle.domain, parent_grid_ratio=3)
+        spacing = bundle.primary_source.grid_spacing_deg
+        west, south, east, north = computational_latlon_bounds(domain, snap_deg=spacing)
+        nx = round((east - west) / spacing) + 1
+        ny = round((north - south) / spacing) + 1
+        row = {
+            "gridType": "regular_ll",
+            "Ni": nx,
+            "Nj": ny,
+            "numberOfDataPoints": nx * ny,
+            "latitudeOfFirstGridPointInDegrees": south,
+            "latitudeOfLastGridPointInDegrees": north,
+            "longitudeOfFirstGridPointInDegrees": west,
+            "longitudeOfLastGridPointInDegrees": east,
+            "iDirectionIncrementInDegrees": spacing,
+            "jDirectionIncrementInDegrees": spacing,
+            "iScansNegatively": 0,
+            "jPointsAreConsecutive": 0,
+            "alternativeRowScanning": 0,
+            "jScansPositively": 1,
+            "md5Section3": "grid",
+            "offset": 0,
+            "totalLength": 20,
+            "packingType": "grid_simple",
+            "min": 1.0,
+            "max": 1.0,
+            "average": 1.0,
+        }
+        path = Path(self.enterContext(TemporaryDirectory())) / "forcing.grib2"
+        path.write_bytes(b" " * 20)
+        cycle = parse_iso_utc("2026-11-12T00:00:00Z")
+        with (
+            patch("av_wrf.runner.forcing_gfs.inspect_grib", return_value=[row]),
+            self.assertRaisesRegex(ValueError, "coverage disagrees"),
+        ):
+            GFS.validate_file(path, cycle, bundle.primary_source, domain, 0)
+
+    def test_candidate_recipe_and_unsupported_primary_are_reported(self) -> None:
         config = ROOT / "config"
         bundle = bundle_for_recipe(config, GFS)
         summary = check_product_config(config, bundle.product.product_id)
         self.assertEqual(summary.candidate_source, bundle.candidate_source.profile_id)
-        self.assertFalse(summary.candidate_recipe_available)
+        self.assertTrue(summary.candidate_recipe_available)
+        unknown = replace(bundle.candidate_source, provider="unsupported-provider")
         with self.assertRaisesRegex(ValueError, "No validated WPS forcing recipe"):
-            validate_bundle(replace(bundle, primary_source=bundle.candidate_source))
+            validate_bundle(replace(bundle, primary_source=unknown))
         bad_cycle = replace(bundle.product, forcing_cycle_hour_utc=1)
         with self.assertRaisesRegex(ValueError, "No 01Z forcing cycle"):
             validate_bundle(replace(bundle, product=bad_cycle))
