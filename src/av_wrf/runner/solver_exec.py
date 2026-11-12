@@ -5,13 +5,18 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-from collections.abc import Mapping
 from datetime import timedelta
 from numbers import Integral
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from av_wrf.codecs import check_geogrid_rotation, validate_wrfinput_nc, verify_grid_against_domain
-from av_wrf.contracts import BuildManifest, DomainProfile, RunLock, SolverReceipt
+from av_wrf.codecs import (
+    check_geogrid_rotation,
+    validate_wrfinput_nc,
+    verify_grid_against_domain,
+    verify_wps_fields,
+)
+from av_wrf.contracts import BuildManifest, DomainProfile, ForcingManifest, RunLock, SolverReceipt
 from av_wrf.core import (
     compile_geogrid_namelist_sections,
     compile_wps_namelist_sections,
@@ -23,9 +28,10 @@ from av_wrf.core import (
 from av_wrf.runner.bundle import LoadedBundle, load_bundle
 from av_wrf.runner.mirrors import resolve_forcing_window, verify_forcing_manifest
 from av_wrf.runner.solver import _hash_complete_wrfout, load_build_manifest, verify_solver_receipt
-from av_wrf.runner.stages import load_run_lock
+from av_wrf.runner.stages import _verify_producer_sha256, load_run_lock
 from av_wrf.runner.store import (
     ObjectStore,
+    _copy_sha256_file,
     json_bytes,
     put_idempotent,
     sha256_file,
@@ -113,7 +119,7 @@ def _validate_geo_em(path: Path, domain: DomainProfile, *, repair_rotation: bool
         str(path), mode="r+" if repair_rotation and domain.std_parallel_1_deg < 0.0 else "r"
     ) as ds:
         xlong = verify_grid_against_domain(ds, domain, path, wps=True)
-        _verify_wps_values(ds.variables, path, ("HGT_M", "LU_INDEX", "LANDMASK"))
+        verify_wps_fields(ds, path, ("HGT_M", "LU_INDEX", "LANDMASK"))
         check_geogrid_rotation(ds, path, domain, xlong, repair=repair_rotation)
 
 
@@ -144,7 +150,7 @@ def _inspect_metgrid_dims(attempt_dir: Path, b: LoadedBundle, lock: RunLock) -> 
             if counts[0] < 2 or min(counts) < 1:
                 raise ValueError(f"Invalid met_em level dimensions in {path}: {counts}")
             dims_seen.add((counts, int(soil_levels)))
-            _verify_wps_values(ds.variables, path, recipe.metgrid_fields)
+            verify_wps_fields(ds, path, recipe.metgrid_fields)
             verify_grid_against_domain(ds, b.domain, path, wps=True)
     if len(dims_seen) != 1:
         raise ValueError(f"Inconsistent met_em level dimensions across window: {dims_seen}")
@@ -152,32 +158,33 @@ def _inspect_metgrid_dims(attempt_dir: Path, b: LoadedBundle, lock: RunLock) -> 
     return counts[0], wrf_soil_levels
 
 
-def _verify_wps_values(
-    variables: Mapping[str, object], path: Path, fields: tuple[str, ...]
-) -> None:
-    import netCDF4
-    import numpy as np
-
-    for name in fields:
-        var = variables.get(name)
-        if not isinstance(var, netCDF4.Variable):
-            raise ValueError(f"Missing required WPS field {name} in {path}")
-        values = var[:]
-        if np.ma.is_masked(values) or not -1e19 <= np.min(values) <= np.max(values) <= 1e19:
-            raise ValueError(f"Invalid values in WPS field {name} in {path}")
-
-
 def _stage_wps_attempt(
     attempt_dir: Path,
     b: LoadedBundle,
     lock: RunLock,
     grib_dir: Path,
-    geo_em: Path,
+    geog_file: Path,
     solver_prefix: Path,
-    forcing_shas: tuple[tuple[str, str], ...],
-) -> None:
+) -> ForcingManifest:
     source = b.primary_source
     recipe, _, _ = resolve_forcing_window(lock, source, domain=b.domain)
+    attempt_dir.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix=".inputs-", dir=attempt_dir.parent) as tmp:
+        inputs = Path(tmp) / "inputs"
+        grib = inputs / "grib"
+        inputs.mkdir(mode=0o700)
+        grib.mkdir()
+        geo_em = inputs / "geo_em.d01.nc"
+        digest = _copy_sha256_file(geog_file, geo_em)
+        if digest != lock.geog_bundle_sha256:
+            raise ValueError(f"geo_em.d01.nc SHA-256 {digest} != RunLock {lock.geog_bundle_sha256}")
+        _validate_geo_em(geo_em, b.domain)
+        manifest = verify_forcing_manifest(
+            grib_dir, lock, source, domain=b.domain, snapshot_dir=grib
+        )
+        attempt_dir.mkdir()
+        inputs.rename(attempt_dir / "inputs")
+
     vtable = attempt_dir / "Vtable"
     if recipe.vtable_text is None:
         _link_file(solver_prefix / "share" / "wps" / "Variable_Tables" / source.vtable_name, vtable)
@@ -187,13 +194,14 @@ def _stage_wps_attempt(
     _link_file(
         solver_prefix / "share" / "wps" / "METGRID.TBL.ARW", attempt_dir / "metgrid" / "METGRID.TBL"
     )
-    _link_file(geo_em, attempt_dir / "geo_em.d01.nc")
-    for idx, (fname, _) in enumerate(forcing_shas):
-        _link_file(grib_dir / fname, attempt_dir / f"GRIBFILE.{_grib_alpha_suffix(idx)}")
+    os.symlink("inputs/geo_em.d01.nc", attempt_dir / "geo_em.d01.nc")
+    for idx, (fname, _) in enumerate(manifest.file_sha256s):
+        os.symlink(f"inputs/grib/{fname}", attempt_dir / f"GRIBFILE.{_grib_alpha_suffix(idx)}")
     wps_txt = render_fortran_namelist(
         compile_wps_namelist_sections(b.domain, b.science, lock, source)
     )
     (attempt_dir / "namelist.wps").write_text(wps_txt, encoding="utf-8")
+    return manifest
 
 
 def _exec_mpi_step(
@@ -304,24 +312,16 @@ def run_wrf_cycle(
     b = load_bundle(config_root, product_id) if bundle is None else bundle
     lock = load_run_lock(store, product_id, cycle_partition, attempt_id, bundle=b)
     _verify_runtime_build_manifest(solver_prefix, lock, runtime_manifest)
-    root = work_dir.resolve()
-    attempt_dir = root / product_id / cycle_partition.replace("/", "_") / attempt_id
+    attempt_dir = work_dir.resolve() / product_id / cycle_partition.replace("/", "_") / attempt_id
     if attempt_dir.resolve() != attempt_dir:
         raise ValueError("Solver attempt directory must be an independent path under scratch")
     receipt_key = solver_receipt_key(product_id, cycle_partition, attempt_id)
     if store.get_bytes(receipt_key) is not None:
         return verify_solver_receipt(store, lock, attempt_dir)
+    _verify_producer_sha256(lock)
     if attempt_dir.exists():
         raise FileExistsError(f"Solver attempt scratch already exists: {attempt_dir}")
-    geo_sha = sha256_file(geog_file)
-    if geo_sha != lock.geog_bundle_sha256:
-        raise ValueError(f"geo_em.d01.nc SHA-256 {geo_sha} != RunLock {lock.geog_bundle_sha256}")
-    _validate_geo_em(geog_file, b.domain)
-    manifest = verify_forcing_manifest(grib_dir, lock, b.primary_source, domain=b.domain)
-    attempt_dir.mkdir(parents=True, exist_ok=False)
-    _stage_wps_attempt(
-        attempt_dir, b, lock, grib_dir, geog_file, solver_prefix, manifest.file_sha256s
-    )
+    manifest = _stage_wps_attempt(attempt_dir, b, lock, grib_dir, geog_file, solver_prefix)
     _execute_solver_binaries(attempt_dir, b, lock, solver_prefix, mpi_launcher)
     window = resolve_cycle_window(b.product, b.output, lock.publish_origin_utc)
     receipt = SolverReceipt(
@@ -330,13 +330,12 @@ def run_wrf_cycle(
         attempt_id,
         lock.config_sha256,
         lock.build_manifest.oci_digest,
-        geo_sha,
+        lock.geog_bundle_sha256,
         manifest.file_sha256s,
         _hash_complete_wrfout(attempt_dir, window),
+        acquisition_inventory_sha256=(
+            manifest.acquisition_inventory[1] if manifest.acquisition_inventory else None
+        ),
     )
-    put_idempotent(
-        store,
-        receipt_key,
-        json_bytes(receipt.to_doc()),
-    )
+    put_idempotent(store, receipt_key, json_bytes(receipt.to_doc()))
     return receipt

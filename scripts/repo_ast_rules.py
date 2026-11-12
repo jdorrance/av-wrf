@@ -62,10 +62,11 @@ def load_public_exports(pkg_root: Path) -> dict[str, frozenset[str]]:
 
 def _check_dataclass_frozen(node: ast.ClassDef, rel: str, errors: list[str]) -> None:
     for dec in node.decorator_list:
-        is_dc = (isinstance(dec, ast.Name) and dec.id == "dataclass") or (
-            isinstance(dec, ast.Call)
-            and isinstance(dec.func, ast.Name)
-            and dec.func.id == "dataclass"
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        is_dc = (isinstance(target, ast.Name) and target.id == "dataclass") or (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and (target.value.id, target.attr) == ("dataclasses", "dataclass")
         )
         frozen_ok = isinstance(dec, ast.Call) and any(
             kw.arg == "frozen" and isinstance(kw.value, ast.Constant) and kw.value.value is True
@@ -87,12 +88,15 @@ def _check_call_node(
             )
         if is_hermetic and node.func.id == "open":
             errors.append(f"{rel}:{node.lineno}: open() forbidden in '{pkg_name}'. FIX: Move I/O.")
-    elif (
-        is_hermetic
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in {"now", "utcnow", "time"}
-    ):
-        errors.append(f"{rel}:{node.lineno}: clock call forbidden. FIX: Pass UTC string.")
+    elif is_hermetic and isinstance(node.func, ast.Attribute):
+        if node.func.attr in {"now", "utcnow", "time"}:
+            errors.append(f"{rel}:{node.lineno}: clock call forbidden. FIX: Pass UTC string.")
+        if (
+            node.func.attr == "open"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "builtins"
+        ):
+            errors.append(f"{rel}:{node.lineno}: open() forbidden in '{pkg_name}'. FIX: Move I/O.")
 
 
 def _check_ast_node(
@@ -108,6 +112,13 @@ def _check_ast_node(
         _check_dataclass_frozen(node, rel, errors)
     if is_code and isinstance(node, ast.Name) and node.id in {"Any", "ABC"}:
         errors.append(f"{rel}:{node.lineno}: '{node.id}' forbidden. FIX: Concrete types.")
+    if (
+        is_code
+        and isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and (node.value.id, node.attr) in {("typing", "Any"), ("abc", "ABC")}
+    ):
+        errors.append(f"{rel}:{node.lineno}: '{node.attr}' forbidden. FIX: Concrete types.")
     if isinstance(node, ast.Call):
         _check_call_node(node, rel, pkg, is_hermetic, errors)
     if (

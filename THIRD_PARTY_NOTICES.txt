@@ -9,6 +9,8 @@ Upstream solver repositories and operational datasets referenced by av-wrf:
   https://github.com/NCAR/noahmp
 - ECMWF Open Data (IFS 0.1 deg / 0.25 deg, CC BY 4.0, Copyright ECMWF):
   https://www.ecmwf.int/en/forecasts/datasets/open-data
+- ICON-EU operational forecast data (Deutscher Wetterdienst):
+  https://opendata.dwd.de/weather/nwp/v1/m/icon-eu/
 - NOAA GFS & NOAA RRFS Open Data (NOAA/NODD, CC0-1.0 / U.S. public domain):
   https://registry.opendata.aws/noaa-gfs-bdp-pds/
   https://registry.opendata.aws/noaa-rrfs-ops/

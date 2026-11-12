@@ -16,21 +16,120 @@ from av_wrf.core import resolve_cycle_window
 from av_wrf.runner import (
     LocalFileStore,
     attempt_stage_prefix,
+    json_bytes,
     load_bundle,
+    load_run_lock,
     plan_product_cycle,
     post_cycle_from_inputs,
     run_geogrid,
+    run_wrf_cycle,
 )
 from av_wrf.runner.forcing_gfs import GFS
 from av_wrf.runner.mirrors import resolve_forcing_window
-from av_wrf.runner.solver import _hash_complete_wrfout
+from av_wrf.runner.solver import _hash_complete_wrfout, parse_build_manifest
 from av_wrf.runner.solver_exec import _inspect_metgrid_dims
 from av_wrf.runner.store import sha256_file
+from tests.integration import bundle_for_recipe
 
 CONFIG = Path(__file__).resolve().parents[2] / "config"
 
 
 class TestSolverCompletion(TestCase):
+    def test_solve_and_post_require_planned_producer_code(self) -> None:
+        bundle = bundle_for_recipe(CONFIG, GFS)
+        product = bundle.product
+        build = BuildManifest("host-dev-unpinned", "wrf", "wps", (), "gcc", "mpi")
+        attempt = "code-drift"
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = LocalFileStore(root)
+            plan = partial(
+                plan_product_cycle,
+                CONFIG,
+                store,
+                product_id=product.product_id,
+                publish_origin_utc=f"2026-11-12T{product.publish_origin_hour_utc:02d}:00:00Z",
+                attempt_id=attempt,
+                mpi_ranks=4,
+                build_manifest=build,
+                bundle=bundle,
+            )
+            key, lock = plan()
+            self.assertRegex(lock.producer_sha256 or "", r"^[0-9a-f]{64}$")
+            stages = (
+                partial(
+                    run_wrf_cycle,
+                    work_dir=root / "solve",
+                    grib_dir=root / "grib",
+                    geog_file=root / "missing-geog.nc",
+                    runtime_manifest=build,
+                    mpi_launcher=("mpirun", "-np"),
+                ),
+                partial(post_cycle_from_inputs, wrfout_dir=root / "missing"),
+            )
+            with (
+                patch("av_wrf.runner.stages._producer_sha256", return_value="0" * 64),
+                patch("av_wrf.runner.solver_exec._verify_runtime_build_manifest"),
+            ):
+                for stage in stages:
+                    with self.assertRaisesRegex(ValueError, "Producer code SHA-256 drifted"):
+                        stage(
+                            CONFIG,
+                            store,
+                            product_id=product.product_id,
+                            cycle_partition=lock.cycle_partition,
+                            attempt_id=attempt,
+                            bundle=bundle,
+                        )
+            self.assertFalse((root / "solve").exists())
+            doc = lock.to_doc()
+            del doc["producer_sha256"]
+            (root / key).write_bytes(json_bytes(doc))
+            self.assertEqual(plan()[0], key)
+            legacy = load_run_lock(
+                store, product.product_id, lock.cycle_partition, attempt, bundle=bundle
+            )
+            self.assertIsNone(legacy.producer_sha256)
+
+    def test_plan_rejects_invalid_native_mpi_mesh(self) -> None:
+        bundle = bundle_for_recipe(CONFIG, GFS)
+        product = bundle.product
+        origin = f"2026-11-12T{product.publish_origin_hour_utc:02d}:00:00Z"
+        with TemporaryDirectory() as tmp:
+            store = LocalFileStore(Path(tmp))
+            plan = partial(
+                plan_product_cycle,
+                CONFIG,
+                store,
+                product_id=product.product_id,
+                publish_origin_utc=origin,
+                attempt_id="mpi-guard",
+                build_manifest=BuildManifest("host-dev-unpinned", "w", "p", (), "g", "m"),
+                bundle=bundle,
+            )
+            with self.assertRaisesRegex(ValueError, "patch narrower than 10 cells"):
+                plan(mpi_ranks=37)
+            with self.assertRaisesRegex(ValueError, "exceeds WRF's 10-cell"):
+                plan(mpi_ranks=bundle.domain.e_we * bundle.domain.e_sn)
+            self.assertEqual(plan(mpi_ranks=4)[1].mpi_ranks, 4)
+
+    def test_native_manifest_validates_commits_and_preserves_legacy_builds(self) -> None:
+        image = "sha256:" + "a" * 64
+        manifest = {
+            "wrf_sha": "1" * 40,
+            "wps_sha": "2" * 40,
+            "patch_sha256s": [],
+            "compiler": "gcc",
+            "mpi": "openmpi",
+        }
+        self.assertIsNone(parse_build_manifest(manifest, image).jasper_git_sha)
+        for key in ("wrf_sha", "wps_sha", "jasper_sha"):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, f"Invalid.*{key}"):
+                parse_build_manifest({**manifest, key: "unverified"}, image)
+        locked = parse_build_manifest({**manifest, "jasper_sha": "3" * 40}, image)
+        self.assertEqual(locked.jasper_git_sha, "3" * 40)
+        self.assertEqual(BuildManifest.from_doc(locked.to_doc()), locked)
+
     def test_geogrid_requires_resolved_sources_in_log(self) -> None:
         product = next((CONFIG / "products").glob("*.yaml")).stem
         default_log = (
@@ -93,15 +192,14 @@ class TestSolverCompletion(TestCase):
                         validate.assert_not_called()
 
     def test_gfs_metgrid_requires_temperature_and_pressure(self) -> None:
-        product = next((CONFIG / "products").glob("*.yaml")).stem
-        bundle = load_bundle(CONFIG, product)
+        bundle = bundle_for_recipe(CONFIG, GFS)
         origin = f"2026-11-12T{bundle.product.publish_origin_hour_utc:02d}:00:00Z"
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             _, lock = plan_product_cycle(
                 CONFIG,
                 LocalFileStore(root / "store"),
-                product_id=product,
+                product_id=bundle.product.product_id,
                 publish_origin_utc=origin,
                 attempt_id="test-metgrid",
                 mpi_ranks=1,

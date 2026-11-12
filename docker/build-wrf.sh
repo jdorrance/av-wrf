@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-wrf_tag=${1:?WRF tag is required}
-jobs=${2:?Build job count is required}
+jobs=${1:?Build job count is required}
 
 # The classic build expects NetCDF headers, tools and libraries under one prefix.
 multiarch=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
@@ -10,7 +9,8 @@ mkdir -p "$NETCDF/lib"
 ln -s /usr/include /usr/bin "$NETCDF/"
 ln -s "/usr/lib/$multiarch"/libnetcdf* "$NETCDF/lib/"
 
-git clone --depth 1 --branch "$wrf_tag" https://github.com/wrf-model/WRF.git
+git clone --depth 1 --branch v4.8.0 https://github.com/wrf-model/WRF.git
+test "$(git -C WRF rev-parse HEAD)" = 06d4240ae989cc3e50af412bb472df3d9048783c
 git -C WRF submodule update --init --depth 1 -- \
     phys/noahmp phys/physics_mmm phys/MYNN-EDMF phys/MYNN-SFC phys/TEMPO phys/GFL
 for patch in patches/wrf-*.patch; do

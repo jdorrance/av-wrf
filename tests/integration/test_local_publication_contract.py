@@ -1,0 +1,259 @@
+"""Exercise local publication locking, latest ordering, and webhook transport."""
+
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager
+from dataclasses import replace
+from pathlib import Path
+from threading import Event
+from traceback import format_exception
+from unittest.mock import patch
+
+import httpx
+import pytest
+
+from av_wrf.contracts import BuildManifest, ReadyReceipt, RunLock
+from av_wrf.runner import (
+    LoadedBundle,
+    LocalFileStore,
+    ObjectStore,
+    attempt_stage_prefix,
+    dispatch_idempotency_key,
+    json_bytes,
+    load_bundle,
+    plan_product_cycle,
+    post_cycle_from_inputs,
+    post_webhook_json,
+    publish_cycle_receipt,
+    published_cycle_prefix,
+    put_idempotent,
+    reconcile_dispatch,
+)
+from av_wrf.runner.forcing_gfs import GFS
+from av_wrf.runner.publish import _advance_latest_pointer_with_retry
+from av_wrf.runner.store import synthetic_cycle_prefix
+from tests.integration import bundle_for_recipe, stage_sparse_config
+
+
+@pytest.fixture
+def receipt() -> ReadyReceipt:
+    return ReadyReceipt(
+        "wrf-zarr-v3",
+        1,
+        "model",
+        "20261112/00",
+        "2026-11-12T00:00:00Z",
+        "att-01",
+        "forecast.zarr",
+        {},
+        38,
+        (),
+        (),
+        (),
+        (),
+        (),
+        (),
+        "config",
+        "source",
+        "image",
+    )
+
+
+def test_cycle_lock_survives_prefix_removal_and_delete_syncs_parent(tmp_path: Path) -> None:
+    store = LocalFileStore(tmp_path)
+    prefix = "upstream/model/20261112/00"
+    key = f"{prefix}/_promotion_owner.json"
+    store.compare_and_swap(key, b"owner", None)
+    locks = tmp_path / ".locks"
+    with store.cycle_lock(prefix):
+        lock_inodes = {lock.name: lock.stat().st_ino for lock in locks.iterdir()}
+        assert len(lock_inodes) == 2
+        with patch("av_wrf.runner.store._sync_directory") as sync:
+            store.delete_prefix(prefix)
+            sync.assert_called_once_with((tmp_path / prefix).parent)
+        assert not (tmp_path / prefix).exists()
+        assert {lock.name: lock.stat().st_ino for lock in locks.iterdir()} == lock_inodes
+        for lock_dir in (".locks", ".LOCKS"):
+            with pytest.raises(ValueError, match="reserved lock directory"):
+                store.delete_prefix(lock_dir)
+    with store.cycle_lock(prefix.upper()):
+        assert {lock.name: lock.stat().st_ino for lock in locks.iterdir()} == lock_inodes
+
+
+@pytest.fixture
+def planned_attempt(tmp_path: Path) -> tuple[Path, LocalFileStore, LoadedBundle, RunLock]:
+    config = tmp_path / "config"
+    product = stage_sparse_config(Path(__file__).resolve().parents[2] / "config", config)
+    bundle = load_bundle(config, product)
+    store = LocalFileStore(tmp_path / "store")
+    _, lock = plan_product_cycle(
+        config,
+        store,
+        product_id=product,
+        publish_origin_utc=f"2026-11-12T{bundle.product.publish_origin_hour_utc:02d}:00:00Z",
+        attempt_id="att-local-publish",
+        mpi_ranks=1,
+        build_manifest=BuildManifest("host-dev-unpinned", "w", "p", (), "gcc", "mpi"),
+        bundle=bundle,
+    )
+    return config, store, bundle, lock
+
+
+def test_pruning_waits_for_repost(
+    planned_attempt: tuple[Path, LocalFileStore, LoadedBundle, RunLock], tmp_path: Path
+) -> None:
+    config, store, bundle, lock = planned_attempt
+    product = lock.product_id
+    stage_root = attempt_stage_prefix(product, lock.cycle_partition, lock.attempt_id)
+
+    def post() -> None:
+        post_cycle_from_inputs(
+            config,
+            store,
+            product_id=product,
+            cycle_partition=lock.cycle_partition,
+            attempt_id=lock.attempt_id,
+            wrfout_dir=None,
+            synthetic=True,
+            bundle=bundle,
+        )
+
+    post()
+    repost_paused, resume_repost, publish_at_stage_lock = Event(), Event(), Event()
+    cycle_lock = store.cycle_lock
+
+    def mark_stage_lock(prefix: str) -> AbstractContextManager[None]:
+        if prefix == stage_root and repost_paused.is_set():
+            publish_at_stage_lock.set()
+        return cycle_lock(prefix)
+
+    def pause_first_write(
+        store: ObjectStore,
+        key: str,
+        payload: bytes,
+        *,
+        equiv: Callable[[bytes, bytes], bool] | None = None,
+    ) -> str:
+        digest = put_idempotent(store, key, payload, equiv=equiv)
+        if not repost_paused.is_set():
+            repost_paused.set()
+            assert resume_repost.wait(timeout=5)
+        return digest
+
+    with (
+        patch.object(store, "cycle_lock", side_effect=mark_stage_lock),
+        patch("av_wrf.runner.post.put_idempotent", side_effect=pause_first_write),
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        repost = pool.submit(post)
+        try:
+            assert repost_paused.wait(timeout=5)
+            promotion = pool.submit(
+                publish_cycle_receipt,
+                config,
+                store,
+                product_id=product,
+                cycle_partition=lock.cycle_partition,
+                attempt_id=lock.attempt_id,
+                bundle=bundle,
+                allow_synthetic=True,
+                prune_stage=True,
+            )
+            assert publish_at_stage_lock.wait(timeout=5)
+        finally:
+            resume_repost.set()
+        repost.result()
+        assert promotion.result().attempt_id == lock.attempt_id
+    assert not (tmp_path / "store" / stage_root).exists()
+
+
+def test_pruned_retry_finds_matching_receipt_in_allowed_namespace(
+    planned_attempt: tuple[Path, LocalFileStore, LoadedBundle, RunLock], receipt: ReadyReceipt
+) -> None:
+    config, store, bundle, lock = planned_attempt
+    live = replace(
+        receipt,
+        model_id=lock.model_id,
+        cycle_partition=lock.cycle_partition,
+        publish_origin_utc=lock.publish_origin_utc,
+        attempt_id=lock.attempt_id,
+        config_sha256=lock.config_sha256,
+    )
+    fixture = replace(live, forcing_profile_id="synthetic-fixture", oci_digest="synthetic-fixture")
+    live_key = f"{published_cycle_prefix(lock.model_id, lock.cycle_partition)}/_ready.json"
+    fixture_key = f"{synthetic_cycle_prefix(lock.model_id, lock.cycle_partition)}/_ready.json"
+
+    def retry(*, allow_synthetic: bool) -> ReadyReceipt:
+        return publish_cycle_receipt(
+            config,
+            store,
+            product_id=lock.product_id,
+            cycle_partition=lock.cycle_partition,
+            attempt_id=lock.attempt_id,
+            bundle=bundle,
+            allow_synthetic=allow_synthetic,
+            now_utc_iso=lock.publish_origin_utc,
+        )
+
+    store.put_if_absent(live_key, json_bytes(live.to_doc()))
+    store.put_if_absent(fixture_key, json_bytes(replace(fixture, attempt_id="competing").to_doc()))
+    assert retry(allow_synthetic=True) == live
+    store.delete_prefix(live_key)
+    with pytest.raises(FileExistsError, match="competing"):
+        retry(allow_synthetic=True)
+    store.delete_prefix(fixture_key)
+    store.put_if_absent(fixture_key, json_bytes(fixture.to_doc()))
+    with pytest.raises(FileNotFoundError, match=r"Missing post_manifest\.json"):
+        retry(allow_synthetic=False)
+    store.put_if_absent(live_key, json_bytes(replace(live, attempt_id="competing").to_doc()))
+    assert retry(allow_synthetic=True) == fixture
+    with pytest.raises(FileExistsError, match="competing"):
+        retry(allow_synthetic=False)
+
+
+def test_latest_pointer_compares_instants(tmp_path: Path, receipt: ReadyReceipt) -> None:
+    b = bundle_for_recipe(Path(__file__).resolve().parents[2] / "config", GFS)
+    hour = b.product.publish_origin_hour_utc
+    receipt = replace(receipt, publish_origin_utc=f"2026-11-12T{hour:02}:00:00Z")
+    store = LocalFileStore(tmp_path)
+    latest_key = "upstream/model/latest.json"
+    newer = json_bytes({"publish_origin_utc": f"2026-11-12T{hour:02}:00:00.001+00:00"})
+    token = store.compare_and_swap(latest_key, newer, None)
+    now = f"2026-11-12T{hour:02}:15:00Z"
+    _advance_latest_pointer_with_retry(store, receipt, b, now)
+    assert store.get_bytes(latest_key) == newer
+    store.compare_and_swap(latest_key, b"{}", token)
+    with pytest.raises(ValueError, match=r"Invalid publish origin in latest\.json"):
+        _advance_latest_pointer_with_retry(store, receipt, b, now)
+
+
+def test_rejected_webhook_can_retry_delivery(tmp_path: Path, receipt: ReadyReceipt) -> None:
+    store = LocalFileStore(tmp_path)
+    with pytest.raises(RuntimeError, match=r"Consumer webhook rejected .*: 503"):
+        reconcile_dispatch(store, receipt, lambda _: 503)
+    assert reconcile_dispatch(store, receipt, lambda _: 204)
+    assert not reconcile_dispatch(store, receipt, lambda _: pytest.fail("Already delivered"))
+
+
+def test_webhook_tls_bearer_and_error_redaction(receipt: ReadyReceipt) -> None:
+    url = "https://example.invalid/endpoint"
+    token = "secret-token"
+    with patch("av_wrf.runner.dispatch.httpx.post", return_value=httpx.Response(202)) as post:
+        for unsafe in (
+            "http://example.invalid",
+            f"https://{token}@example.invalid",
+            f"{url}?x={token}",
+        ):
+            with pytest.raises(ValueError, match="requires HTTPS"):
+                post_webhook_json(unsafe, receipt, bearer_token=token)
+        post.assert_not_called()
+        assert post_webhook_json(url, receipt, bearer_token=token) == 202
+        assert post.call_args.kwargs["headers"]["Authorization"] == f"Bearer {token}"
+        assert post.call_args.kwargs["headers"]["Idempotency-Key"] == dispatch_idempotency_key(
+            receipt, url
+        )
+        assert post.call_args.kwargs["follow_redirects"] is False
+        post.side_effect = httpx.ConnectError(f"Sensitive destination {url}/{token}")
+        with pytest.raises(RuntimeError, match="Consumer webhook request failed") as failure:
+            post_webhook_json(url, receipt, bearer_token=token)
+        assert token not in "".join(format_exception(failure.value))

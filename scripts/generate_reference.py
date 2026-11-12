@@ -24,7 +24,7 @@ from av_wrf.contracts import (  # noqa: E402
     ZARR_SCHEMA_STATUS,
     ZARR_SCHEMA_VERSION,
 )
-from av_wrf.runner import check_product_config  # noqa: E402
+from av_wrf.runner import check_all_products  # noqa: E402
 from scripts.check_repo import IGNORED_NAMES  # noqa: E402
 
 LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
@@ -60,8 +60,7 @@ def _render_products_section(repo: Path) -> list[str]:
         "Source: [`config/products/`](../config/README.md).",
         "",
     ]
-    for yaml_path in sorted((repo / "config" / "products").glob("*.yaml")):
-        info = check_product_config(repo / "config", yaml_path.stem)
+    for info in check_all_products(repo / "config"):
         nj, ni = info.published_yx
         recipe = "recipe available" if info.candidate_recipe_available else "no solve recipe"
         out.append(

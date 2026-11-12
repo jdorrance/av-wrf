@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import threading
+import unicodedata
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
@@ -46,6 +47,16 @@ def sha256_file(path: Path) -> str:
     """Stream file and return lowercase SHA-256 hex digest."""
     with path.open("rb") as handle:
         return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def _copy_sha256_file(source: Path, destination: Path) -> str:
+    """Write a new file and hash the bytes copied from its source."""
+    digest = hashlib.sha256()
+    with source.open("rb") as src, destination.open("xb") as dst:
+        while chunk := src.read(1024 * 1024):
+            dst.write(chunk)
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def json_bytes(obj: object) -> bytes:
@@ -137,6 +148,7 @@ class LocalFileStore:
 
     def __init__(self, root_dir: Path) -> None:
         self._root = root_dir.resolve()
+        self._locks = self._root / ".locks"
         if not self._root.is_dir():
             ancestor = next(parent for parent in self._root.parents if parent.is_dir())
             self._root.mkdir(parents=True, exist_ok=True)
@@ -152,6 +164,8 @@ class LocalFileStore:
         target = (self._root / clean).resolve()
         if self._root not in target.parents:
             raise ValueError(f"Store key escapes root directory: {key}")
+        if target.relative_to(self._root).parts[0].casefold() == self._locks.name:
+            raise ValueError("Store key uses the reserved lock directory")
         return target
 
     def get_bytes(self, key: str) -> bytes | None:
@@ -203,22 +217,38 @@ class LocalFileStore:
 
     def delete_prefix(self, prefix: str) -> None:
         target = self._resolve(prefix)
-        if target.is_dir():
-            shutil.rmtree(target, onexc=_ignore_missing_path)
-        else:
-            target.unlink(missing_ok=True)
+        try:
+            if target.is_dir():
+                shutil.rmtree(target, onexc=_ignore_missing_path)
+            else:
+                target.unlink(missing_ok=True)
+        except FileNotFoundError:
+            pass
+        for parent in target.parents:
+            try:
+                _sync_directory(parent)
+                break
+            except FileNotFoundError:
+                if parent == self._root:
+                    raise
+
+    def _lock_path(self, kind: str, target: Path) -> Path:
+        self._locks.mkdir(exist_ok=True)
+        if self._locks.is_symlink():
+            raise ValueError("Store lock directory must be a real directory")
+        # Case and normalization aliases share one lock on macOS volumes.
+        key = unicodedata.normalize("NFD", target.relative_to(self._root).as_posix()).casefold()
+        key_hash = sha256_hex(os.fsencode(key))
+        return self._locks / f"{kind}-{key_hash}.lock"
 
     def cycle_lock(self, prefix: str) -> AbstractContextManager[None]:
-        """Hold exclusive thread + OS flock on `<prefix>/.publish.lock` through promotion."""
-        dir_path = self._resolve(prefix)
-        dir_path.mkdir(parents=True, exist_ok=True)
-        return _exclusive_lock(dir_path / ".publish.lock")
+        """Hold a stable thread and OS lock through promotion and prefix replacement."""
+        return _exclusive_lock(self._lock_path("cycle", self._resolve(prefix)))
 
     def compare_and_swap(self, key: str, payload: bytes, expected_token: str | None) -> str:
         path = self._resolve(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = path.parent / f".{path.name}.cas.lock"
-        with _exclusive_lock(lock_path):
+        with _exclusive_lock(self._lock_path("cas", path)):
             _, actual_tok = self.get_with_token(key)
             if expected_token != actual_tok and (
                 actual_tok is None or expected_token != actual_tok.removeprefix("etag:")

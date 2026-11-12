@@ -11,8 +11,9 @@ docker run --rm av-wrf:solver check
 ```
 
 Both targets ship the installed app and config. BuildKit mounts the sources
-for `uv sync` and caches dependencies from `uv.lock`. The solver caches its
-native libraries and link checks before copying the app.
+for `uv sync` and caches dependencies from `uv.lock`. The app layer rebuilds
+the local wheel when the build context changes. The solver caches its native
+libraries and link checks before copying the app.
 [Astral Docker guide](https://docs.astral.sh/uv/guides/integration/docker/)
 
 BuildKit mounts each script only for its layer. [`build-jasper.sh`](build-jasper.sh)

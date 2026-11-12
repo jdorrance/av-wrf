@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from av_wrf.codecs.icon_grib import IconGribCutout
 from av_wrf.codecs.synthetic import (
     build_synthetic_wrf_baseline,
     build_synthetic_wrf_step,
@@ -17,7 +18,11 @@ from av_wrf.codecs.wrf_nc import (
     verify_local_wrf_nc,
     verify_wrfout_grid_against_domain,
 )
-from av_wrf.codecs.wrf_nc_grid import check_geogrid_rotation, verify_grid_against_domain
+from av_wrf.codecs.wrf_nc_grid import (
+    check_geogrid_rotation,
+    verify_grid_against_domain,
+    verify_wps_fields,
+)
 from av_wrf.codecs.zarr_shard import (
     MAX_SPATIAL_TILES_PER_FRAME,
     crc32c_u32,
@@ -37,6 +42,7 @@ from av_wrf.codecs.zarr_v3 import (
 
 __all__ = [
     "MAX_SPATIAL_TILES_PER_FRAME",
+    "IconGribCutout",
     "RawWrfBaselineInput",
     "RawWrfStepInput",
     "build_synthetic_wrf_baseline",
@@ -59,6 +65,7 @@ __all__ = [
     "verify_grid_against_domain",
     "verify_local_wrf_nc",
     "verify_shard_index",
+    "verify_wps_fields",
     "verify_wrfout_grid_against_domain",
     "zarr_shard_relpath",
 ]

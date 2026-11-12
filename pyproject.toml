@@ -17,6 +17,9 @@ dependencies = [
   "httpx>=0.28.0",
 ]
 
+[project.optional-dependencies]
+icon = ["eccodes>=2.42", "eccodeslib>=2.42; sys_platform != 'win32'", "scipy>=1.15"]
+
 [project.scripts]
 av-wrf = "av_wrf.cli.main:main"
 verify = "scripts.verify:main"
@@ -62,7 +65,7 @@ disallow_any_explicit = true
 files = ["src", "scripts", "tests"]
 
 [[tool.mypy.overrides]]
-module = ["netCDF4.*", "numcodecs.*"]
+module = ["eccodes.*", "netCDF4.*", "numcodecs.*", "scipy.*"]
 ignore_missing_imports = true
 
 [tool.importlinter]

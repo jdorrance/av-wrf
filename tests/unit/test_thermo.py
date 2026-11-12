@@ -17,7 +17,6 @@ for p in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(p))
 
 from av_wrf.contracts import CompMass3D, Slab3DF32  # noqa: E402
-from av_wrf.core import lambert_convergence_trig  # noqa: E402
 from av_wrf.core.thermo import (  # noqa: E402
     KAPPA_DRY,
     MOIST_THETA_COEFF,
@@ -30,15 +29,12 @@ from av_wrf.core.thermo import (  # noqa: E402
     mixing_ratio_to_spfh_vec,
     parameterized_gust_10m_vec,
     potential_to_temp_vec,
-    rotate_grid_to_earth_vec,
     verify_t_thm_consistency,
 )
 from av_wrf.runner import load_bundle  # noqa: E402
 from tests.oracle.reference_cases import (  # noqa: E402
     EXPECTED_TEMP_850HPA_K,
-    NH_MIDLAT_LCC,
     PRESSURE_850HPA_PA,
-    SH_MIDLAT_LCC,
     THETA_PERTURB_10K,
 )
 
@@ -111,6 +107,13 @@ class TestThermo(unittest.TestCase):
         self.assertLessEqual(e_hpa, es_hpa)
         self.assertGreater(e_hpa, 0.999 * es_hpa)
 
+        t2_k = 333.0
+        es_pa = 611.2 * math.exp(17.67 * (t2_k - 273.15) / (t2_k - 29.65))
+        psfc = 1.005 * es_pa
+        clamped = clamp_spfh_2m_vec(_arr(0.999), _arr(t2_k), _arr(psfc))[0]
+        e_pa = psfc * clamped / (0.622 + 0.378 * clamped)
+        self.assertLess(e_pa, es_pa)
+
     def test_mslp_plateau_and_signed_height(self) -> None:
         mslp = hypsometric_mslp_vec(
             _arr(100_000, 85_000, 85_000, 70_000, 70_000, 105_000, 105_000),
@@ -162,20 +165,6 @@ class TestThermo(unittest.TestCase):
             rtol=0.0,
             atol=1e-10,
         )
-
-    def test_rotation_with_signed_lambert_convergence(self) -> None:
-        for lat0, lon0, sp1, sp2 in (NH_MIDLAT_LCC, SH_MIDLAT_LCC):
-            cos_t, sin_t = lambert_convergence_trig(
-                lon0 + 4.0,
-                central_meridian_deg=lon0,
-                std_parallel_1_deg=sp1,
-                std_parallel_2_deg=sp2,
-                origin_lat_deg=lat0,
-                radius_m=6_370_000.0,
-            )
-            ue, ve = rotate_grid_to_earth_vec(_arr(7.3), _arr(-4.1), _arr(cos_t), _arr(-sin_t))
-            self.assertAlmostEqual(float(ue[0]), cos_t * 7.3 + sin_t * (-4.1), places=12)
-            self.assertAlmostEqual(float(ve[0]), -sin_t * 7.3 + cos_t * (-4.1), places=12)
 
 
 if __name__ == "__main__":

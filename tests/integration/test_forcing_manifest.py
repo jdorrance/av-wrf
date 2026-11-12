@@ -15,17 +15,18 @@ from av_wrf.core import required_forcing_forecast_hours
 from av_wrf.runner import (
     LocalFileStore,
     check_product_config,
-    load_bundle,
     plan_product_cycle,
     prep_cycle_namelists,
 )
 from av_wrf.runner.bundle import validate_bundle
-from av_wrf.runner.forcing_gfs import _ATMOSPHERIC, _FIELD_KEYS, _SOIL, _SURFACE
+from av_wrf.runner.forcing_gfs import _ATMOSPHERIC, _SOIL, _SURFACE, GFS
+from av_wrf.runner.grib import GRIB_FIELD_KEYS
 from av_wrf.runner.mirrors import (
     resolve_forcing_window,
     verify_forcing_manifest,
     write_forcing_manifest,
 )
+from tests.integration import bundle_for_recipe
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -44,6 +45,11 @@ def _messages(lock: RunLock, fhr: int) -> list[dict[str, object]]:
         "validityTime": int(valid.strftime("%H%M")),
         "iDirectionIncrementInDegrees": 0.25,
         "jDirectionIncrementInDegrees": 0.25,
+        "iScansNegatively": 0,
+        "jPointsAreConsecutive": 0,
+        "alternativeRowScanning": 0,
+        "numberOfMissing": 0,
+        "uvRelativeToGrid": 0,
         "gridType": "regular_ll",
         "typeOfLevel": "isobaricInhPa",
         "md5Section3": "matching-grid",
@@ -63,7 +69,7 @@ def _messages(lock: RunLock, fhr: int) -> list[dict[str, object]]:
         *((*param, 100, level, level) for param in _ATMOSPHERIC for level in levels),
     )
     return [
-        {**metadata, **dict(zip(_FIELD_KEYS, field, strict=True)), "offset": i * 20}
+        {**metadata, **dict(zip(GRIB_FIELD_KEYS, field, strict=True)), "offset": i * 20}
         for i, field in enumerate(fields)
     ]
 
@@ -71,9 +77,8 @@ def _messages(lock: RunLock, fhr: int) -> list[dict[str, object]]:
 class TestForcingManifest(TestCase):
     def test_candidate_without_recipe_is_reported_and_cannot_be_primary(self) -> None:
         config = ROOT / "config"
-        product_id = next((config / "products").glob("*.yaml")).stem
-        bundle = load_bundle(config, product_id)
-        summary = check_product_config(config, product_id)
+        bundle = bundle_for_recipe(config, GFS)
+        summary = check_product_config(config, bundle.product.product_id)
         self.assertEqual(summary.candidate_source, bundle.candidate_source.profile_id)
         self.assertFalse(summary.candidate_recipe_available)
         with self.assertRaisesRegex(ValueError, "No validated WPS forcing recipe"):
@@ -84,7 +89,7 @@ class TestForcingManifest(TestCase):
 
     def test_prep_lists_source_files_and_gfs_rejects_missing_hourly_tail(self) -> None:
         config = ROOT / "config"
-        b = load_bundle(config, next((config / "products").glob("*.yaml")).stem)
+        b = bundle_for_recipe(config, GFS)
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             stage = LocalFileStore(root / "store")
@@ -131,7 +136,7 @@ class TestForcingManifest(TestCase):
 
     def test_rejects_wrong_cycle_grid_or_inventory(self) -> None:
         config = ROOT / "config"
-        b = load_bundle(config, next((config / "products").glob("*.yaml")).stem)
+        b = bundle_for_recipe(config, GFS)
         with TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             stage = LocalFileStore(root / "store")
@@ -167,6 +172,9 @@ class TestForcingManifest(TestCase):
                 for key, value, error in (
                     ("validityTime", -1, "Wrong GFS source, cycle or valid time"),
                     ("Ni", 2, "coverage disagrees"),
+                    ("iScansNegatively", 1, "coverage disagrees"),
+                    ("numberOfMissing", 1, "Missing values in required GFS field"),
+                    ("packingType", "grid_jpeg", "Invalid GRIB2 framing or packing"),
                     ("parameterNumber", 255, "Missing GFS surface/soil messages"),
                 ):
                     old = row[key]

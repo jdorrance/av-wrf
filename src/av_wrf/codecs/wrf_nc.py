@@ -9,10 +9,10 @@ from pathlib import Path
 import numpy as np
 
 from av_wrf.codecs.wrf_nc_grid import (
-    _southern_lambert_sine,
     extract_clean_f32_nc,
     extract_clean_i32_nc,
     parse_wrf_timestamp,
+    rotation_sine_needs_flip,
     select_cycle_wrfout_slices,
     validate_wrfinput_nc,
     verify_local_wrf_nc,
@@ -263,9 +263,10 @@ def read_wrfout_step_nc(
         if expected_valid_utc is not None and stamp[0] != expected_valid_utc:
             raise ValueError(f"wrfout Times {stamp[0]} != expected {expected_valid_utc}")
         step = _assemble_step_from_vars(ds.variables, nc_path, stamp, time_index, dims, science)
-    if domain.std_parallel_1_deg < 0.0:
-        sine = np.frombuffer(step.sin_alpha.buf, np.float32).reshape(xlong.shape)
-        sine[:] = _southern_lambert_sine(sine, xlong, domain.central_meridian_deg)
+    cosine = np.frombuffer(step.cos_alpha.buf, np.float32).reshape(xlong.shape)
+    sine = np.frombuffer(step.sin_alpha.buf, np.float32).reshape(xlong.shape)
+    if rotation_sine_needs_flip(domain, xlong, cosine, sine, str(nc_path)):
+        sine *= -1.0
     return step
 
 

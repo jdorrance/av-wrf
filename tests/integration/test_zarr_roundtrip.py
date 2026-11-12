@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 import unittest
+from array import array
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -16,17 +17,24 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from av_wrf.codecs import build_synthetic_wrf_baseline, build_synthetic_wrf_step  # noqa: E402
+from av_wrf.codecs import (  # noqa: E402
+    build_synthetic_wrf_baseline,
+    build_synthetic_wrf_step,
+    encode_3d_shard_bytes,
+)
 from av_wrf.contracts import (  # noqa: E402
     WRF_ZARR_V3_2D_NAMES,
     WRF_ZARR_V3_3D_NAMES,
     BuildManifest,
+    PubMass3D,
     RawWrfStepInput,
+    Slab3DF32,
     parse_iso_utc,
 )
 from av_wrf.core import resolve_cycle_window  # noqa: E402
 from av_wrf.runner import (  # noqa: E402
     LocalFileStore,
+    attempt_stage_prefix,
     json_bytes,
     load_bundle,
     plan_product_cycle,
@@ -36,10 +44,64 @@ from av_wrf.runner import (  # noqa: E402
     run_lock_key,
 )
 from av_wrf.runner.post import _stage_cycle  # noqa: E402
+from av_wrf.runner.store import sha256_file  # noqa: E402
 from tests.integration import stage_sparse_config  # noqa: E402
 
 
 class TestZarrV3RoundTrip(unittest.TestCase):
+    def test_publish_rejects_rehashed_nonmonotonic_height(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = root / "config"
+            b = load_bundle(cfg, stage_sparse_config(ROOT / "config", cfg))
+            store = LocalFileStore(root / "store")
+            _, lock = plan_product_cycle(
+                cfg,
+                store,
+                product_id=b.product.product_id,
+                publish_origin_utc=f"2026-11-12T{b.product.publish_origin_hour_utc:02d}:00:00Z",
+                attempt_id="att-height",
+                mpi_ranks=1,
+                bundle=b,
+                build_manifest=BuildManifest("host-dev-unpinned", "wrf", "wps", (), "gcc", "mpi"),
+            )
+            identity = dict(
+                product_id=lock.product_id,
+                cycle_partition=lock.cycle_partition,
+                attempt_id=lock.attempt_id,
+            )
+            post_cycle_from_inputs(
+                cfg, store, **identity, wrfout_dir=None, synthetic=True, bundle=b
+            )
+            staged = root / "store" / attempt_stage_prefix(**identity) / "forecast.zarr"
+            height = zarr.open_group(str(staged), mode="r")["height_msl_m"]
+            assert isinstance(height, zarr.Array)
+            volume = np.asarray(height[0], dtype=np.float32)
+            volume[1, 0, 0] = volume[0, 0, 0]
+            buffer = array("f")
+            buffer.frombytes(volume.tobytes())
+            nz, ny, nx = volume.shape
+            slab = PubMass3D(Slab3DF32(nz, ny, nx, buffer))
+            shard_key = "height_msl_m/c/0/0/0/0"
+            (staged / shard_key).write_bytes(encode_3d_shard_bytes([slab], b.output))
+            pm = root / "store" / post_manifest_key(**identity)
+            doc = json.loads(pm.read_bytes())
+            doc["shard_sha256s"] = [
+                [key, sha256_file(staged / key) if key == shard_key else sha]
+                for key, sha in doc["shard_sha256s"]
+            ]
+            pm.write_bytes(json_bytes(doc))
+            with self.assertRaisesRegex(ValueError, "Exported column gap"):
+                publish_cycle_receipt(
+                    cfg,
+                    store,
+                    product_id=lock.product_id,
+                    cycle_partition=lock.cycle_partition,
+                    attempt_id=lock.attempt_id,
+                    allow_synthetic=True,
+                    bundle=b,
+                )
+
     def test_publish_checks_staged_producer_and_accepts_legacy_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

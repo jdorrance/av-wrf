@@ -40,7 +40,7 @@ python3 scripts/check_repo.py
   `wrfout` reader, deterministic ZEP-0002 `zstd`+`crc32c` shard codec, and
   `wrf-zarr-v3` metadata.
 - [src/av_wrf/runner](src/av_wrf/runner/README.md): `flock`-serialized local storage,
-  verified GFS input, attempt-staged `post`, full-horizon `publish`, and
+  GFS and ICON-EU forcing recipes, attempt-staged `post`, full-horizon `publish`, and
   idempotent webhook dispatch.
 - [src/av_wrf/verify](src/av_wrf/verify/README.md): sounding-based soaring proxies.
 - [src/av_wrf/cli](src/av_wrf/cli/README.md): `av-wrf` CLI entrypoint and sole

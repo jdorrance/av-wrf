@@ -13,6 +13,7 @@ import numpy.typing as npt
 from av_wrf.contracts import DomainProfile, ScienceProfile, format_iso_utc, parse_iso_utc
 from av_wrf.core import (
     computational_grid_origin_xy_m,
+    lambert_grid_to_earth_trig,
     lambert_xy_m_to_latlon,
     validate_solver_znw,
     validate_wrfinput_columns,
@@ -23,6 +24,34 @@ if TYPE_CHECKING:
 
 NC_FLOAT_FILL_THRESHOLD = 1.0e30
 GRID_COORD_TOL_DEG = 5.0e-4
+_WPS_FIELD_LIMITS = {
+    "SM": (0.0, 1.0),
+    "SOILM": (0.0, 1.0),
+    "SPECHUMD": (0.0, math.nextafter(1.0, 0.0)),
+}
+_WPS_FIELD_FLAGS = {"SOIL_LEVELS": "FLAG_SOIL_LEVELS", "SPECHUMD": "FLAG_SH"}
+
+
+def verify_wps_fields(ds: netCDF4.Dataset, path: Path, fields: tuple[str, ...]) -> None:
+    """Check required WPS fields, WRF activation flags, and physical value bounds."""
+    import netCDF4
+
+    for name in fields:
+        var = ds.variables.get(name)
+        if not isinstance(var, netCDF4.Variable):
+            raise ValueError(f"Missing required WPS field {name} in {path}")
+        # real.exe uses FLAG_SH and converts specific humidity as q / (1 - q).
+        # https://github.com/wrf-model/WRF/blob/v4.8.0/dyn_em/module_initialize_real.F
+        flag = _WPS_FIELD_FLAGS.get(name)
+        if flag is not None and getattr(ds, flag, 0) != 1:
+            raise ValueError(f"Missing WPS {flag}=1 in {path}")
+        values = var[:]
+        lo, hi = _WPS_FIELD_LIMITS.get(name, (-1e19, 1e19))
+        if (
+            np.ma.is_masked(values)
+            or not lo <= float(np.min(values)) <= float(np.max(values)) <= hi
+        ):
+            raise ValueError(f"Invalid values in WPS field {name} in {path}")
 
 
 def verify_local_wrf_nc(nc_path: Path) -> str:
@@ -194,14 +223,24 @@ def verify_grid_against_domain(
     return xlong
 
 
-def _southern_lambert_sine(
-    sine: npt.NDArray[np.float32], xlong: npt.NDArray[np.float32], stand_lon: float
-) -> npt.NDArray[np.float32]:
-    # WPS get_rotang uses a positive cone in both hemispheres. The signed southern cone
-    # gives a grid-to-Earth sine with the sign of the wrapped longitude offset.
+def rotation_sine_needs_flip(
+    domain: DomainProfile,
+    longitude: npt.NDArray[np.float32],
+    cosine: npt.NDArray[np.float32],
+    sine: npt.NDArray[np.float32],
+    label: str,
+) -> bool:
+    """Validate both coefficients and identify the legacy unsigned WPS cone."""
+    expected_cos, expected_sin = lambert_grid_to_earth_trig(domain, longitude)
+    if not np.allclose(cosine, expected_cos, rtol=0.0, atol=1e-5):
+        raise ValueError(f"{label}: COSALPHA disagrees with Lambert convergence")
+    if np.allclose(sine, expected_sin, rtol=0.0, atol=1e-5):
+        return False
+    # WPS get_rotang computes an unsigned cone in both hemispheres.
     # https://github.com/wrf-model/WPS/blob/v4.7.0/geogrid/src/process_tile_module.F#L1873-L1895
-    dlon = (xlong.astype(np.float64) - stand_lon + 180.0) % 360.0 - 180.0
-    return np.copysign(sine, dlon, dtype=np.float32, casting="same_kind")
+    if domain.std_parallel_1_deg < 0.0 and np.allclose(sine, -expected_sin, rtol=0.0, atol=1e-5):
+        return True
+    raise ValueError(f"{label}: SINALPHA disagrees with Lambert convergence")
 
 
 def check_geogrid_rotation(
@@ -212,9 +251,7 @@ def check_geogrid_rotation(
     *,
     repair: bool = False,
 ) -> None:
-    """Check southern WPS sine signs or correct a newly generated writable geo_em."""
-    if domain.std_parallel_1_deg >= 0.0:
-        return
+    """Check WPS coefficients and correct the southern sine on writable geo_em."""
     ny, nx = xlong.shape
     variables = ds.variables
     for suffix, longitude in (
@@ -224,13 +261,13 @@ def check_geogrid_rotation(
     ):
         name = "SINALPHA" + suffix
         sine = extract_clean_f32_nc(variables, nc_path, name, 0, longitude.shape)
-        corrected = _southern_lambert_sine(sine, longitude, domain.central_meridian_deg)
-        if not np.array_equal(sine, corrected):
+        cosine = extract_clean_f32_nc(variables, nc_path, "COSALPHA" + suffix, 0, longitude.shape)
+        if rotation_sine_needs_flip(domain, longitude, cosine, sine, str(nc_path)):
             if not repair:
                 raise ValueError(
                     f"{nc_path}: incorrect southern Lambert {name}; rerun `av-wrf geog`"
                 )
-            variables[name][0] = corrected
+            variables[name][0] = -sine
 
 
 def verify_wrfout_grid_against_domain(

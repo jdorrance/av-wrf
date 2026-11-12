@@ -125,9 +125,7 @@ def _stage_attempt_with_t2(
 
 class TestPublishRecoveryAndConcurrency(unittest.TestCase):
     def setUp(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.cfg = self.root / "cfg"
         self.prod_id = stage_sparse_config(ROOT / "config", self.cfg)
         self.bundle = load_bundle(self.cfg, self.prod_id)
@@ -243,10 +241,12 @@ class TestPublishRecoveryAndConcurrency(unittest.TestCase):
         rec2 = promote(dst2, prune=True)
         self.assertEqual(rec1, rec2)
         self.assertFalse(stage_path.exists())
+        self.assertEqual(promote(dst2, prune=True), rec2)
+        with self.assertRaisesRegex(FileNotFoundError, "Missing post_manifest.json"):
+            promote(LocalFileStore(self.root / "dst3"), prune=False)
         diag_raw = dst2.get_bytes(f"upstream/{b.product.model_id}/{part}/_diagnostics.json")
         assert diag_raw is not None
-        diag = DiagnosticsReceipt.from_doc(json.loads(diag_raw.decode("utf-8")))
-        self.assertGreaterEqual(diag.max_cfl, 0.0)
+        self.assertGreaterEqual(DiagnosticsReceipt.from_doc(json.loads(diag_raw)).max_cfl, 0.0)
 
         wrong_part = f"20261113/{part.split('/')[1]}"
         dst2.put_if_absent(
@@ -310,14 +310,14 @@ class TestPublishRecoveryAndConcurrency(unittest.TestCase):
         origin = f"2026-11-12T{b.product.publish_origin_hour_utc:02d}:00:00Z"
         part = _stage_attempt_with_t2(self.cfg, stage, b, origin, attempt_id, 290.0)
         stage_prefix = attempt_stage_prefix(prod_id, part, attempt_id)
-        shard = "temp_2m_k/c/0/0/0"
+        shard = "pressure_pa/c/0/0/0/0"
         shard_file = root / "stage" / stage_prefix / "forecast.zarr" / shard
         valid_shard = shard_file.read_bytes()
         corrupt_shard = bytes([valid_shard[0] ^ 1]) + valid_shard[1:]
         shard_file.write_bytes(corrupt_shard)
-        manifest_file = root / "stage" / post_manifest_key(prod_id, part, attempt_id)
-        valid_manifest = manifest_file.read_bytes()
-        corrupt_manifest = json.loads(valid_manifest)
+        manifest_key = post_manifest_key(prod_id, part, attempt_id)
+        manifest_file = root / "stage" / manifest_key
+        corrupt_manifest = json.loads(manifest_file.read_bytes())
         corrupt_manifest["shard_sha256s"] = [
             [key, sha256_hex(corrupt_shard) if key == shard else sha]
             for key, sha in corrupt_manifest["shard_sha256s"]
@@ -338,13 +338,13 @@ class TestPublishRecoveryAndConcurrency(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Corrupt Zstd payload"):
             publish()
         pub_root = f"upstream/{b.product.model_id}/{part}"
-        self.assertIsNotNone(dst.get_bytes(f"{pub_root}/forecast.zarr/zarr.json"))
+        early_key = f"{pub_root}/forecast.zarr/temp_2m_k/c/0/0/0"
+        early_shard = dst.get_bytes(early_key)
+        self.assertIsNotNone(early_shard)
         self.assertIsNone(dst.get_bytes(f"{pub_root}/_ready.json"))
-        shard_file.write_bytes(valid_shard)
-        manifest_file.write_bytes(valid_manifest)
+        stage.delete_prefix(manifest_key)
+        stage.delete_prefix(stage_prefix)
+        _stage_attempt_with_t2(self.cfg, stage, b, origin, attempt_id, 292.0)
         publish()
+        self.assertNotEqual(dst.get_bytes(early_key), early_shard)
         self.assertIsNotNone(dst.get_bytes(f"{pub_root}/_ready.json"))
-
-
-if __name__ == "__main__":
-    unittest.main()

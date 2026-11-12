@@ -1,8 +1,4 @@
-"""Pure float64 spherical Lambert Conformal projection, destaggering, and sponge cropping.
-
-WPS Lambert projection: https://github.com/wrf-model/WPS/blob/v4.7.0/geogrid/src/module_map_utils.F
-WRF staggering: https://www2.mmm.ucar.edu/wrf/users/docs/technote/v4_technote.pdf (Sec. 3.2)
-"""
+"""WPS spherical Lambert geometry, mass-grid cropping, and destaggering."""
 
 from __future__ import annotations
 
@@ -13,6 +9,7 @@ import numpy as np
 import numpy.typing as npt
 
 from av_wrf.contracts import (
+    WRF_SPHERE_RADIUS_M,
     CompBucket2D,
     CompMass2D,
     CompStagX3D,
@@ -37,7 +34,21 @@ def _to_f32_array(arr: npt.NDArray[np.float32]) -> array[float]:
 
 
 def validate_domain_profile(domain: DomainProfile) -> None:
-    """Enforce project real-domain sizing policy (>= 100x100 computational mass cells)."""
+    """Enforce the WPS Lambert coordinate and computational domain limits."""
+    # WPS geogrid passes one Lambert spacing and uses its default spherical radius.
+    # https://github.com/wrf-model/WPS/blob/v4.7.0/geogrid/src/llxy_module.F#L340-L389
+    if domain.dx_m != domain.dy_m:
+        raise ValueError("WPS Lambert grid spacing must be equal in both directions")
+    if domain.earth_radius_m != WRF_SPHERE_RADIUS_M:
+        raise ValueError(f"WPS Lambert Earth radius must be {WRF_SPHERE_RADIUS_M:.0f} m")
+    if not (abs(domain.center_lon_deg) <= 180.0 and abs(domain.central_meridian_deg) <= 180.0):
+        raise ValueError("Lambert longitudes must lie in [-180, 180] degrees")
+    p1, p2 = domain.std_parallel_1_deg, domain.std_parallel_2_deg
+    # WPS uses one hemisphere (selected by TRUELAT1) for both standard parallels.
+    # https://github.com/wrf-model/WPS/blob/v4.7.0/geogrid/src/module_map_utils.F#L1124-L1157
+    if not (abs(domain.center_lat_deg) < 90.0 and max(abs(p1), abs(p2)) < 90.0 and p1 * p2 > 0):
+        raise ValueError("WPS Lambert standard parallels must share a hemisphere between the poles")
+    _cone_constants(p1, p2, domain.center_lat_deg, domain.earth_radius_m)
     comp_nj, comp_ni = domain.e_sn - 1, domain.e_we - 1
     if comp_ni < MIN_DOMAIN_MASS_CELLS or comp_nj < MIN_DOMAIN_MASS_CELLS:
         raise ValueError(
@@ -51,18 +62,29 @@ def _wrap_lon_rad(delta_rad: float) -> float:
     return (delta_rad + math.pi) % (2.0 * math.pi) - math.pi
 
 
+def _effective_second_parallel(p1: float, p2: float) -> float:
+    # WPS lc_cone selects tangent geometry using default REAL arithmetic.
+    # https://github.com/wrf-model/WPS/blob/v4.7.0/geogrid/src/module_map_utils.F#L1130-L1157
+    return p1 if abs(np.float32(p1) - np.float32(p2)) <= np.float32(0.1) else p2
+
+
 def _cone_constants(
     std_lat1_deg: float, std_lat2_deg: float, origin_lat_deg: float, radius_m: float
 ) -> tuple[float, float, float]:
-    phi1, phi2 = math.radians(std_lat1_deg), math.radians(std_lat2_deg)
+    if not all(-90.0 < lat < 90.0 for lat in (std_lat1_deg, std_lat2_deg, origin_lat_deg)):
+        raise ValueError("Lambert projection latitudes must lie between the poles")
+    phi1 = math.radians(std_lat1_deg)
+    phi2 = math.radians(_effective_second_parallel(std_lat1_deg, std_lat2_deg))
     phi0 = math.radians(origin_lat_deg)
     t1, t2 = math.tan(0.25 * math.pi + 0.5 * phi1), math.tan(0.25 * math.pi + 0.5 * phi2)
     t0 = math.tan(0.25 * math.pi + 0.5 * phi0)
     n = (
         math.sin(phi1)
-        if abs(phi1 - phi2) < 1e-12
+        if phi1 == phi2
         else math.log(math.cos(phi1) / math.cos(phi2)) / math.log(t2 / t1)
     )
+    if abs(n) < 1e-12:
+        raise ValueError("Lambert standard parallels define a zero cone")
     f_const = (math.cos(phi1) * (t1**n)) / n
     return n, f_const, radius_m * f_const / (t0**n)
 
@@ -108,19 +130,17 @@ def lambert_xy_m_to_latlon(
     return math.degrees(lat_rad), math.degrees(lon_rad)
 
 
-def lambert_convergence_trig(
-    lon_deg: float,
-    *,
-    central_meridian_deg: float,
-    std_parallel_1_deg: float,
-    std_parallel_2_deg: float,
-    origin_lat_deg: float,
-    radius_m: float,
-) -> tuple[float, float]:
-    """Return (cos(theta), sin(theta)) for theta = n*(lon - stand_lon)."""
-    n, _, _ = _cone_constants(std_parallel_1_deg, std_parallel_2_deg, origin_lat_deg, radius_m)
-    theta = n * _wrap_lon_rad(math.radians(lon_deg - central_meridian_deg))
-    return math.cos(theta), math.sin(theta)
+def lambert_grid_to_earth_trig(
+    domain: DomainProfile, longitude: npt.NDArray[np.float32]
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """Return grid-to-Earth cosine and sine using the signed Lambert cone."""
+    p1, p2 = domain.std_parallel_1_deg, domain.std_parallel_2_deg
+    n, _, _ = _cone_constants(p1, p2, domain.center_lat_deg, domain.earth_radius_m)
+    # Preserve the sign of a 180° tie as in WPS get_rotang.
+    delta = domain.central_meridian_deg - longitude.astype(np.float64)
+    delta -= 360.0 * (delta > 180.0) - 360.0 * (delta < -180.0)
+    angle = np.deg2rad(n * delta)
+    return np.cos(angle), np.sin(angle)
 
 
 def lambert_map_scale(
@@ -181,6 +201,8 @@ def published_grid_origin_xy_m(domain: DomainProfile) -> tuple[float, float]:
 def published_crs_wkt(domain: DomainProfile) -> str:
     """Return OGC WKT spherical Lambert Conformal CRS string for GeoZarr readers."""
     r = domain.earth_radius_m
+    p1 = domain.std_parallel_1_deg
+    p2 = _effective_second_parallel(p1, domain.std_parallel_2_deg)
     return (
         'PROJCS["WRF_Lambert_Conformal_Spherical",'
         f'GEOGCS["GCS_WRF_Sphere",DATUM["D_Sphere",SPHEROID["Sphere",{r:.1f},0.0]],'
@@ -188,8 +210,8 @@ def published_crs_wkt(domain: DomainProfile) -> str:
         'PROJECTION["Lambert_Conformal_Conic_2SP"],'
         f'PARAMETER["Central_Meridian",{domain.central_meridian_deg}],'
         f'PARAMETER["Latitude_Of_Origin",{domain.center_lat_deg}],'
-        f'PARAMETER["Standard_Parallel_1",{domain.std_parallel_1_deg}],'
-        f'PARAMETER["Standard_Parallel_2",{domain.std_parallel_2_deg}],'
+        f'PARAMETER["Standard_Parallel_1",{p1}],'
+        f'PARAMETER["Standard_Parallel_2",{p2}],'
         'UNIT["Meter",1.0]]'
     )
 
@@ -198,6 +220,7 @@ def published_lambert_grid_metadata(domain: DomainProfile) -> dict[str, int | fl
     """Build exact windy-av-layer LambertConformalGrid descriptor for Published Grid."""
     nj, ni = published_grid_shape(domain)
     x0_m, y0_m = published_grid_origin_xy_m(domain)
+    p1 = domain.std_parallel_1_deg
     return {
         "kind": "lambert-conformal",
         "width": ni,
@@ -205,8 +228,8 @@ def published_lambert_grid_metadata(domain: DomainProfile) -> dict[str, int | fl
         "earthRadiusM": domain.earth_radius_m,
         "centralMeridianDeg": domain.central_meridian_deg,
         "latitudeOfOriginDeg": domain.center_lat_deg,
-        "standardParallel1Deg": domain.std_parallel_1_deg,
-        "standardParallel2Deg": domain.std_parallel_2_deg,
+        "standardParallel1Deg": p1,
+        "standardParallel2Deg": _effective_second_parallel(p1, domain.std_parallel_2_deg),
         "x0M": x0_m,
         "y0M": y0_m,
         "dxM": domain.dx_m,

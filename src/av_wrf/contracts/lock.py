@@ -77,6 +77,7 @@ class BuildManifest:
     patch_sha256s: tuple[tuple[str, str], ...]
     compiler_version: str
     mpi_version: str
+    jasper_git_sha: str | None = None
 
     def to_doc(self) -> dict[str, object]:
         return dataclasses.asdict(self)
@@ -90,6 +91,7 @@ class BuildManifest:
             req_pair_tuple(doc, "patch_sha256s"),
             req_str(doc, "compiler_version"),
             req_str(doc, "mpi_version"),
+            req_str(doc, "jasper_git_sha") if doc.get("jasper_git_sha") is not None else None,
         )
 
 

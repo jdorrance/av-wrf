@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from dataclasses import replace
+from math import isqrt
 from pathlib import Path
 
 from av_wrf.contracts import (
@@ -18,15 +19,13 @@ from av_wrf.contracts import (
 from av_wrf.core import (
     compile_wps_namelist_sections,
     compile_wrf_run_namelist,
-    computational_latlon_bounds,
-    parse_cycle_arg,
     published_grid_origin_xy_m,
     published_grid_shape,
     render_fortran_namelist,
     resolve_cycle_window,
 )
 from av_wrf.runner.bundle import LoadedBundle, _require_segment, load_bundle, validate_bundle
-from av_wrf.runner.mirrors import find_forcing_recipe, resolve_forcing_window
+from av_wrf.runner.mirrors import _forcing_subset, find_forcing_recipe
 from av_wrf.runner.store import ObjectStore, json_bytes, run_lock_key, sha256_file
 
 
@@ -63,18 +62,6 @@ def check_all_products(config_root: Path) -> tuple[ProductCheckSummary, ...]:
     if len({b.product.model_id for b in bundles}) != len(bundles):
         raise ValueError("Configured products must have distinct model_id publication namespaces")
     return tuple(_check_bundle(b) for b in bundles)
-
-
-def resolve_cli_cycle(
-    config_root: Path,
-    product_id: str,
-    raw_cycle: str,
-    *,
-    bundle: LoadedBundle | None = None,
-) -> tuple[str, str]:
-    """Resolve raw CLI --cycle string into (publish_origin_utc, cycle_partition)."""
-    b = load_bundle(config_root, product_id) if bundle is None else bundle
-    return parse_cycle_arg(raw_cycle, b.product)
 
 
 def plan_product_cycle(
@@ -123,6 +110,11 @@ def _producer_sha256() -> str:
     return digest.hexdigest()
 
 
+def _verify_producer_sha256(lock: RunLock) -> None:
+    if lock.producer_sha256 is not None and lock.producer_sha256 != _producer_sha256():
+        raise ValueError("Producer code SHA-256 drifted from frozen RunLock")
+
+
 def _build_run_lock(
     b: LoadedBundle,
     window: CycleWindow,
@@ -134,6 +126,15 @@ def _build_run_lock(
 ) -> RunLock:
     if isinstance(mpi_ranks, bool) or mpi_ranks < 1:
         raise ValueError("RunLock mpi_ranks must be >= 1")
+    # WRF chooses the closest factor pair, with the smaller factor in X.
+    # https://github.com/wrf-model/WRF/blob/v4.8.0/external/RSL_LITE/module_dm.F#L90-L161
+    # https://github.com/wrf-model/WRF/blob/v4.8.0/share/module_check_a_mundo.F#L2773-L2799
+    max_x, max_y = b.domain.e_we // 10, b.domain.e_sn // 10
+    if mpi_ranks > max_x * max_y:
+        raise ValueError("RunLock mpi_ranks exceeds WRF's 10-cell minimum patch width")
+    ranks_x = next(x for x in range(isqrt(mpi_ranks), 0, -1) if mpi_ranks % x == 0)
+    if ranks_x > max_x or mpi_ranks // ranks_x > max_y:
+        raise ValueError("RunLock mpi_ranks creates a WRF patch narrower than 10 cells")
     if build_manifest.oci_digest != "host-dev-unpinned" and (
         not re.fullmatch(r"sha256:[0-9a-f]{64}", build_manifest.oci_digest)
         or not re.fullmatch(r"[0-9a-f]{64}", geog_bundle_sha256)
@@ -222,7 +223,7 @@ def prep_cycle_namelists(
     b = load_bundle(config_root, product_id) if bundle is None else bundle
     lk = load_run_lock(store, product_id, cycle_partition, attempt_id, bundle=b)
     source = b.primary_source
-    recipe, cycle, fhrs = resolve_forcing_window(lk, source, domain=b.domain)
+    _, _, subset = _forcing_subset(lk.product_id, lk, source, b.domain)
     work_dir.mkdir(parents=True, exist_ok=True)
     wps_path, wrf_path = work_dir / "namelist.wps", work_dir / "namelist.input"
     wps_path.write_text(
@@ -233,17 +234,5 @@ def prep_cycle_namelists(
         render_fortran_namelist(compile_wrf_run_namelist(b.domain, b.science, lk, source)),
         encoding="utf-8",
     )
-    subset = {
-        "product_id": lk.product_id,
-        "cycle_partition": lk.cycle_partition,
-        "forcing_profile_id": lk.forcing_profile_id,
-        "forcing_cycle_utc": lk.forcing_cycle_utc,
-        "vtable_name": source.vtable_name,
-        "mirrors": source.mirrors,
-        "interval_seconds": source.interval_seconds,
-        "bbox_wsen_deg": computational_latlon_bounds(b.domain, snap_deg=source.grid_spacing_deg),
-        "forecast_hours": fhrs,
-        "file_keys": dict(recipe.file_keys(cycle, fhrs)),
-    }
     (work_dir / "forcing_subset.json").write_bytes(json_bytes(subset))
     return wps_path, wrf_path

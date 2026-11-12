@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from av_wrf.core import parse_cycle_arg
 from av_wrf.runner.bundle import (
     LoadedBundle,
     load_bundle,
@@ -34,7 +35,6 @@ from av_wrf.runner.stages import (
     load_run_lock,
     plan_product_cycle,
     prep_cycle_namelists,
-    resolve_cli_cycle,
 )
 from av_wrf.runner.store import (
     LocalFileStore,
@@ -70,6 +70,7 @@ __all__ = [
     "load_run_lock",
     "open_store",
     "parse_build_manifest",
+    "parse_cycle_arg",
     "parse_declarative_yaml",
     "plan_product_cycle",
     "post_cycle_from_inputs",
@@ -80,7 +81,6 @@ __all__ = [
     "published_cycle_prefix",
     "put_idempotent",
     "reconcile_dispatch",
-    "resolve_cli_cycle",
     "run_geogrid",
     "run_lock_key",
     "run_wrf_cycle",

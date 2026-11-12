@@ -17,7 +17,7 @@ RUN --mount=from=uv,source=/uv,target=/bin/uv \
 RUN --mount=from=uv,source=/uv,target=/bin/uv \
     --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,target=/project \
-    uv sync --project /project --locked --no-dev --no-editable
+    uv sync --project /project --locked --no-dev --no-editable --reinstall-package av-wrf
 COPY config/ config/
 
 FROM debian:bookworm-slim AS solver-build
@@ -31,18 +31,15 @@ ENV NETCDF=/opt/netcdf WRFIO_NCD_LARGE_FILE_SUPPORT=1 \
     JASPERLIB=/opt/jasper/lib JASPERINC=/opt/jasper/include
 WORKDIR /build
 ARG JOBS=8
-ARG JASPER_TAG=version-1.900.29
 RUN --mount=type=bind,source=docker/build-jasper.sh,target=/tmp/build-jasper.sh \
-    bash /tmp/build-jasper.sh "${JASPER_TAG}" "${JOBS}"
+    bash /tmp/build-jasper.sh "${JOBS}"
 
 COPY docker/patches/ patches/
-ARG WRF_TAG=v4.8.0
 RUN --mount=type=bind,source=docker/build-wrf.sh,target=/tmp/build-wrf.sh \
-    bash /tmp/build-wrf.sh "${WRF_TAG}" "${JOBS}"
+    bash /tmp/build-wrf.sh "${JOBS}"
 
-ARG WPS_TAG=v4.7.0
 RUN --mount=type=bind,source=docker/build-wps.sh,target=/tmp/build-wps.sh \
-    bash /tmp/build-wps.sh "${WPS_TAG}"
+    bash /tmp/build-wps.sh
 RUN --mount=type=bind,source=docker/package-solver.sh,target=/tmp/package-solver.sh \
     --mount=type=bind,source=docker/write-build-manifest.py,target=/tmp/write-build-manifest.py \
     bash /tmp/package-solver.sh

@@ -61,6 +61,10 @@ class TestCheckRepoHarness(unittest.TestCase):
                 + f"from av_wrf.runner import LocalFileStore  {ti_comment}\n"
                 + f"{long_line}\n_ = list(zip([1], [2]))\n"
                 + "@dataclass\nclass BadMutable:\n    x: int\n"
+                + "import abc, builtins, dataclasses, typing\n"
+                + "@dataclasses.dataclass\nclass QualifiedMutable:\n    value: typing.Any\n"
+                + "class Abstract(abc.ABC):\n    pass\n"
+                + "_ = builtins.open('data')\n"
                 + "# pmtiles\n_ = os.environ\n_ = eval('1')\n",
                 encoding="utf-8",
             )
@@ -71,6 +75,10 @@ class TestCheckRepoHarness(unittest.TestCase):
                 "exceeds 100 cols",
                 "B905",
                 "frozen=True",
+                "QualifiedMutable",
+                "'Any' forbidden",
+                "'ABC' forbidden",
+                "open() forbidden",
                 "type-ignore",
                 "eval",
                 "environ",

@@ -3,16 +3,8 @@ name: images
 on:
   pull_request:
     paths:
-      - 'src/av_wrf/contracts/config*.py'
-      - 'src/av_wrf/core/grid.py'
-      - 'src/av_wrf/core/namelist.py'
-      - 'src/av_wrf/core/schedule.py'
-      - 'src/av_wrf/runner/bundle.py'
-      - 'src/av_wrf/runner/forcing_*.py'
-      - 'src/av_wrf/runner/grib.py'
-      - 'src/av_wrf/runner/mirrors.py'
-      - 'src/av_wrf/runner/solver_exec.py'
-      - 'src/av_wrf/runner/stages.py'
+      - 'src/av_wrf/**'
+      - 'scripts/**'
       - 'config/**'
       - 'docker/**'
       - 'pyproject.toml'
@@ -21,16 +13,8 @@ on:
   push:
     branches: [main]
     paths:
-      - 'src/av_wrf/contracts/config*.py'
-      - 'src/av_wrf/core/grid.py'
-      - 'src/av_wrf/core/namelist.py'
-      - 'src/av_wrf/core/schedule.py'
-      - 'src/av_wrf/runner/bundle.py'
-      - 'src/av_wrf/runner/forcing_*.py'
-      - 'src/av_wrf/runner/grib.py'
-      - 'src/av_wrf/runner/mirrors.py'
-      - 'src/av_wrf/runner/solver_exec.py'
-      - 'src/av_wrf/runner/stages.py'
+      - 'src/av_wrf/**'
+      - 'scripts/**'
       - 'config/**'
       - 'docker/**'
       - 'pyproject.toml'

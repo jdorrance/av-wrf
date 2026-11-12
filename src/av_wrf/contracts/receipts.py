@@ -48,15 +48,18 @@ def req_pair_tuple(doc: Mapping[str, object], key: str) -> tuple[tuple[str, str]
     val = doc.get(key)
     if not isinstance(val, (list, tuple)):
         raise ValueError(f"Expected pair list for '{key}'")
-    pairs: list[tuple[str, str]] = []
-    for item in val:
-        if not isinstance(item, (list, tuple)) or len(item) != 2:
-            raise ValueError(f"Invalid [key, sha256] pair in '{key}'")
-        first, second = item[0], item[1]
-        if not isinstance(first, str) or not isinstance(second, str):
-            raise ValueError(f"Invalid [key, sha256] pair in '{key}'")
-        pairs.append((first, second))
-    return tuple(pairs)
+    return tuple(_sha_pair(item, key) for item in val)
+
+
+def _sha_pair(item: object, key: str) -> tuple[str, str]:
+    if (
+        not isinstance(item, (list, tuple))
+        or len(item) != 2
+        or not isinstance(item[0], str)
+        or not isinstance(item[1], str)
+    ):
+        raise ValueError(f"Invalid [key, sha256] pair in '{key}'")
+    return item[0], item[1]
 
 
 @dataclass(frozen=True)
@@ -71,9 +74,13 @@ class ForcingManifest:
     interval_seconds: int
     forecast_hours: tuple[int, ...]
     file_sha256s: tuple[tuple[str, str], ...]
+    acquisition_inventory: tuple[str, str] | None = None
 
     def to_doc(self) -> dict[str, object]:
-        return dataclasses.asdict(self)
+        doc = dataclasses.asdict(self)
+        if self.acquisition_inventory is None:
+            del doc["acquisition_inventory"]
+        return doc
 
     @classmethod
     def from_doc(cls, doc: Mapping[str, object]) -> ForcingManifest:
@@ -86,6 +93,9 @@ class ForcingManifest:
             req_int(doc, "interval_seconds"),
             req_int_tuple(doc, "forecast_hours"),
             req_pair_tuple(doc, "file_sha256s"),
+            _sha_pair(doc["acquisition_inventory"], "acquisition_inventory")
+            if "acquisition_inventory" in doc
+            else None,
         )
 
 
@@ -101,9 +111,13 @@ class SolverReceipt:
     geog_sha256: str
     forcing_sha256s: tuple[tuple[str, str], ...]
     wrfout_sha256s: tuple[tuple[str, str], ...]
+    acquisition_inventory_sha256: str | None = None
 
     def to_doc(self) -> dict[str, object]:
-        return dataclasses.asdict(self)
+        doc = dataclasses.asdict(self)
+        if self.acquisition_inventory_sha256 is None:
+            del doc["acquisition_inventory_sha256"]
+        return doc
 
     @classmethod
     def from_doc(cls, doc: Mapping[str, object]) -> SolverReceipt:
@@ -116,6 +130,9 @@ class SolverReceipt:
             req_str(doc, "geog_sha256"),
             req_pair_tuple(doc, "forcing_sha256s"),
             req_pair_tuple(doc, "wrfout_sha256s"),
+            req_str(doc, "acquisition_inventory_sha256")
+            if "acquisition_inventory_sha256" in doc
+            else None,
         )
 
 

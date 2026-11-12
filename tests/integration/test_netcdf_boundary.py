@@ -29,6 +29,7 @@ from av_wrf.core import (  # noqa: E402
     build_accum_baseline,
     computational_grid_origin_xy_m,
     estimate_auto_levels_agl_m,
+    lambert_grid_to_earth_trig,
     lambert_xy_m_to_latlon,
     post_frame,
 )
@@ -113,10 +114,12 @@ def _write_real_wrfout(
             )
         ds.createVariable("XLAT", "f4", ("Time", "south_north", "west_east"))[:] = xlat
         ds.createVariable("XLONG", "f4", ("Time", "south_north", "west_east"))[:] = xlong
+        dims_2d = ("Time", "south_north", "west_east")
+        cos_alpha, sin_alpha = lambert_grid_to_earth_trig(domain, xlong)
+        ds.createVariable("COSALPHA", "f4", dims_2d)[:] = cos_alpha
+        ds.createVariable("SINALPHA", "f4", dims_2d)[:] = sin_alpha
         vals_2d = {
             "HGT": 1200.0,
-            "COSALPHA": 1.0,
-            "SINALPHA": 0.0,
             "PSFC": 88_000.0,
             "T2": 295.0,
             "Q2": 0.007,
@@ -176,6 +179,22 @@ class TestRealNetcdfBoundary(unittest.TestCase):
                     post_frame(base, raw, dom, sci)
                 slab.buf[idx] = valid
 
+            for name, field_slab, invalid in (
+                ("temp_2m_k", raw.t2_k, 334.0),
+                ("temp_k", raw.theta_pert_k, 200.0),
+                ("surface_pressure_pa", raw.psfc_pa, 112_000.0),
+            ):
+                valid = field_slab.buf[idx]
+                field_slab.buf[idx] = invalid
+                with self.assertRaisesRegex(ValueError, f"{name} outside consumer bounds"):
+                    post_frame(base, raw, dom, sci)
+                field_slab.buf[idx] = valid
+            raw.psfc_pa.buf[idx] = float(
+                np.nextafter(np.float32(raw.pb_pa.buf[idx]), np.float32(np.inf))
+            )
+            with self.assertRaisesRegex(ValueError, "Bit-groomed 3D column pressure"):
+                post_frame(base, raw, dom, sci)
+
     def test_southern_lambert_rotation_sign_across_antimeridian(self) -> None:
         dom, sci = _small_domain_and_science()
         dom = dataclasses.replace(
@@ -190,13 +209,10 @@ class TestRealNetcdfBoundary(unittest.TestCase):
             path = Path(tmp) / "southern.nc"
             _write_real_wrfout(path, dom, "2026-11-12_01:00:00")
             with netCDF4.Dataset(str(path), mode="a") as ds:
-                lon = np.asarray(ds.variables["XLONG"][:], np.float64)
-                offset = (lon - dom.central_meridian_deg + 180.0) % 360.0 - 180.0
-                theta = np.deg2rad(0.64 * offset)
-                expected = np.sin(theta).astype(np.float32)
+                lon = np.asarray(ds.variables["XLONG"][:], np.float32)
+                expected = np.asarray(ds.variables["SINALPHA"][:], np.float32)
                 self.assertLess(lon[0, 0, -1], 0.0)
                 self.assertGreater(expected[0, 0, -1], 0.0)
-                ds.variables["COSALPHA"][:] = np.cos(theta)
                 ds.variables["SINALPHA"][:] = -expected
             legacy = read_wrfout_step_nc(path, dom, sci)
             np.testing.assert_array_equal(np.asarray(legacy.sin_alpha.buf), expected.ravel())
@@ -218,12 +234,20 @@ class TestRealNetcdfBoundary(unittest.TestCase):
                     ds.createVariable(f"SINALPHA{suffix}", "f4", dims)[:] = np.pad(
                         -expected, pad, mode="edge"
                     )
+                    ds.createVariable(f"COSALPHA{suffix}", "f4", dims)[:] = np.pad(
+                        ds.variables["COSALPHA"][:], pad, mode="edge"
+                    )
                 longitude = lon[0].astype(np.float32)
                 with self.assertRaisesRegex(ValueError, "incorrect southern Lambert SINALPHA"):
                     check_geogrid_rotation(ds, path, dom, longitude)
                 check_geogrid_rotation(ds, path, dom, longitude, repair=True)
             with netCDF4.Dataset(str(path)) as ds:
                 check_geogrid_rotation(ds, path, dom, longitude)
+
+            with netCDF4.Dataset(str(path), mode="a") as ds:
+                ds.variables["COSALPHA"][0, 4, 7] = 0.0
+            with self.assertRaisesRegex(ValueError, "COSALPHA disagrees with Lambert convergence"):
+                read_wrfout_step_nc(path, dom, sci)
 
     def test_low_cloud_uses_native_levels_above_exported_column(self) -> None:
         dom, sci = _small_domain_and_science()
@@ -261,6 +285,17 @@ class TestRealNetcdfBoundary(unittest.TestCase):
             _write_real_wrfout(td / "shift.nc", dom, "2026-11-12_01:00:00", shift_lat_deg=0.0135)
             with self.assertRaisesRegex(ValueError, "XLAT/XLONG"):
                 read_wrfout_step_nc(td / "shift.nc", dom, sci)
+
+    def test_initialized_profile_uses_domain_gap_limit(self) -> None:
+        dom, sci = _small_domain_and_science()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "wrfinput_d01"
+            _write_real_wrfout(path, dom, "2026-11-12_00:00:00")
+            validate_wrfinput_nc(path, dom, sci)
+            with netCDF4.Dataset(str(path), mode="a") as ds:
+                ds.variables["PHB"][0, dom.exported_levels_k, :, :] += 600.0 * 9.81
+            with self.assertRaisesRegex(ValueError, rf"violates \(0, {dom.max_dz_m}\] m"):
+                validate_wrfinput_nc(path, dom, sci)
 
     def test_sparse_tail_uses_full_accumulation_and_endpoint_gust(self) -> None:
         dom, sci = _small_domain_and_science()

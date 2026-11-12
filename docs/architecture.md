@@ -54,21 +54,23 @@ flowchart TB
 - [`src/av_wrf/runner/`](../src/av_wrf/runner/README.md): `store.py`
   (`ObjectStore`, `LocalFileStore`, `cycle_lock`, `get_with_token`,
   `sha256_file`), `stages.py` (`check`, `plan`, `prep`), `mirrors.py`
-  (forcing recipe registry and manifest verification), `forcing_gfs.py`
-  (GFS availability, acquisition and WPS inventory), `post.py`,
-  `publish.py` + `publish_verify.py` (exclusive cycle-locked promotion, paired
-  pressure checks, stage retention), `solver.py` + `solver_exec.py`, and
+  (forcing recipe registry and manifest verification), `forcing_gfs.py` and
+  `forcing_icon.py` (source availability, acquisition and WPS inventory), `post.py`,
+  `publish.py` + `publish_verify.py` (cycle-locked promotion, decoded column
+  admission, stage retention), `solver.py` + `solver_exec.py`, and
   `dispatch.py` (expiring-lease webhook delivery).
 - A storage adapter must provide opaque conditional-write tokens and exclusive
   cycle ownership through the ready commit. The implemented backend uses a
   shared filesystem. A remote adapter needs equivalent fencing or a consumer
   contract for committing an attempt-specific payload.
-- Local writes sync file contents before installation and directory entries
-  through the store root before returning. The filesystem supplies `flock`
-  exclusion and `fsync` persistence.
+- Local writes sync file contents and directory entries. Prefix deletion syncs
+  the surviving parent. Store-private lock files survive prefix replacement.
+  Before `_ready.json` commits, the staged manifest digest identifies which
+  attempt bytes own a partial promotion.
 - Published objects have independent storage from staged objects. Keep staging
   for replay to additional destinations. Pass `publish --prune-stage` on the
-  final promotion when no further replay needs the staged payload.
+  final promotion when no further replay needs the staged payload. Post,
+  promotion, and prune share an attempt lock acquired before the destination lock.
 - WRF boundary forcing enters through the GRIB recipe. A direct native model
   needs its own reader and grid mapping into published fields before reusing
   the Zarr and promotion path.

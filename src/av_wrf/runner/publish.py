@@ -14,6 +14,7 @@ from av_wrf.contracts import (
     ReadyReceipt,
     RunLock,
     StagedPostManifest,
+    parse_iso_utc,
 )
 from av_wrf.core import (
     is_cycle_live_fresh,
@@ -32,6 +33,7 @@ from av_wrf.runner.store import (
     post_manifest_key,
     published_cycle_prefix,
     put_idempotent,
+    sha256_hex,
     synthetic_cycle_prefix,
 )
 
@@ -43,6 +45,7 @@ def _advance_latest_pointer_with_retry(
 ) -> None:
     latest_key = f"upstream/{receipt.model_id}/latest.json"
     ready_key = f"{published_cycle_prefix(receipt.model_id, receipt.cycle_partition)}/_ready.json"
+    origin = parse_iso_utc(receipt.publish_origin_utc)
     next_payload = json_bytes(
         {
             "model_id": receipt.model_id,
@@ -57,11 +60,13 @@ def _advance_latest_pointer_with_retry(
         if not is_cycle_live_fresh(b.product, b.output, receipt.publish_origin_utc, now):
             return
         if current_raw is not None:
-            cur_doc = json.loads(current_raw.decode("utf-8"))
-            if (
-                receipt.publish_origin_utc < str(cur_doc["publish_origin_utc"])
-                or cur_doc.get("ready_key") == ready_key
-            ):
+            cur_doc = json.loads(current_raw)
+            current_origin = (
+                cur_doc.get("publish_origin_utc") if isinstance(cur_doc, dict) else None
+            )
+            if not isinstance(current_origin, str):
+                raise ValueError("Invalid publish origin in latest.json")
+            if origin < parse_iso_utc(current_origin) or cur_doc.get("ready_key") == ready_key:
                 return
         try:
             store.compare_and_swap(latest_key, next_payload, expected_tok)
@@ -101,6 +106,28 @@ def _check_existing_published_ready(
     return committed
 
 
+def _recover_published_ready(
+    store: ObjectStore, lock: RunLock, live_root: str, fixture_root: str, allow_synthetic: bool
+) -> tuple[ReadyReceipt, bool]:
+    candidates = ((live_root, False), (fixture_root, True))
+    conflict = None
+    for root, synthetic in candidates:
+        if synthetic and not allow_synthetic:
+            break
+        try:
+            receipt = _check_existing_published_ready(store, f"{root}/_ready.json", lock)
+        except FileExistsError as exc:
+            conflict = conflict or exc
+            continue
+        if receipt is not None:
+            return receipt, synthetic
+    if conflict is not None:
+        raise conflict
+    raise FileNotFoundError(
+        "Missing post_manifest.json; run `av-wrf post` to stage or restage this attempt"
+    )
+
+
 def _build_ready_receipt(
     lock: RunLock, pm: StagedPostManifest, b: LoadedBundle, window: CycleWindow, is_synth: bool
 ) -> ReadyReceipt:
@@ -137,6 +164,7 @@ def _promote_under_cycle_lock(
     stage_root: str,
     pub_root: str,
     pm: StagedPostManifest,
+    pm_sha256: str,
     b: LoadedBundle,
     window: CycleWindow,
     lock: RunLock,
@@ -149,7 +177,7 @@ def _promote_under_cycle_lock(
         if already is not None:
             return already
         owner_key = f"{pub_root}/_promotion_owner.json"
-        owner_doc = json_bytes({"attempt_id": lock.attempt_id})
+        owner_doc = json_bytes({"attempt_id": lock.attempt_id, "post_manifest_sha256": pm_sha256})
         prior_owner, owner_tok = dst_store.get_with_token(owner_key)
         if prior_owner != owner_doc:
             if prior_owner is not None:
@@ -188,39 +216,35 @@ def publish_cycle_receipt(
     b = load_bundle(config_root, product_id) if bundle is None else bundle
     lock = load_run_lock(stg, product_id, cycle_partition, attempt_id, bundle=b)
     stage_root = attempt_stage_prefix(product_id, cycle_partition, attempt_id)
-    pm_raw = stg.get_bytes(post_manifest_key(product_id, cycle_partition, attempt_id))
-    if pm_raw is None:
-        live_r = f"{published_cycle_prefix(lock.model_id, lock.cycle_partition)}/_ready.json"
-        fix_r = f"{synthetic_cycle_prefix(lock.model_id, lock.cycle_partition)}/_ready.json"
-        chk = fix_r if allow_synthetic and store.get_bytes(fix_r) else live_r
-        already = _check_existing_published_ready(store, chk, lock)
-        if already is not None:
-            if chk == live_r:
-                _advance_latest_pointer_with_retry(store, already, b, now_utc_iso)
-            return already
-        raise FileNotFoundError("Missing post_manifest.json; run `av-wrf post` before `publish`")
-
-    window = resolve_cycle_window(b.product, b.output, lock.publish_origin_utc)
-    pm = validate_post_manifest(json.loads(pm_raw.decode("utf-8")), b, window)
-    if pm.producer_sha256 != lock.producer_sha256:
-        raise ValueError("Staged producer SHA-256 differs from the RunLock")
-    is_synth = pm.execution_mode == "synthetic"
-    if is_synth and not allow_synthetic:
-        raise ValueError("Refusing to publish synthetic forecast to live upstream store")
-    if not is_synth:
-        verify_solver_receipt(stg, lock, None)
-    pub_root = (
-        synthetic_cycle_prefix(lock.model_id, lock.cycle_partition)
-        if is_synth
-        else published_cycle_prefix(lock.model_id, lock.cycle_partition)
-    )
-    receipt = _promote_under_cycle_lock(
-        stg, store, stage_root, pub_root, pm, b, window, lock, is_synth
-    )
-    if not is_synth:
-        _advance_latest_pointer_with_retry(store, receipt, b, now_utc_iso)
-    if prune_stage:
-        stg.delete_prefix(stage_root)
+    manifest_key = post_manifest_key(product_id, cycle_partition, attempt_id)
+    live_root = published_cycle_prefix(lock.model_id, lock.cycle_partition)
+    fixture_root = synthetic_cycle_prefix(lock.model_id, lock.cycle_partition)
+    # Acquire the attempt lock before any destination lock. Post uses the same attempt lock.
+    with stg.cycle_lock(stage_root):
+        pm_raw = stg.get_bytes(manifest_key)
+        if pm_raw is None:
+            receipt, is_synth = _recover_published_ready(
+                store, lock, live_root, fixture_root, allow_synthetic
+            )
+        else:
+            window = resolve_cycle_window(b.product, b.output, lock.publish_origin_utc)
+            pm = validate_post_manifest(json.loads(pm_raw), b, window)
+            if pm.producer_sha256 != lock.producer_sha256:
+                raise ValueError("Staged producer SHA-256 differs from the RunLock")
+            is_synth = pm.execution_mode == "synthetic"
+            if is_synth and not allow_synthetic:
+                raise ValueError("Refusing to publish synthetic forecast to live upstream store")
+            if not is_synth:
+                verify_solver_receipt(stg, lock, None)
+            pub_root = fixture_root if is_synth else live_root
+            receipt = _promote_under_cycle_lock(
+                stg, store, stage_root, pub_root, pm, sha256_hex(pm_raw), b, window, lock, is_synth
+            )
+        if not is_synth:
+            _advance_latest_pointer_with_retry(store, receipt, b, now_utc_iso)
+        if prune_stage:
+            stg.delete_prefix(manifest_key)
+            stg.delete_prefix(stage_root)
     return receipt
 
 

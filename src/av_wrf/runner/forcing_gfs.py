@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -10,7 +9,13 @@ from pathlib import Path
 from av_wrf.contracts import DomainProfile, ForcingProfile
 from av_wrf.core import computational_latlon_bounds
 from av_wrf.runner.forcing_recipe import ForcingRecipe
-from av_wrf.runner.grib import inspect_grib
+from av_wrf.runner.grib import (
+    GRIB_FIELD_KEYS,
+    GRIB_KEYS,
+    checked_grib_grid,
+    grib_number,
+    inspect_grib,
+)
 
 # GRIB2 codes from the WPS v4.7.0 Vtable.GFS and the NCEP GFS product inventory.
 # https://github.com/wrf-model/WPS/blob/v4.7.0/ungrib/Variable_Tables/Vtable.GFS
@@ -34,61 +39,7 @@ _SOIL = tuple(
     for top, bottom in ((0, 0.1), (0.1, 0.4), (0.4, 1), (1, 2))
 )
 _REQUIRED_SURFACE = frozenset((*_SURFACE, *_SOIL))
-_FIELD_KEYS = (
-    "discipline",
-    "parameterCategory",
-    "parameterNumber",
-    "typeOfFirstFixedSurface",
-    "level",
-    "bottomLevel",
-)
-_GRIB_KEYS = (
-    "edition,centre:i,generatingProcessIdentifier:i,productDefinitionTemplateNumber:i,"
-    "dataDate:i,dataTime:i,validityDate:i,validityTime:i,"
-    "discipline:i,parameterCategory:i,parameterNumber:i,typeOfFirstFixedSurface:i,level:d,"
-    "bottomLevel:d,typeOfLevel,gridType,md5Section3,offset:i,totalLength:i,packingType,"
-    "latitudeOfFirstGridPointInDegrees:d,latitudeOfLastGridPointInDegrees:d,"
-    "longitudeOfFirstGridPointInDegrees:d,longitudeOfLastGridPointInDegrees:d,"
-    "iDirectionIncrementInDegrees:d,jDirectionIncrementInDegrees:d,Ni:i,Nj:i"
-)
-
-
-def _number(row: Mapping[str, object], key: str) -> float:
-    value = row.get(key)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-        raise ValueError(f"Missing or invalid GRIB2 key {key}")
-    return float(value)
-
-
-def _validate_gfs_coverage(
-    row: Mapping[str, object], domain: DomainProfile, source: ForcingProfile
-) -> None:
-    w, s, e, n = computational_latlon_bounds(domain, snap_deg=source.grid_spacing_deg)
-    dx = _number(row, "iDirectionIncrementInDegrees")
-    dy = _number(row, "jDirectionIncrementInDegrees")
-    ni, nj = _number(row, "Ni"), _number(row, "Nj")
-    lon0 = _number(row, "longitudeOfFirstGridPointInDegrees")
-    lon1 = _number(row, "longitudeOfLastGridPointInDegrees")
-    south, north = sorted(
-        (
-            _number(row, "latitudeOfFirstGridPointInDegrees"),
-            _number(row, "latitudeOfLastGridPointInDegrees"),
-        )
-    )
-    width = dx * (ni - 1)
-    west = w - (w - lon0) % 360.0
-    if (
-        row.get("gridType") != "regular_ll"
-        or not math.isclose(dx, source.grid_spacing_deg, abs_tol=1e-6)
-        or not math.isclose(dy, source.grid_spacing_deg, abs_tol=1e-6)
-        or min(ni, nj) < 2
-        or not math.isclose((lon1 - lon0) % 360.0, width, abs_tol=1e-5)
-        or not math.isclose(north - south, dy * (nj - 1), abs_tol=1e-5)
-        or (ni * dx < 360.0 - 1e-5 and e > west + width + 1e-5)
-        or s < south - 1e-5
-        or n > north + 1e-5
-    ):
-        raise ValueError("GFS grid geometry or coverage disagrees with the forcing cutout")
+_MASKED = frozenset((*_SOIL, (0, 1, 13, 1, 0, 0)))
 
 
 def _validate_gfs_inventory(
@@ -111,7 +62,7 @@ def _validate_gfs_inventory(
 
 
 def _grib_field(row: Mapping[str, object]) -> tuple[object, ...] | None:
-    field = tuple(row.get(k) for k in _FIELD_KEYS)
+    field = tuple(row.get(k) for k in GRIB_FIELD_KEYS)
     if field[:4] == (0, 0, 0, 106):
         # Vtable.GFS maps both encodings to the same soil-temperature layer.
         field = (2, 0, 2, 106, *field[4:])
@@ -122,7 +73,7 @@ def _grib_field(row: Mapping[str, object]) -> tuple[object, ...] | None:
     unit = row.get("typeOfLevel")
     if unit not in ("isobaricInPa", "isobaricInhPa"):
         raise ValueError("Unknown GRIB isobaric coordinate units")
-    pressure_pa = _number(row, "level") * (100.0 if unit == "isobaricInhPa" else 1.0)
+    pressure_pa = grib_number(row, "level") * (100.0 if unit == "isobaricInhPa" else 1.0)
     # ungrib's default pmin is 100 Pa. metgrid adds one surface level.
     # https://github.com/wrf-model/WPS/blob/v4.7.0/ungrib/src/read_namelist.F
     return (*field[:4], pressure_pa, pressure_pa) if pressure_pa >= 100.0 else None
@@ -141,32 +92,33 @@ def _validate_file(
         int(valid.strftime("%Y%m%d")),
         int(valid.strftime("%H%M")),
     )
-    messages = inspect_grib(path, _GRIB_KEYS)
-    _validate_gfs_coverage(messages[0], domain, source)
-    grid = messages[0].get("md5Section3")
-    offset = 0
+    messages = inspect_grib(path, GRIB_KEYS + ",numberOfMissing:i,uvRelativeToGrid:i")
+    spacing = source.grid_spacing_deg
+    rows = checked_grib_grid(
+        path,
+        messages,
+        computational_latlon_bounds(domain, snap_deg=spacing),
+        spacing,
+        ("grid_simple", "grid_complex", "grid_complex_spatial_differencing"),
+    )
     fields: set[tuple[object, ...]] = set()
-    for row in messages:
+    for row in rows:
         identity = tuple(
             row.get(k)
             for k in ("edition", "centre", "dataDate", "dataTime", "validityDate", "validityTime")
         )
         if identity != expected or row.get("generatingProcessIdentifier") != (96 if fhr else 81):
             raise ValueError(f"Wrong GFS source, cycle or valid time in {path} for f{fhr:03d}")
-        if not isinstance(grid, str) or not grid or row.get("md5Section3") != grid:
-            raise ValueError(f"Mixed or missing GFS grids in {path}")
-        length = int(_number(row, "totalLength"))
-        if row.get("offset") != offset or length < 20 or row.get("packingType") == "grid_ccsds":
-            raise ValueError(f"Invalid GRIB2 framing or unsupported packing in {path}")
-        offset += length
         if row.get("productDefinitionTemplateNumber") == 0:
             field = _grib_field(row)
             if field is not None:
                 if field in fields:
                     raise ValueError(f"Duplicate required GFS field {field} in {path}")
+                if field not in _MASKED and row.get("numberOfMissing") != 0:
+                    raise ValueError(f"Missing values in required GFS field {field} in {path}")
+                if field[:2] == (0, 2) and row.get("uvRelativeToGrid") != 0:
+                    raise ValueError(f"GFS winds must be earth-relative in {path}")
                 fields.add(field)
-    if offset != path.stat().st_size:
-        raise ValueError(f"Incomplete GRIB2 framing in {path}")
     _validate_gfs_inventory(fields, domain, source)
 
 

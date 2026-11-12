@@ -232,18 +232,23 @@ def model_column_spacing(
     return gaps_m, int(np.min(np.count_nonzero(bl_levels, axis=0)))
 
 
-def _validate_column_geometry(
-    min_gap: float, max_gap: float, min_bl: int, d: DomainProfile
+def validate_column_geometry(
+    min_gap: float,
+    max_gap: float,
+    min_bl: int,
+    domain: DomainProfile,
+    *,
+    gap_limit_m: float = CONSUMER_MAX_PROFILE_GAP_M,
 ) -> None:
+    """Reject gaps or boundary-layer counts outside the requested column limits."""
     if not (math.isfinite(min_gap) and math.isfinite(max_gap)):
         raise ValueError("Non-finite column gap")
-    if min_gap <= 0.0 or max_gap > CONSUMER_MAX_PROFILE_GAP_M:
+    if min_gap <= 0.0 or max_gap > gap_limit_m:
         raise ValueError(
-            f"Exported column gap [{min_gap:.1f}, {max_gap:.1f}] m "
-            f"violates (0, {CONSUMER_MAX_PROFILE_GAP_M}] m"
+            f"Exported column gap [{min_gap:.1f}, {max_gap:.1f}] m violates (0, {gap_limit_m}] m"
         )
-    if min_bl < d.min_bl_levels_2km_agl:
-        raise ValueError(f"Exported usable BL count {min_bl} < {d.min_bl_levels_2km_agl}")
+    if min_bl < domain.min_bl_levels_2km_agl:
+        raise ValueError(f"Exported usable BL count {min_bl} < {domain.min_bl_levels_2km_agl}")
 
 
 def validate_wrfinput_columns(
@@ -257,12 +262,14 @@ def validate_wrfinput_columns(
     phi = np.add(ph[:, trim:-trim, trim:-trim], phb[:, trim:-trim, trim:-trim], dtype=np.float64)
     agl = (phi[1:] + phi[:-1]) * (0.5 / G0_MPS2) - hgt_m[trim:-trim, trim:-trim]
     gaps_m, min_bl = model_column_spacing(agl)
-    _validate_column_geometry(float(np.min(gaps_m)), float(np.max(gaps_m)), min_bl, domain)
+    validate_column_geometry(
+        float(np.min(gaps_m)), float(np.max(gaps_m)), min_bl, domain, gap_limit_m=domain.max_dz_m
+    )
 
 
 def validate_frame_columns(frame: NormalizedWrfFrame, domain: DomainProfile) -> float:
     """Verify exported column geometry and record the output-frame CFL proxy."""
-    _validate_column_geometry(frame.min_dz_m, frame.max_dz_m, frame.min_bl_levels_2km, domain)
+    validate_column_geometry(frame.min_dz_m, frame.max_dz_m, frame.min_bl_levels_2km, domain)
     if not math.isfinite(frame.max_cfl) or frame.max_cfl < 0.0:
         raise ValueError(f"Invalid exported frame max_cfl {frame.max_cfl:.4f}")
     return round(frame.max_cfl, 5)
@@ -277,6 +284,7 @@ __all__ = [
     "auto_eta_faces",
     "estimate_auto_levels_agl_m",
     "model_column_spacing",
+    "validate_column_geometry",
     "validate_frame_columns",
     "validate_solver_znw",
     "validate_vertical_column",

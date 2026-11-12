@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import shlex
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,7 @@ class RuntimeEnv:
     build_manifest_path: str
     oci_digest: str
     solver_prefix: str
+    webhook_token: str = field(default="", repr=False)
 
 
 def load_runtime_env(environ: Mapping[str, str] | None = None) -> RuntimeEnv:
@@ -45,4 +46,5 @@ def load_runtime_env(environ: Mapping[str, str] | None = None) -> RuntimeEnv:
         build_manifest_path=manifest_path,
         oci_digest=oci_digest,
         solver_prefix=solver_prefix,
+        webhook_token=env.get("AV_WRF_WEBHOOK_TOKEN", "").strip(),
     )

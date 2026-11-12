@@ -19,13 +19,13 @@ from av_wrf.runner import (
     load_ready_receipt,
     load_run_lock,
     open_store,
+    parse_cycle_arg,
     plan_product_cycle,
     post_cycle_from_inputs,
     post_webhook_json,
     prep_cycle_namelists,
     publish_cycle_receipt,
     reconcile_dispatch,
-    resolve_cli_cycle,
     run_geogrid,
     run_wrf_cycle,
     sha256_file,
@@ -72,6 +72,7 @@ def _add_subcommand_flags(cmd_name: str, cmd: argparse.ArgumentParser) -> None:
     if cmd_name in {"forcing-manifest", "solve"}:
         cmd.add_argument("--grib-dir", type=Path, required=True, help="Staged forcing directory")
     if cmd_name == "forcing-manifest":
+        cmd.add_argument("--acquisition-inventory", type=Path, help="Source hash inventory path")
         cmd.add_argument(
             "--file",
             action="append",
@@ -205,7 +206,12 @@ def _run_forcing_manifest_cmd(
             raise ValueError(f"Missing filename or repeated forecast hour in --file {entry!r}")
         files[forecast_hour] = grib_dir / name
     manifest = write_forcing_manifest(
-        grib_dir, lock, bundle.primary_source, files, domain=bundle.domain
+        grib_dir,
+        lock,
+        bundle.primary_source,
+        files,
+        domain=bundle.domain,
+        acquisition_inventory=args.acquisition_inventory,
     )
     return {"status": "forcing_verified", "forecast_hours": manifest.forecast_hours}
 
@@ -250,7 +256,7 @@ def _run_publish_cmd(
 def _dispatch_cycle_cmd(args: argparse.Namespace, env: RuntimeEnv, cfg_dir: Path) -> int:
     prod_id, att = str(args.product), str(args.attempt)
     bundle = load_bundle(cfg_dir, prod_id)
-    orig_utc, part = resolve_cli_cycle(cfg_dir, prod_id, str(args.cycle), bundle=bundle)
+    orig_utc, part = parse_cycle_arg(str(args.cycle), bundle.product)
     if args.command == "reconcile":
         dst_store = open_store(args.store_uri or env.store_uri)
         rec = load_ready_receipt(dst_store, bundle.product.model_id, part)
@@ -262,7 +268,7 @@ def _dispatch_cycle_cmd(args: argparse.Namespace, env: RuntimeEnv, cfg_dir: Path
         sent = reconcile_dispatch(
             dst_store,
             rec,
-            lambda r: post_webhook_json(target_url, r),
+            lambda r: post_webhook_json(target_url, r, bearer_token=env.webhook_token),
             destination_id=target_url,
         )
         out = {"status": "reconciled", "dispatched_now": sent, "cycle": part}

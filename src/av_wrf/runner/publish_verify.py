@@ -1,4 +1,4 @@
-"""Canonical Zarr v3 metadata, coordinate, ZEP-0002 index, and paired pressure verification."""
+"""Verify canonical Zarr v3 bytes and decoded forecast columns before promotion."""
 
 from __future__ import annotations
 
@@ -24,7 +24,12 @@ from av_wrf.contracts import (
     StagedPostManifest,
     parse_iso_utc,
 )
-from av_wrf.core import published_grid_shape
+from av_wrf.core import (
+    model_column_spacing,
+    published_grid_shape,
+    validate_column_geometry,
+    validate_thermodynamic_field,
+)
 from av_wrf.runner.bundle import LoadedBundle
 from av_wrf.runner.store import ObjectStore, json_bytes, sha256_hex
 
@@ -32,7 +37,7 @@ from av_wrf.runner.store import ObjectStore, json_bytes, sha256_hex
 def validate_post_manifest(
     raw_doc: object, b: LoadedBundle, window: CycleWindow
 ) -> StagedPostManifest:
-    """Validate `post_manifest.json` horizon, window bounds, metadata, and 22-field inventory."""
+    """Validate `post_manifest.json` horizon and shard inventory."""
     if not isinstance(raw_doc, dict):
         raise ValueError("Expected JSON object in post_manifest.json")
     pm = StagedPostManifest.from_doc(raw_doc)
@@ -42,11 +47,12 @@ def validate_post_manifest(
         raise ValueError(
             f"Incomplete cycle horizon: got {len(pm.lead_hours)}, expected {len(window.lead_hours)}"
         )
-    expected_meta = set(build_zarr_v3_store_metadata(b.domain, b.output, pm.lead_hours))
     expected_shards = expected_shard_keys(b.output, len(pm.lead_hours))
-    for items, expected in ((pm.meta_sha256s, expected_meta), (pm.shard_sha256s, expected_shards)):
-        if len(items) != len(expected) or {key for key, _ in items} != expected:
-            raise ValueError("Staged Zarr inventory differs from the expected store hierarchy")
+    if (
+        len(pm.shard_sha256s) != len(expected_shards)
+        or {key for key, _ in pm.shard_sha256s} != expected_shards
+    ):
+        raise ValueError("Staged Zarr inventory differs from the expected store hierarchy")
     return pm
 
 
@@ -62,41 +68,37 @@ def _expected_canonical_bytes(
     return meta_bytes, encode_coord_chunks(b.domain, window.lead_hours, valid_s, starts_s, valid_s)
 
 
-def _decode_field_shard(
-    rel_key: str, payload: bytes, n_leads: int, b: LoadedBundle
-) -> npt.NDArray[np.float32]:
-    field_name, _, *indices = rel_key.split("/")
-    if field_name == "terrain_m":
-        outer_t, n_frames = 1, 1
-    else:
-        outer_t = min(n_leads, b.output.shard_time_steps)
-        n_frames = min(outer_t, n_leads - int(indices[0]) * outer_t)
+def _decode_field_shard(rel_key: str, payload: bytes, b: LoadedBundle) -> npt.NDArray[np.float32]:
+    field_name = rel_key.split("/", 1)[0]
     ny, nx = published_grid_shape(b.domain)
     nz = b.domain.exported_levels_k if field_name in WRF_ZARR_V3_3D_NAMES else 1
     arr = decode_shard_f32_array(
-        payload, shard_time_steps=outer_t, n_frames=n_frames, nz=nz, ny=ny, nx=nx, output=b.output
-    )[:n_frames]
+        payload, shard_time_steps=1, n_frames=1, nz=nz, ny=ny, nx=nx, output=b.output
+    )
     if not bool(np.all(np.isfinite(arr))):
         raise ValueError(f"Non-finite values in decoded staged shard {rel_key}")
+    validate_thermodynamic_field(field_name, arr)
     return arr
 
 
 def _verify_pressure(
     rel_key: str, p3_arr: npt.NDArray[np.float32], ps_arr: npt.NDArray[np.float32]
 ) -> None:
-    if bool(np.any(ps_arr <= 0.0)) or bool(np.any(p3_arr <= 0.0)):
+    if bool(np.any(p3_arr <= 0.0)):
         raise ValueError(f"Non-positive pressure in {rel_key}")
     if bool(np.any(p3_arr[:, 1:] >= p3_arr[:, :-1])):
         raise ValueError(f"Non-monotonic 3D pressure_pa in {rel_key}")
-    if bool(np.any(p3_arr[:, 0] > ps_arr[:, 0])):
-        raise ValueError(f"Lowest level pressure_pa exceeds surface_pressure_pa in {rel_key}")
+    if bool(np.any(p3_arr[:, 0] >= ps_arr[:, 0])):
+        raise ValueError(f"Lowest level pressure_pa must be below surface_pressure_pa in {rel_key}")
 
 
 def _verify_diagnostics_receipt(
     stage_store: ObjectStore, stage_root: str, exp_sha: str, lock: RunLock
 ) -> bytes:
     diag_raw = stage_store.get_bytes(f"{stage_root}/_diagnostics.json")
-    if diag_raw is None or sha256_hex(diag_raw) != exp_sha:
+    if diag_raw is None:
+        raise FileNotFoundError("Missing staged _diagnostics.json; restage with `av-wrf post`")
+    if sha256_hex(diag_raw) != exp_sha:
         raise ValueError("Missing or corrupt staged _diagnostics.json before publish")
     diag_obj = json.loads(diag_raw.decode("utf-8"))
     if not isinstance(diag_obj, dict):
@@ -129,6 +131,11 @@ def verify_staged_objects(
     """Verify canonical staged metadata and decoded fields and hand off each verified object."""
     diag_raw = _verify_diagnostics_receipt(stage_store, stage_root, pm.diagnostics_sha256, lock)
     meta_expected, coord_expected = _expected_canonical_bytes(b, window)
+    if (
+        len(pm.meta_sha256s) != len(meta_expected)
+        or {key for key, _ in pm.meta_sha256s} != meta_expected.keys()
+    ):
+        raise ValueError("Staged Zarr inventory differs from the expected store hierarchy")
     staged_zarr = f"{stage_root}/{pm.zarr_relpath}"
     expected_shas = dict((*pm.meta_sha256s, *pm.shard_sha256s))
 
@@ -143,17 +150,28 @@ def verify_staged_objects(
         if payload != expected:
             raise ValueError(f"Staged Zarr metadata or coordinate {rel_key} contradicts RunLock")
         on_verified_object(rel_key, payload)
-    n_leads = len(pm.lead_hours)
+    terrain_key = zarr_shard_relpath("terrain_m", b.output)
+    terrain_payload = fetch_verified(terrain_key)
+    terrain = _decode_field_shard(terrain_key, terrain_payload, b)[0, 0]
+    on_verified_object(terrain_key, terrain_payload)
     for rel_key, _ in pm.shard_sha256s:
-        if rel_key in coord_expected or rel_key.startswith("surface_pressure_pa/"):
+        if (
+            rel_key in coord_expected
+            or rel_key == terrain_key
+            or rel_key.startswith("surface_pressure_pa/")
+        ):
             continue
         payload = fetch_verified(rel_key)
-        values = _decode_field_shard(rel_key, payload, n_leads, b)
+        values = _decode_field_shard(rel_key, payload, b)
         if rel_key.startswith("pressure_pa/"):
-            t_idx = int(rel_key.split("/")[2]) * b.output.shard_time_steps
+            t_idx = int(rel_key.split("/")[2])
             ps_key = zarr_shard_relpath("surface_pressure_pa", b.output, time_index=t_idx)
             ps_payload = fetch_verified(ps_key)
-            _verify_pressure(rel_key, values, _decode_field_shard(ps_key, ps_payload, n_leads, b))
+            _verify_pressure(rel_key, values, _decode_field_shard(ps_key, ps_payload, b))
             on_verified_object(ps_key, ps_payload)
+        elif rel_key.startswith("height_msl_m/"):
+            agl = np.subtract(np.moveaxis(values, 1, 0), terrain, dtype=np.float64)
+            gaps, min_bl = model_column_spacing(agl)
+            validate_column_geometry(float(np.min(gaps)), float(np.max(gaps)), min_bl, b.domain)
         on_verified_object(rel_key, payload)
     return diag_raw

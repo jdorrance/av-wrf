@@ -129,7 +129,7 @@ def validate_bundle(
     window = resolve_cycle_window(b.product, b.output, origin)
     resolve_forcing_window(window, b.primary_source, domain=b.domain)
     remaining_floor = validate_horizon_policy(
-        b.product, b.primary_source, b.output, publish_origin_utc=publish_origin_utc
+        b.product, b.primary_source, b.output, publish_origin_utc=window.publish_origin_utc
     )
     compile_wrf_namelist_sections(b.domain, b.science, b.primary_source)
     if not b.candidate_source.fail_closed:

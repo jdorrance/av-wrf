@@ -1,4 +1,4 @@
-"""Record the WRF, WPS, patches, compiler, and MPI used to build the solver image."""
+"""Record solver source commits, patches, compiler, and MPI."""
 
 import hashlib
 import json
@@ -13,8 +13,10 @@ def _version(*args: str) -> str:
 
 if __name__ == "__main__":
     manifest = {
-        "wrf_sha": _version("git", "-C", "WRF", "rev-parse", "HEAD"),
-        "wps_sha": _version("git", "-C", "WPS", "rev-parse", "HEAD"),
+        **{
+            f"{repo.lower()}_sha": _version("git", "-C", repo, "rev-parse", "HEAD")
+            for repo in ("WRF", "WPS", "jasper")
+        },
         "patch_sha256s": [
             [patch.name, hashlib.sha256(patch.read_bytes()).hexdigest()]
             for patch in sorted(

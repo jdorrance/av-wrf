@@ -1,0 +1,13 @@
+profile_id: dwd-icon-eu-v1
+provider: DWD
+vtable_name: Vtable.ICONm
+interval_seconds: 3600
+grid_spacing_deg: 0.0625
+metgrid_levels: 75
+metgrid_soil_levels: 8
+use_sh_qv: true
+# Conservative pilot allowance pending prospective arrival measurements.
+source_ready_lag_p95_hours: 3.25
+mirrors:
+  - https://opendata.dwd.de/weather/nwp/v1
+fail_closed: true

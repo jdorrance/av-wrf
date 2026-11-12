@@ -27,9 +27,9 @@ def parse_build_manifest(raw: Mapping[str, object], oci_digest: str) -> BuildMan
         if not isinstance(first, str) or not isinstance(second, str):
             raise ValueError("Invalid patch_sha256s entry in build-manifest.json")
         patches.append((first, second))
-    wrf_sha, wps_sha = raw.get("wrf_sha"), raw.get("wps_sha")
-    if not isinstance(wrf_sha, str) or not wrf_sha or not isinstance(wps_sha, str) or not wps_sha:
-        raise ValueError("Missing wrf_sha or wps_sha in build-manifest.json")
+    wrf_sha = _git_sha(raw, "wrf_sha")
+    wps_sha = _git_sha(raw, "wps_sha")
+    jasper_sha = _git_sha(raw, "jasper_sha") if "jasper_sha" in raw else None
     compiler, mpi = raw.get("compiler"), raw.get("mpi")
     if not isinstance(compiler, str) or not compiler or not isinstance(mpi, str) or not mpi:
         raise ValueError("Missing compiler or mpi in build-manifest.json")
@@ -40,7 +40,15 @@ def parse_build_manifest(raw: Mapping[str, object], oci_digest: str) -> BuildMan
         tuple(patches),
         compiler,
         mpi,
+        jasper_sha,
     )
+
+
+def _git_sha(raw: Mapping[str, object], key: str) -> str:
+    sha = raw.get(key)
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise ValueError(f"Invalid Git commit for {key} in build-manifest.json")
+    return sha
 
 
 def load_build_manifest(

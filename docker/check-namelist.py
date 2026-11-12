@@ -1,6 +1,5 @@
 """Check generated WRF namelists with both native executables in an empty directory."""
 
-import math
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -10,17 +9,15 @@ from av_wrf.core import compile_wrf_run_namelist, render_fortran_namelist
 from av_wrf.runner import LocalFileStore, check_all_products, load_bundle, plan_product_cycle
 
 
-def _check_native_namelists() -> None:
-    config = Path("config")
-    product = min(check_all_products(config), key=lambda item: math.prod(item.published_yx))
-    bundle = load_bundle(config, product.product_id)
+def _check_native_namelists(config: Path, product_id: str) -> None:
+    bundle = load_bundle(config, product_id)
     origin = f"2026-01-15T{bundle.product.publish_origin_hour_utc:02d}:00:00Z"
     with TemporaryDirectory() as tmp:
         scratch = Path(tmp)
         _, lock = plan_product_cycle(
             config,
             LocalFileStore(scratch / "store"),
-            product_id=product.product_id,
+            product_id=product_id,
             publish_origin_utc=origin,
             attempt_id="native-parser",
             mpi_ranks=1,
@@ -49,8 +46,10 @@ def _check_native_namelists() -> None:
             log = log_path.read_text("utf-8", errors="replace") if log_path.is_file() else ""
             if proc.returncode == 0 or input_error not in log:
                 raise RuntimeError(f"{exe}.exe failed to reach input opening\n{log}{proc.stderr}")
-            print(f"{exe}.exe accepted the generated namelist and reached input opening")
+            print(f"{exe}.exe accepted the {product_id} namelist and reached input opening")
 
 
 if __name__ == "__main__":
-    _check_native_namelists()
+    config = Path("config")
+    for product in check_all_products(config):
+        _check_native_namelists(config, product.product_id)

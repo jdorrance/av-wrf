@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 import sys
 import unittest
 from pathlib import Path
+
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 for p in (ROOT, ROOT / "src"):
@@ -31,6 +34,7 @@ from av_wrf.core import (  # noqa: E402
     crop_destagger_y_3d,
     crop_destagger_z_3d,
     crop_sponge_2d,
+    lambert_grid_to_earth_trig,
     lambert_xy_m_to_latlon,
     latlon_to_lambert_xy_m,
     published_crs_wkt,
@@ -38,6 +42,7 @@ from av_wrf.core import (  # noqa: E402
     published_lambert_grid_metadata,
     validate_domain_profile,
 )
+from av_wrf.core.thermo import rotate_grid_to_earth_vec  # noqa: E402
 from av_wrf.runner import parse_declarative_yaml  # noqa: E402
 from tests.oracle.reference_cases import NH_MIDLAT_LCC, SH_MIDLAT_LCC  # noqa: E402
 
@@ -48,6 +53,57 @@ def _load_configured_domains() -> tuple[DomainProfile, ...]:
 
 
 class TestGrid(unittest.TestCase):
+    def test_lambert_rejects_unsupported_spacing_and_radius(self) -> None:
+        d = _load_configured_domains()[0]
+        with self.assertRaisesRegex(ValueError, "grid spacing must be equal"):
+            validate_domain_profile(dataclasses.replace(d, dy_m=d.dx_m * 2.0))
+        with self.assertRaisesRegex(ValueError, "Earth radius"):
+            validate_domain_profile(dataclasses.replace(d, earth_radius_m=d.earth_radius_m + 1.0))
+
+    def test_lambert_rejects_invalid_meridian_and_degenerate_cone(self) -> None:
+        d = _load_configured_domains()[0]
+        with self.assertRaisesRegex(ValueError, "longitudes"):
+            validate_domain_profile(dataclasses.replace(d, central_meridian_deg=181.0))
+        with self.assertRaisesRegex(ValueError, "share a hemisphere"):
+            validate_domain_profile(
+                dataclasses.replace(d, std_parallel_2_deg=-d.std_parallel_1_deg)
+            )
+        with self.assertRaisesRegex(ValueError, "zero cone"):
+            latlon_to_lambert_xy_m(
+                d.center_lat_deg,
+                d.center_lon_deg,
+                origin_lat_deg=d.center_lat_deg,
+                central_meridian_deg=d.central_meridian_deg,
+                std_parallel_1_deg=35.0,
+                std_parallel_2_deg=-35.0,
+                radius_m=d.earth_radius_m,
+            )
+
+    def test_wps_tangent_cutoff_matches_published_geometry_and_rotation(self) -> None:
+        for sign in (1.0, -1.0):
+            tangent = dataclasses.replace(
+                _load_configured_domains()[0],
+                center_lat_deg=40.0 * sign,
+                center_lon_deg=40.0,
+                central_meridian_deg=0.0,
+                std_parallel_1_deg=40.0 * sign,
+                std_parallel_2_deg=40.0 * sign,
+            )
+            near = dataclasses.replace(tangent, std_parallel_2_deg=40.1 * sign)
+            secant = dataclasses.replace(tangent, std_parallel_2_deg=40.11 * sign)
+            meta = published_lambert_grid_metadata(tangent)
+            self.assertEqual(published_lambert_grid_metadata(near), meta)
+            self.assertNotEqual(published_lambert_grid_metadata(secant)["x0M"], meta["x0M"])
+            self.assertEqual(published_crs_wkt(near), published_crs_wkt(tangent))
+            self.assertEqual(
+                computational_latlon_bounds(near), computational_latlon_bounds(tangent)
+            )
+            cosine, sine = lambert_grid_to_earth_trig(near, np.array([40.0], dtype=np.float32))
+            angle = math.sin(math.radians(40.0 * sign)) * math.radians(-40.0)
+            east, north = rotate_grid_to_earth_vec(np.ones(1), np.zeros(1), cosine, sine)
+            self.assertAlmostEqual(float(east[0]), math.cos(angle), places=12)
+            self.assertAlmostEqual(float(north[0]), math.sin(angle), places=12)
+
     def test_nh_and_sh_lambert_roundtrip_and_optional_pyproj_oracle(self) -> None:
         r_m = _load_configured_domains()[0].earth_radius_m
         for lat0, lon0, sp1, sp2 in (NH_MIDLAT_LCC, SH_MIDLAT_LCC):

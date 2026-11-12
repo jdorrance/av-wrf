@@ -5,13 +5,24 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+from av_wrf.runner.bundle import LoadedBundle, load_bundle
+from av_wrf.runner.forcing_recipe import ForcingRecipe
+from av_wrf.runner.mirrors import find_forcing_recipe
+
+
+def bundle_for_recipe(config: Path, recipe: ForcingRecipe) -> LoadedBundle:
+    for path in sorted((config / "products").glob("*.yaml")):
+        bundle = load_bundle(config, path.stem)
+        if find_forcing_recipe(bundle.primary_source) is recipe:
+            return bundle
+    raise AssertionError(f"No configured product for {recipe.identity}")
+
 
 def stage_sparse_config(src_cfg: Path, dst_cfg: Path) -> str:
     """Copy the smallest product configuration with hourly leads 1, 2 and sparse lead 6."""
-    from av_wrf.runner import load_bundle
-
     shutil.copytree(src_cfg, dst_cfg)
-    candidates = (load_bundle(dst_cfg, path.stem) for path in (dst_cfg / "products").glob("*.yaml"))
+    products = sorted((dst_cfg / "products").glob("*.yaml"))
+    candidates = (load_bundle(dst_cfg, path.stem) for path in products)
     bundle = min(candidates, key=lambda item: item.domain.e_we * item.domain.e_sn)
     profile = "wrf-zarr-v3-6h"
     (dst_cfg / "profiles" / "outputs" / f"{profile}.yaml").write_text(

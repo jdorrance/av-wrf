@@ -79,8 +79,9 @@ class TestSchedule(unittest.TestCase):
             self.assertFalse(is_cycle_live_fresh(prod, out, iso_arg, "2026-11-10T00:00:00Z"))
 
             with self.assertRaises(ValueError):
+                hour = (prod.forcing_cycle_hour_utc + 1) % 24
                 validate_horizon_policy(
-                    dataclasses.replace(prod, schedule_cron_utc="50 22 * * *"), src, out
+                    dataclasses.replace(prod, schedule_cron_utc=f"0 {hour} * * *"), src, out
                 )
             with self.assertRaises(ValueError):
                 validate_horizon_policy(

@@ -42,6 +42,7 @@ from av_wrf.core.thermo import (
     parameterized_gust_10m_vec,
     potential_to_temp_vec,
     rotate_grid_to_earth_vec,
+    validate_thermodynamic_field,
 )
 from av_wrf.core.vertical import model_column_spacing
 
@@ -105,15 +106,13 @@ def _validate_and_groom_3d_pressure(
         _mass_view(raw.pb_pa, trim, shape),
         dtype=np.float64,
     )
-    if not np.all(p_pa[-1] > 0.0) or not np.all(psfc_2d > 0.0):
-        raise ValueError("Non-positive surface or 3D pressure in post_frame")
-    if not np.all(p_pa[0] <= psfc_2d):
-        raise ValueError("Lowest model-level pressure exceeds surface_pressure_pa")
+    if not np.all(p_pa[-1] > 0.0):
+        raise ValueError("Non-positive 3D pressure in post_frame")
     if not np.all(p_pa[1:] < p_pa[:-1]):
         raise ValueError("Non-monotonic 3D column pressure (pressure must decrease with height)")
     p_buf = groom_f32_buf(p_pa[:k_exp], 17)
     p_gr = np.frombuffer(p_buf, dtype=np.float32).reshape(k_exp, ny, nx)
-    if bool(np.any(p_gr[0] > psfc_2d)) or bool(np.any(p_gr[1:] >= p_gr[:-1])):
+    if bool(np.any(p_gr[0] >= psfc_2d)) or bool(np.any(p_gr[1:] >= p_gr[:-1])):
         raise ValueError("Bit-groomed 3D column pressure violated monotonic ordering")
     return p_pa, p_buf
 
@@ -136,23 +135,26 @@ def _post_3d_slabs(
     p_pa = p_all[:k_exp]
     ph = np.frombuffer(crop_destagger_z_3d(raw.ph_stag_m2s2, trim, k_exp).buf, np.float32)
     phb = np.frombuffer(crop_destagger_z_3d(raw.phb_stag_m2s2, trim, k_exp).buf, np.float32)
-    z_msl = np.add(ph, phb, dtype=np.float64).reshape(shp3)
-    z_buf = groom_f32_buf(z_msl / G0_MPS2, 17)
+    height_m = np.add(ph, phb, dtype=np.float64).reshape(shp3)
+    height_m /= G0_MPS2
+    z_buf = groom_f32_buf(height_m, 17)
     th = _mass_view(raw.theta_pert_k, trim, shp3).astype(np.float64)
     tk = potential_to_temp_vec(th, p_pa)
+    t_buf = groom_f32_buf(tk, 15)
+    validate_thermodynamic_field("temp_k", np.frombuffer(t_buf, np.float32))
     qv_in = _mass_view(raw.qvapor_kgkg, trim, shp3).astype(np.float64)
     if bool(np.any(qv_in < -1e-4)):
         raise ValueError("Large negative QVAPOR encountered in post_frame")
     spfh = mixing_ratio_to_spfh_vec(qv_in)
-    if not bool(np.all(tk > 0.0)) or bool(np.any(spfh >= 1.0)):
-        raise ValueError("Invalid temperature or specific humidity in 3D column")
+    if bool(np.any(spfh >= 1.0)):
+        raise ValueError("Invalid specific humidity in 3D column")
     # Averages of the previously validated faces remain finite through float32 rounding.
     w_m = _as_f64(crop_destagger_z_3d(raw.w_stag_mps, trim, k_exp).buf, shp3)
     omega = geometric_w_to_omega_vec(w_m, p_pa, tk, spfh)
     u_g = _as_f64(crop_destagger_x_3d(raw.u_stag_mps, trim, k_exp).buf, shp3)
     v_g = _as_f64(crop_destagger_y_3d(raw.v_stag_mps, trim, k_exp).buf, shp3)
     u_e, v_e = rotate_grid_to_earth_vec(u_g, v_g, ca, sa)
-    agl = np.subtract(np.frombuffer(z_buf, np.float32).reshape(shp3), terr, dtype=np.float64)
+    agl = np.subtract(np.frombuffer(z_buf, np.float32).reshape(shp3), terr, out=height_m)
     dz, bl_n = model_column_spacing(agl)
     cfl = (
         np.abs(u_g) / domain.dx_m + np.abs(v_g) / domain.dy_m + np.abs(w_m) / np.maximum(10.0, dz)
@@ -161,7 +163,7 @@ def _post_3d_slabs(
     bufs = (
         ("pressure_pa", p_buf),
         ("height_msl_m", z_buf),
-        ("temp_k", groom_f32_buf(tk, 15)),
+        ("temp_k", t_buf),
         ("spfh_kgkg", groom_f32_buf(spfh, 15)),
         ("u_earth_mps", groom_f32_buf(u_e, 15)),
         ("v_earth_mps", groom_f32_buf(v_e, 15)),
@@ -207,9 +209,9 @@ def _post_surface_slabs(
     hgt, psfc, ca, sa = shared_2d
     ny, nx = hgt.shape
     t2_s = _groom_2d(_crop2_f64(raw.t2_k, trim, "T2"), 15)
-    t2 = _as_f64(t2_s.buf, (ny, nx), "T2")
-    if not bool(np.all(t2 > 0.0)):
-        raise ValueError("Non-positive 2 m air temperature")
+    t2_gr = np.frombuffer(t2_s.buf, np.float32).reshape(ny, nx)
+    validate_thermodynamic_field("temp_2m_k", t2_gr)
+    t2 = t2_gr.astype(np.float64)
     q2 = mixing_ratio_to_spfh_vec(_crop2_f64(raw.q2_kgkg, trim, "Q2"))
     sp2 = clamp_spfh_2m_vec(q2, t2, psfc)
     sh, lh, pr = _surface_accum_rates(prev, curr, sc.bucket_mm)
@@ -265,6 +267,7 @@ def post_frame(
     trim = domain.bdy_trim_cells
     hgt = _groom_2d(_crop2_f64(raw.terrain_m, trim, "HGT"), 17)
     psfc = _groom_2d(_crop2_f64(raw.psfc_pa, trim, "PSFC"), 17)
+    validate_thermodynamic_field("surface_pressure_pa", np.frombuffer(psfc.buf, np.float32))
     shape = (hgt.ny, hgt.nx)
     if shape != published_grid_shape(domain):
         raise ValueError("Cropped Published Grid shape mismatch")

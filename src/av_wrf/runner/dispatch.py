@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import re
 import time
 import uuid
 from collections.abc import Callable
@@ -42,24 +43,38 @@ def dispatch_receipt_key(receipt: ReadyReceipt, destination_id: str = "default")
     )
 
 
-def post_webhook_json(webhook_url: str, receipt: ReadyReceipt, timeout_s: float = 15.0) -> int:
-    """POST ReadyReceipt JSON with stable Idempotency-Key header; fail closed when unset."""
+def post_webhook_json(
+    webhook_url: str, receipt: ReadyReceipt, timeout_s: float = 15.0, *, bearer_token: str = ""
+) -> int:
+    """POST ReadyReceipt over TLS with a stable idempotency key and optional bearer auth."""
     clean_url = webhook_url.strip()
-    if not clean_url.startswith(("http://", "https://")):
+    try:
+        url = httpx.URL(clean_url)
+    except httpx.InvalidURL:
+        raise ValueError("Invalid HTTPS webhook URL") from None
+    if url.scheme != "https" or not url.host or url.userinfo or url.query or url.fragment:
         raise ValueError(
-            "Webhook URL is required for reconcile (pass --webhook-url or set AV_WRF_WEBHOOK_URL)"
+            "Webhook URL requires HTTPS with no embedded credentials, query or fragment"
         )
-    idem_key = dispatch_idempotency_key(receipt, clean_url)
-    resp = httpx.post(
-        clean_url,
-        content=json_bytes(receipt.to_doc()),
-        headers={
-            "Content-Type": "application/json",
-            "Idempotency-Key": idem_key,
-            "User-Agent": "av-wrf/0.1.0",
-        },
-        timeout=timeout_s,
-    )
+    headers = {
+        "Content-Type": "application/json",
+        "Idempotency-Key": dispatch_idempotency_key(receipt, clean_url),
+        "User-Agent": "av-wrf/0.1.0",
+    }
+    if bearer_token:
+        if not re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", bearer_token):
+            raise ValueError("Invalid webhook bearer token")
+        headers["Authorization"] = f"Bearer {bearer_token}"
+    try:
+        resp = httpx.post(
+            url,
+            content=json_bytes(receipt.to_doc()),
+            headers=headers,
+            timeout=timeout_s,
+            follow_redirects=False,
+        )
+    except (httpx.RequestError, httpx.InvalidURL):
+        raise RuntimeError("Consumer webhook request failed") from None
     return resp.status_code
 
 

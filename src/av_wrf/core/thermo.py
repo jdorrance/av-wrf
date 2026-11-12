@@ -29,6 +29,20 @@ IFS_GUST_COEFF = 7.71
 VON_KARMAN = 0.40
 ZERO_CELSIUS_K = 273.15
 WATER_DRY_AIR_MOLAR_MASS_RATIO = 0.622
+# windy-av-layer/packages/soaring/src/parameters.ts, expressed in wire units.
+_CONSUMER_RANGES = {
+    "surface_pressure_pa": (10_000.0, 110_000.0),
+    "temp_2m_k": (ZERO_CELSIUS_K - 100.0, ZERO_CELSIUS_K + 60.0),
+    "temp_k": (ZERO_CELSIUS_K - 120.0, ZERO_CELSIUS_K + 60.0),
+}
+
+
+def validate_thermodynamic_field(name: str, values: npt.NDArray[np.float32]) -> None:
+    """Reject encoded fields outside the consumer's dry-column input bounds."""
+    if (bounds := _CONSUMER_RANGES.get(name)) is not None:
+        lower, upper = bounds
+        if not lower <= float(np.min(values)) <= float(np.max(values)) <= upper:
+            raise ValueError(f"{name} outside consumer bounds [{lower}, {upper}]")
 
 
 def potential_to_temp_vec(
@@ -93,11 +107,10 @@ def clamp_spfh_2m_vec(
     """Vectorized Bolton (1980) 2 m liquid-saturation cap."""
     q = np.maximum(0.0, spfh_2m_kgkg)
     es_pa = 611.2 * np.exp((17.67 * (t2_k - ZERO_CELSIUS_K)) / np.maximum(1.0, t2_k - 29.65))
-    safe_p = psfc_pa > es_pa * 1.01
-    r_sat = np.where(
-        safe_p, WATER_DRY_AIR_MOLAR_MASS_RATIO * es_pa / np.maximum(1.0, psfc_pa - es_pa), q
-    )
-    return np.where(safe_p, np.minimum(q, (r_sat / (1.0 + r_sat)) * (1.0 - 2.0**-14)), q)
+    es_pa = np.minimum(es_pa, psfc_pa)
+    eps = WATER_DRY_AIR_MOLAR_MASS_RATIO
+    q_sat = eps * es_pa / (psfc_pa - (1.0 - eps) * es_pa)
+    return np.minimum(q, q_sat * (1.0 - 2.0**-14))
 
 
 def geometric_w_to_omega_vec(

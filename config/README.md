@@ -16,7 +16,7 @@ uv run av-wrf check
 - `profiles/science/*.yaml`: frozen WRF v4.8 physics and dynamics parameters.
 - `profiles/sources/*.yaml`: WPS boundary cadence (`interval_seconds`), target
   grid spacing after any remapping, WPS table, metgrid level counts, mirrors,
-  and dissemination lag. GFS is the verified solve recipe.
+  and dissemination lag. GFS and ICON-EU have solve recipes.
   New profiles use `metgrid_levels` and `metgrid_soil_levels` for prep.
   Existing bundles retain `pressure_level_count` and `soil_layer_centers_cm`
   to preserve their RunLock config hashes.
