@@ -7,10 +7,6 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import NewType
 
-TempK = NewType("TempK", float)
-EarthWindMps = NewType("EarthWindMps", float)
-OmegaPaS = NewType("OmegaPaS", float)
-
 
 @dataclass(frozen=True)
 class Slab2DF32:
@@ -98,13 +94,10 @@ __all__ = [
     "CompStagX3D",
     "CompStagY3D",
     "CompStagZ3D",
-    "EarthWindMps",
-    "OmegaPaS",
     "PubBucket2D",
     "PubMass2D",
     "PubMass3D",
     "Slab2DF32",
     "Slab2DI32",
     "Slab3DF32",
-    "TempK",
 ]

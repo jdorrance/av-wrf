@@ -4,7 +4,7 @@ Frozen schemas, `RunLock` and receipt records, the 22-field `wrf-zarr-v3`
 template, and nominal unit/stagger types.
 
 ```python
-from av_wrf.contracts import WRF_ZARR_V3_FIELDS, DomainProfile, EarthWindMps
+from av_wrf.contracts import WRF_ZARR_V3_FIELDS, DomainProfile, PubMass3D
 ```
 
 - **Allowed imports:** Python standard library only.

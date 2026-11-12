@@ -33,10 +33,10 @@ from av_wrf.core.grid import (
 )
 from av_wrf.core.thermo import (
     G0_MPS2,
+    afwa_mslp_vec,
     clamp_spfh_2m_vec,
     geometric_w_to_omega_vec,
     groom_f32_buf,
-    hypsometric_mslp_vec,
     max_random_cloud_cover_pct,
     mixing_ratio_to_spfh_vec,
     parameterized_gust_10m_vec,
@@ -117,12 +117,32 @@ def _validate_and_groom_3d_pressure(
     return p_pa, p_buf
 
 
+def _post_mslp(
+    raw: RawWrfStepInput, trim: int, first_height: _ArrF64, first_temp: _ArrF64, first_qv: _ArrF64
+) -> PubMass2D:
+    mslp = (
+        np.zeros_like(first_height)
+        if raw.afwa_mslp_pa is None
+        else _crop2_f64(raw.afwa_mslp_pa, trim, "AFWA_MSLP")
+    )
+    missing = mslp <= 0.0
+    if np.any(missing):
+        mslp[missing] = afwa_mslp_vec(
+            _crop_sponge_2d_view(raw.psfc_pa, trim)[missing].astype(np.float64),
+            _crop_sponge_2d_view(raw.terrain_m, trim)[missing].astype(np.float64),
+            first_height[missing],
+            first_temp[missing],
+            first_qv[missing],
+        )
+    return _groom_2d(mslp, 17)
+
+
 def _post_3d_slabs(
     raw: RawWrfStepInput,
     domain: DomainProfile,
     science: ScienceProfile,
     shared_2d: _SharedSurface,
-) -> tuple[dict[str, PubMass3D], array[float], array[float], tuple[float, float, int, float]]:
+) -> tuple[dict[str, PubMass3D], dict[str, PubMass2D], tuple[float, float, int, float]]:
     terr, psfc, ca, sa = shared_2d
     trim, k_exp = domain.bdy_trim_cells, domain.exported_levels_k
     ny, nx = psfc.shape
@@ -145,6 +165,11 @@ def _post_3d_slabs(
     qv_in = _mass_view(raw.qvapor_kgkg, trim, shp3).astype(np.float64)
     if bool(np.any(qv_in < -1e-4)):
         raise ValueError("Large negative QVAPOR encountered in post_frame")
+    column_fields = {
+        "cloud_total_pct": _groom_2d(cld_tot, 15),
+        "cloud_low_pct": _groom_2d(cld_low, 15),
+        "mslp_pa": _post_mslp(raw, trim, height_m[0], tk[0], qv_in[0]),
+    }
     spfh = mixing_ratio_to_spfh_vec(qv_in)
     if bool(np.any(spfh >= 1.0)):
         raise ValueError("Invalid specific humidity in 3D column")
@@ -170,7 +195,7 @@ def _post_3d_slabs(
         ("omega_pas", groom_f32_buf(omega, 15)),
     )
     f3d = {nm: PubMass3D(Slab3DF32(nz=k_exp, ny=ny, nx=nx, buf=b)) for nm, b in bufs}
-    return f3d, groom_f32_buf(cld_tot, 15), groom_f32_buf(cld_low, 15), stats
+    return f3d, column_fields, stats
 
 
 def _surface_accum_rates(
@@ -203,11 +228,9 @@ def _post_surface_slabs(
     trim: int,
     sc: ScienceProfile,
     shared_2d: _SharedSurface,
-    cld_tot: array[float],
-    cld_low: array[float],
 ) -> dict[str, PubMass2D]:
-    hgt, psfc, ca, sa = shared_2d
-    ny, nx = hgt.shape
+    _, psfc, ca, sa = shared_2d
+    ny, nx = psfc.shape
     t2_s = _groom_2d(_crop2_f64(raw.t2_k, trim, "T2"), 15)
     t2_gr = np.frombuffer(t2_s.buf, np.float32).reshape(ny, nx)
     validate_thermodynamic_field("temp_2m_k", t2_gr)
@@ -220,13 +243,6 @@ def _post_surface_slabs(
     ue, ve = rotate_grid_to_earth_vec(u10g, v10g, ca, sa)
     pblh = _crop2_f64(raw.pblh_m, trim, "PBLH", nonnegative=True)
     cape = _crop2_f64(raw.afwa_cape_jkg, trim, "AFWA_CAPE_MU", nonnegative=True)
-    if raw.afwa_mslp_pa is None:
-        mslp = hypsometric_mslp_vec(psfc, hgt, t2, sp2)
-    else:
-        mslp = _crop2_f64(raw.afwa_mslp_pa, trim, "AFWA_MSLP")
-        mask = mslp <= 0.0
-        if np.any(mask):
-            mslp[mask] = hypsometric_mslp_vec(psfc[mask], hgt[mask], t2[mask], sp2[mask])
     gust = parameterized_gust_10m_vec(
         ue,
         ve,
@@ -243,12 +259,9 @@ def _post_surface_slabs(
         ("sensible_heat_flux_wm2", groom_f32_buf(sh, 15)),
         ("latent_heat_flux_wm2", groom_f32_buf(lh, 15)),
         ("precip_mm_hr", groom_f32_buf(pr, 15)),
-        ("mslp_pa", groom_f32_buf(mslp, 17)),
         ("u_10m_earth_mps", groom_f32_buf(ue, 15)),
         ("v_10m_earth_mps", groom_f32_buf(ve, 15)),
         ("gust_10m_mps", groom_f32_buf(gust, 15)),
-        ("cloud_total_pct", cld_tot),
-        ("cloud_low_pct", cld_low),
     )
     return {
         "temp_2m_k": t2_s,
@@ -277,16 +290,16 @@ def post_frame(
         _crop2_f64(raw.cos_alpha, trim, "COSALPHA"),
         _crop2_f64(raw.sin_alpha, trim, "SINALPHA"),
     )
-    f3d, cld_tot, cld_low, (min_dz, max_dz, min_bl, max_cfl) = _post_3d_slabs(
+    f3d, column_fields, (min_dz, max_dz, min_bl, max_cfl) = _post_3d_slabs(
         raw, domain, science, shared_2d
     )
     next_base = _crop_accum_baseline(raw, trim)
-    f2d = _post_surface_slabs(prev, next_base, raw, trim, science, shared_2d, cld_tot, cld_low)
+    f2d = _post_surface_slabs(prev, next_base, raw, trim, science, shared_2d)
     frame = NormalizedWrfFrame(
         raw.valid_time_utc,
         prev.valid_time_unix_s,
         raw.valid_time_unix_s,
-        {"terrain_m": hgt, "surface_pressure_pa": psfc, **f2d},
+        {"terrain_m": hgt, "surface_pressure_pa": psfc, **column_fields, **f2d},
         f3d,
         min_dz,
         max_dz,

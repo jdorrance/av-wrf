@@ -47,9 +47,9 @@ def _validate_gfs_inventory(
 ) -> None:
     levels = [{row[4] for row in fields if row[:4] == (*var, 100)} for var in _ATMOSPHERIC]
     pressure = sorted(float(x) for x in levels[0] if isinstance(x, (int, float)))
-    # The configured minimum counts the surface level that metgrid adds.
+    # metgrid adds the surface to the isobars retained at ungrib's pmin.
     if (
-        len(pressure) + 1 < source.metgrid_levels
+        len(pressure) + 1 != source.metgrid_levels
         or any(group != levels[0] for group in levels[1:])
         or not pressure
         or pressure[0] > domain.p_top_pa

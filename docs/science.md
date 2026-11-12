@@ -116,11 +116,9 @@ their respective sides of the Zarr v3 contract:
    share the full interval between published valid times, so tail rain totals
    can be recovered by integrating the reported rate. A shorter heat window
    requires its own time support in the consumer contract.
-4. **Plateau MSLP (`AFWA_MSLP` / `hypsometric_mslp_vec`):** Uses positive native
-   `AFWA_MSLP` values (`afwa_diag_opt = 1`). The fallback reduces pressure over
-   signed terrain with a 6.5 K/km lapse rate. It moves virtual temperatures below
-   255 K halfway toward that threshold and caps the sea-level virtual
-   temperature at 290.5 K when reducing from above sea level.
+4. **Plateau MSLP:** Positive native `AFWA_MSLP` values take precedence. Missing
+   or nonpositive cells use the same sea-level pressure reduction and Shuell
+   correction, reconstructed from the lowest mass level and surface pressure.
    [Native WRF AFWA MSLP](https://github.com/wrf-model/WRF/blob/06d4240ae989cc3e50af412bb472df3d9048783c/phys/module_diag_functions.F#L911-L962)
 5. **CAPE provenance (`afwa_buoy_opt = 1`, strict `AFWA_CAPE_MU`):** Enabling
    `afwa_buoy_opt = 1` in `&afwa` ([`registry.afwa`](https://github.com/wrf-model/WRF/blob/v4.8.0/Registry/registry.afwa))
@@ -139,6 +137,8 @@ their respective sides of the Zarr v3 contract:
   directly (`radt = 3 min`) without consumer double-counting.
   The [Noah-MP patch](../docker/patches/README.md) retains valid WRF albedo
   across steps with no incident shortwave so RRTMG receives a reflectance at dawn.
+  Live post requires `SWDNB`, `SWUPB`, and `ALBEDO` at saved RRTMG times and
+  checks same-plane flux bounds and illuminated albedo. Sparse archive reads may omit them.
 - **Cold-start land state, snow, & high-altitude inland lakes:** Phase 1
   initializes Noah-MP soil layers from the selected forcing and integrates
   through the configured spin-up. Warm land-state cycling needs observation

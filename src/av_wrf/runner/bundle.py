@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -30,7 +31,8 @@ from av_wrf.core import (
     validate_horizon_policy,
     validate_vertical_column,
 )
-from av_wrf.runner.mirrors import resolve_forcing_window
+from av_wrf.runner.forcing_recipe import ForcingRecipe
+from av_wrf.runner.mirrors import ForcingSubset, forcing_subset, resolve_forcing_window
 
 
 @dataclass(frozen=True)
@@ -86,7 +88,8 @@ def _parse_yaml_text(path: Path, raw_text: str) -> dict[str, object]:
     return out
 
 
-def _require_segment(value: str, label: str) -> None:
+def require_path_segment(value: str, label: str) -> None:
+    """Require a single component for a profile filename or object key."""
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value):
         raise ValueError(f"{label} must be a single safe path segment")
 
@@ -96,7 +99,7 @@ def load_bundle(config_root: Path, product_id: str) -> LoadedBundle:
     hasher = hashlib.sha256()
 
     def read(folder: str, ident: str, key: str = "profile_id") -> dict[str, object]:
-        _require_segment(ident, key)
+        require_path_segment(ident, key)
         path = config_root / folder / f"{ident}.yaml"
         data = path.read_bytes()
         hasher.update(data)
@@ -106,7 +109,7 @@ def load_bundle(config_root: Path, product_id: str) -> LoadedBundle:
         return doc
 
     product = parse_product_spec(read("products", product_id, "product_id"))
-    _require_segment(product.model_id, "model_id")
+    require_path_segment(product.model_id, "model_id")
     return LoadedBundle(
         product=product,
         domain=parse_domain_profile(read("profiles/domains", product.domain_profile)),
@@ -120,6 +123,26 @@ def load_bundle(config_root: Path, product_id: str) -> LoadedBundle:
         output=parse_output_profile(read("profiles/outputs", product.output_profile)),
         config_sha256=hasher.hexdigest(),
     )
+
+
+def load_forcing_plan(
+    path: Path, config_root: Path, expected_recipe: ForcingRecipe
+) -> tuple[LoadedBundle, datetime, ForcingSubset]:
+    """Verify the prep plan against the configured source, footprint, cycle, and file keys."""
+    doc = json.loads(path.read_bytes())
+    if not isinstance(doc, dict):
+        raise ValueError("Expected a forcing_subset.json object")
+    product, partition = doc.get("product_id"), doc.get("cycle_partition")
+    if not isinstance(product, str) or not isinstance(partition, str):
+        raise ValueError("Forcing plan requires product_id and cycle_partition")
+    bundle = load_bundle(config_root, product)
+    window = resolve_cycle_window(bundle.product, bundle.output, partition)
+    recipe, cycle, expected = forcing_subset(product, window, bundle.primary_source, bundle.domain)
+    if recipe is not expected_recipe or any(
+        doc.get(key) != value for key, value in expected.items()
+    ):
+        raise ValueError("Forcing plan differs from the configured source inventory")
+    return bundle, cycle, expected
 
 
 def validate_bundle(
@@ -156,3 +179,13 @@ def validate_bundle(
     leads = window.lead_hours
     build_zarr_v3_store_metadata(b.domain, b.output, leads)
     return remaining_floor, min(bl_counts), leads
+
+
+__all__ = [
+    "LoadedBundle",
+    "load_bundle",
+    "load_forcing_plan",
+    "parse_declarative_yaml",
+    "require_path_segment",
+    "validate_bundle",
+]

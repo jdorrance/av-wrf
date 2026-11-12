@@ -44,7 +44,7 @@ from av_wrf.core import (
 )
 from av_wrf.runner.bundle import LoadedBundle, load_bundle
 from av_wrf.runner.solver import verify_solver_receipt
-from av_wrf.runner.stages import _verify_producer_sha256, load_run_lock
+from av_wrf.runner.stages import load_run_lock, verify_producer_sha256
 from av_wrf.runner.store import (
     ObjectStore,
     attempt_stage_prefix,
@@ -246,6 +246,7 @@ def _open_cycle_inputs(
         time_index=f0_i,
         expected_valid_utc=win.publish_origin_utc,
         science=b.science,
+        require_surface_shortwave=True,
     )
     steps_nc = (
         read_wrfout_step_nc(
@@ -254,6 +255,7 @@ def _open_cycle_inputs(
             b.science,
             time_index=index,
             expected_valid_utc=vt,
+            require_surface_shortwave=True,
         )
         for (path, index), vt in zip(leads, win.valid_times_utc, strict=True)
     )
@@ -274,7 +276,7 @@ def post_cycle_from_inputs(
     """Stage Zarr from verified solver output or an explicitly synthetic fixture."""
     b = load_bundle(config_root, product_id) if bundle is None else bundle
     lk = load_run_lock(store, product_id, cycle_partition, attempt_id, bundle=b)
-    _verify_producer_sha256(lk)
+    verify_producer_sha256(lk)
     win = resolve_cycle_window(b.product, b.output, lk.publish_origin_utc)
     mode, f0, st = _open_cycle_inputs(store, b, lk, win, wrfout_dir, synthetic)
     return _stage_cycle(store, b, lk, win, f0, st, mode), len(win.lead_hours)

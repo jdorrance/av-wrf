@@ -33,6 +33,10 @@ in every saved frame, including the full computational grid. The previous
 published interiors contained 8,990 GFS and 8,120 ICON-EU negative slope
 shortwave samples. Both corrected counts were zero.
 
+A three-minute GFS replay showed valid albedo before first light at 03:45Z.
+The first reflected-to-incident shortwave ratio matched the preceding
+albedo within 3.6 × 10⁻⁷. All 21 samples from 03Z to 04Z passed.
+
 The ICON-EU minus GFS mean absolute 2 m difference fell from 1.56 to
 0.78 K and the maximum from 18.32 to 6.38 K. At the original outlier
 cell, the gap changed from +18.32 to −2.15 K. Corrected 10 m wind speed
@@ -40,6 +44,16 @@ mean absolute difference was 0.74 m/s. At one +16 h cell, native wind
 speeds were 0.47 and 10.93 m/s, with parameterized gusts of 0.53 and
 20.17 m/s. At +13 h, one cell had a 905 m boundary-layer depth difference.
 The paired replay measures disagreement; observation scoring is separate.
+
+Reproduce the paired field and radiation audit from local artifacts.
+The baseline and candidate must share grid and time coordinates.
+Field differences use corresponding native model levels.
+
+```sh
+uv run python -m scripts.audit_forecast "$ready" --baseline "$baseline" \
+  --wrfout-dir "$wrfout_dir" --solver-receipt "$solver_receipt" \
+  --require-clean-radiation
+```
 
 The hardened image retained the same WRF, real, and metgrid binaries.
 The smaller ungrib build reproduced all 46 archived WPS intermediates
@@ -87,6 +101,13 @@ across the donor cutout. Ice-bearing regions need an ice-fraction source.
   single 30-minute replays on one ARM64 image. Ten-minute radiation took
   55.61 s and changed the frame. The current configuration uses the
   three-minute setting.
+- **Production geometry.** A cold GFS hour on the 196 × 164 computational
+  grid took 215.6 s to solve with four ranks and a 15 s time step.
+  The WRF process took 208.8 s, including 149.1 s in integration steps.
+  Post and local publication took 0.92 s and 0.23 s. This nighttime
+  scratch run used a zero-spin-up override. The full delivery budget
+  remains a target-host measurement. All 55 GFS forcing files passed
+  native initialization for the full 54-hour bracket in 206.1 s.
 - **Publish.** A retiled 40-lead fixture held 878 objects and 825 MB. ARM64
   Docker Desktop median publish took 3.13 s, including 1.01 s for decode and
   finite checks. A failure after 439 writes left the ready receipt absent.

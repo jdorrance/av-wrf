@@ -67,7 +67,7 @@ def _messages(lock: RunLock, fhr: int) -> list[dict[str, object]]:
         "latitudeOfLastGridPointInDegrees": -90,
         "totalLength": 20,
     }
-    levels = (*range(10, 950, 25), 1000)
+    levels = (*range(10, 810, 25), 1000)
     fields = (
         *_SURFACE,
         *_SOIL,
@@ -118,6 +118,7 @@ class TestForcingManifest(TestCase):
                 work_dir=work,
                 bundle=b,
             )
+            self.assertIn("num_metgrid_levels = 34", (work / "namelist.input.real").read_text())
             subset = json.loads((work / "forcing_subset.json").read_bytes())
             hours = tuple(subset["forecast_hours"])
             cycle = parse_iso_utc(lock.forcing_cycle_utc)

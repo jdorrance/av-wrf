@@ -297,6 +297,9 @@ class TestZarrV3RoundTrip(unittest.TestCase):
             np.testing.assert_allclose(durations_h, (1, 1, 4))
             precip_rate = np.asarray(precip[:, 0, 0], dtype=np.float64)
             np.testing.assert_allclose(np.sum(durations_h * precip_rate), 6 * 0.25)
+            cape = grp["cape_jkg"]
+            assert isinstance(cape, zarr.Array)
+            np.testing.assert_array_equal(cape[:], 320.0)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,8 @@ Source: [`src/av_wrf/cli/main.py`](../src/av_wrf/cli/main.py).
 ## Configured Products
 
 Source: [`config/products/`](../config/README.md).
+The effective remaining-horizon floor also reflects `max_cycle_age_hours`.
+The configured `min_horizon_hours` sets the lower bound.
 
 - `wrf-armenia-3km`: published grid `180 x 148` (`x0M = -268500.0`, `y0M = -220500.0`), primary `noaa-gfs-0p25-v1` (candidate `ecmwf-ifs-0p1-v1`, no solve recipe), `40` leads, `17` BL levels (`0-2 km` AGL), remaining-horizon floor `42 h`, `time_step = 15 s`.
 - `wrf-armenia-pilot-3km-dwd`: published grid `84 x 84` (`x0M = -124500.0`, `y0M = -124500.0`), primary `dwd-icon-eu-v1` (candidate `noaa-gfs-0p25-v1`, recipe available), `16` leads, `17` BL levels (`0-2 km` AGL), remaining-horizon floor `10 h`, `time_step = 15 s`.

@@ -326,18 +326,20 @@ class TestRealNetcdfBoundary(unittest.TestCase):
                 float(np.hypot(4.0, 1.5)) + 7.71 * 0.4,
                 delta=0.001,
             )
+            self.assertEqual(frame3.fields_2d["cape_jkg"].at(0, 0), 340.0)
+            fallback = frame3.fields_2d["mslp_pa"].at(0, 0)
             with netCDF4.Dataset(str(f3_p), mode="a") as ds:
                 mslp = ds.createVariable("AFWA_MSLP", "f4", ("Time", "south_north", "west_east"))
-                mslp[:] = 100_500.0
+                mslp[:] = fallback
                 trim = dom.bdy_trim_cells
                 mslp[f3_i, trim, trim] = 0.0
+                mslp[f3_i, trim, trim + 2] = 100_500.0
             mixed, _ = post_frame(
                 base0, read_wrfout_step_nc(f3_p, dom, sci, time_index=f3_i), dom, sci
             )
-            self.assertEqual(
-                mixed.fields_2d["mslp_pa"].at(0, 0), frame3.fields_2d["mslp_pa"].at(0, 0)
-            )
-            self.assertEqual(mixed.fields_2d["mslp_pa"].at(0, 1), 100_500.0)
+            self.assertEqual(mixed.fields_2d["mslp_pa"].at(0, 0), fallback)
+            self.assertEqual(mixed.fields_2d["mslp_pa"].at(0, 1), fallback)
+            self.assertEqual(mixed.fields_2d["mslp_pa"].at(0, 2), 100_500.0)
 
 
 if __name__ == "__main__":

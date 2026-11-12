@@ -241,10 +241,11 @@ def published_lambert_grid_metadata(domain: DomainProfile) -> dict[str, int | fl
 def computational_latlon_bounds(
     domain: DomainProfile, *, halo_deg: float = 1.0, snap_deg: float = 0.25
 ) -> tuple[float, float, float, float]:
-    """Return snapped forcing bounds, with longitude unwrapped across the dateline."""
+    """Return snapped bounds enclosing the full cell footprint and its forcing halo."""
     if not math.isfinite(halo_deg) or not math.isfinite(snap_deg) or halo_deg < 0 or snap_deg <= 0:
         raise ValueError("Forcing halo must be nonnegative and snap spacing must be positive")
     cx_m, cy_m = _domain_center_xy_m(domain)
+    # The outer cell faces lie half a cell beyond the first and last mass centers.
     hx, hy = (
         0.5 * max(1, domain.e_we - 1) * domain.dx_m,
         0.5 * max(1, domain.e_sn - 1) * domain.dy_m,

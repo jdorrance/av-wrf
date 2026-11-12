@@ -29,9 +29,7 @@ Imports flow strictly top-down (`L4 -> L3 -> L2 -> L1 -> L0`), enforced by
 ```mermaid
 flowchart TB
   cli["L4: av_wrf.cli<br/>CLI flags & sole os.environ reader"] --> runner["L3a: av_wrf.runner<br/>stores, stages, post, publish, solver, dispatch"]
-  cli --> verify["L3b: av_wrf.verify<br/>sounding scorecards"]
   runner --> codecs["L2: av_wrf.codecs<br/>wrf_nc, zarr_shard, zarr_v3"]
-  verify --> codecs
   codecs --> core["L1: av_wrf.core<br/>grid, thermo, schedule, vertical, namelist, post, metrics"]
   core --> contracts["L0: av_wrf.contracts<br/>frozen schemas, RunLock, slabs, NewTypes"]
 ```
@@ -49,6 +47,7 @@ flowchart TB
 - [`src/av_wrf/codecs/`](../src/av_wrf/codecs/README.md): `wrf_nc.py` and
   `wrf_nc_grid.py` reject NetCDF masks/fills, slice `0:k_exp` hyperslabs, verify
   `ZNW` and `XLAT`/`XLONG`, and require `AFWA_CAPE_MU`.
+  Live RRTMG post also checks native surface shortwave and daylight albedo.
   `zarr_shard.py` and `zarr_v3.py` encode ZEP-0002
   padded outer shards with exact `[64, 64]` inner spatial chunks.
 - [`src/av_wrf/runner/`](../src/av_wrf/runner/README.md): `store.py`
@@ -57,7 +56,8 @@ flowchart TB
   (forcing recipe registry and manifest verification), `forcing_gfs.py` and
   `forcing_icon.py` (source availability, acquisition and WPS inventory), `post.py`,
   `publish.py` + `publish_verify.py` (cycle-locked promotion, decoded column
-  admission, stage retention), `solver.py` + `solver_exec.py`, and
+  admission, committed object hash checks on recovery), `solver.py` +
+  `solver_exec.py` (native execution and stage wall times), and
   `dispatch.py` (expiring-lease webhook delivery).
 - A storage adapter must provide opaque conditional-write tokens and exclusive
   cycle ownership through the ready commit. The implemented backend uses a
@@ -74,7 +74,6 @@ flowchart TB
 - WRF boundary forcing enters through the GRIB recipe. A direct native model
   needs its own reader and grid mapping into published fields before reusing
   the Zarr and promotion path.
-- [`src/av_wrf/verify/`](../src/av_wrf/verify/README.md): sounding records and scorecards.
 - [`src/av_wrf/cli/`](../src/av_wrf/cli/README.md): `env.py` (`RuntimeEnv`) and
   `main.py` (`av-wrf` subcommands with lazy store handles and `--store-uri` /
   `--prune-stage`).
@@ -90,8 +89,8 @@ flowchart TB
   clients, subprocesses, `netCDF4`, `zarr`, `os`, `sys`, `importlib`, `random`,
   and wall-clock calls.
 - **Single environment reader.** Only `src/av_wrf/cli/env.py` reads `os.environ`.
-- **Mutual isolation at `L3`.** `runner` never imports `verify`; `verify` never
-  executes WRF, writes `latest.json`, or dispatches webhooks.
+- **Observation verification.** The planned scorecard belongs in a separate
+  `L3` package with no runtime dependency on `runner`.
 - **Zero type-ignore or mutable records.** Every `@dataclass` in `src/` is
   `frozen=True`; `# type: ignore`, `typing.Any`, `abc.ABC`, and relative imports
   are rejected mechanically.

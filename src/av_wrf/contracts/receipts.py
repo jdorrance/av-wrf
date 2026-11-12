@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -62,6 +63,27 @@ def _sha_pair(item: object, key: str) -> tuple[str, str]:
     return item[0], item[1]
 
 
+def _stage_seconds(doc: Mapping[str, object]) -> tuple[tuple[str, float], ...]:
+    raw = doc.get("stage_seconds")
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError("Expected stage_seconds list")
+    stages: list[tuple[str, float]] = []
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError("Invalid stage_seconds entry")
+        name, seconds = item
+        if (
+            not isinstance(name, str)
+            or not name
+            or isinstance(seconds, bool)
+            or not isinstance(seconds, (int, float))
+            or not 0 <= seconds < math.inf
+        ):
+            raise ValueError("Invalid stage_seconds entry")
+        stages.append((name, float(seconds)))
+    return tuple(stages)
+
+
 @dataclass(frozen=True)
 class ForcingManifest:
     """Verified forcing inventory binding source profile, cycle, forecast hours, and SHA-256s."""
@@ -112,11 +134,14 @@ class SolverReceipt:
     forcing_sha256s: tuple[tuple[str, str], ...]
     wrfout_sha256s: tuple[tuple[str, str], ...]
     acquisition_inventory_sha256: str | None = None
+    stage_seconds: tuple[tuple[str, float], ...] = ()
 
     def to_doc(self) -> dict[str, object]:
         doc = dataclasses.asdict(self)
         if self.acquisition_inventory_sha256 is None:
             del doc["acquisition_inventory_sha256"]
+        if not self.stage_seconds:
+            del doc["stage_seconds"]
         return doc
 
     @classmethod
@@ -133,6 +158,7 @@ class SolverReceipt:
             req_str(doc, "acquisition_inventory_sha256")
             if "acquisition_inventory_sha256" in doc
             else None,
+            _stage_seconds(doc) if "stage_seconds" in doc else (),
         )
 
 
@@ -232,7 +258,7 @@ class ReadyReceipt:
 
 @dataclass(frozen=True)
 class DiagnosticsReceipt:
-    """Per-cycle runtime metrics; `max_cfl` is an output-frame Courant proxy on exported cells."""
+    """Runtime metrics and grid-cell means. `max_cfl` is an output-frame Courant proxy."""
 
     model_id: str
     cycle_partition: str
@@ -249,21 +275,6 @@ class DiagnosticsReceipt:
 
     @classmethod
     def from_doc(cls, doc: Mapping[str, object]) -> DiagnosticsReceipt:
-        raw_stages = doc.get("stage_seconds")
-        if not isinstance(raw_stages, (list, tuple)):
-            raise ValueError("Expected stage_seconds list")
-        stages: list[tuple[str, float]] = []
-        for item in raw_stages:
-            if not isinstance(item, (list, tuple)) or len(item) != 2:
-                raise ValueError("Invalid stage_seconds entry")
-            nm, sec = item[0], item[1]
-            if (
-                not isinstance(nm, str)
-                or isinstance(sec, bool)
-                or not isinstance(sec, (int, float))
-            ):
-                raise ValueError("Invalid stage_seconds entry")
-            stages.append((nm, float(sec)))
         raw_dps = doc.get("initial_dps_dt_hpa_hr")
         if not isinstance(raw_dps, (list, tuple)) or any(
             isinstance(x, bool) or not isinstance(x, (int, float)) for x in raw_dps
@@ -273,7 +284,7 @@ class DiagnosticsReceipt:
             req_str(doc, "model_id"),
             req_str(doc, "cycle_partition"),
             req_str(doc, "attempt_id"),
-            tuple(stages),
+            _stage_seconds(doc),
             req_float(doc, "max_cfl"),
             tuple(float(x) for x in raw_dps),
             req_float(doc, "mean_sensible_flux_wm2"),

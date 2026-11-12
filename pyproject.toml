@@ -79,16 +79,11 @@ containers = ["av_wrf"]
 exhaustive = true
 layers = [
   "cli",
-  "runner | verify",
+  "runner",
   "codecs",
   "core",
   "contracts",
 ]
-
-[[tool.importlinter.contracts]]
-name = "Runner and verify are mutually independent"
-type = "independence"
-modules = ["av_wrf.runner", "av_wrf.verify"]
 
 [[tool.importlinter.contracts]]
 name = "Contracts and core forbid side-effecting packages"

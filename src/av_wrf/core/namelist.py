@@ -45,11 +45,7 @@ def _validate_dynamics(science: ScienceProfile, domain: DomainProfile) -> None:
         )
 
 
-def _validate_science_profile(science: ScienceProfile, domain: DomainProfile) -> None:
-    """Enforce domain sizing policy and WRF v4.8 physics, CFL, AFWA, and sponge invariants."""
-    validate_domain_profile(domain)
-    if (science.wrf_version, science.wps_version) != ("4.8.0", "4.7.0"):
-        raise ValueError("Supported namelist versions are WRF 4.8.0 and WPS 4.7.0")
+def _validate_physics_compatibility(science: ScienceProfile) -> None:
     # https://github.com/wrf-model/WRF/wiki/WRF-V4.8.0-Known-Problems
     if science.sf_surface_physics == 4 and science.opt_runsrf == 5:
         raise ValueError("WRF v4.8 Noah-MP forbids opt_runsrf=5 due to runtime/restart bug")
@@ -57,6 +53,28 @@ def _validate_science_profile(science: ScienceProfile, domain: DomainProfile) ->
         raise ValueError("WRF v4.8 requires gwd_if_nonhyd=False when gwd_opt=1")
     if science.shinhong_scu_mixing and science.shinhong_nonlocal_flux:
         raise ValueError("WRF v4.8 forbids shinhong_scu_mixing=True with shinhong_nonlocal_flux")
+    # https://github.com/wrf-model/WRF/blob/v4.8.0/share/module_check_a_mundo.F#L319-L379
+    if science.km_opt == 5 and (
+        science.diff_opt != 2
+        or science.bl_pbl_physics != 0
+        or science.sf_sfclay_physics not in (0, 1, 5, 91)
+        or science.cu_physics == 11  # Same source, scale-aware KF guard.
+    ):
+        raise ValueError(
+            "km_opt=5 requires diff_opt=2, bl_pbl_physics=0, "
+            "sf_sfclay_physics in (0, 1, 5, 91), and cu_physics other than 11"
+        )
+    # https://github.com/wrf-model/WRF/blob/v4.8.0/share/module_check_a_mundo.F#L2114-L2128
+    if (science.bl_pbl_physics == 10) != (science.sf_sfclay_physics == 10):
+        raise ValueError("TEMF requires both bl_pbl_physics=10 and sf_sfclay_physics=10")
+
+
+def _validate_science_profile(science: ScienceProfile, domain: DomainProfile) -> None:
+    """Enforce domain sizing policy and WRF v4.8 physics, CFL, AFWA, and sponge invariants."""
+    validate_domain_profile(domain)
+    if (science.wrf_version, science.wps_version) != ("4.8.0", "4.7.0"):
+        raise ValueError("Supported namelist versions are WRF 4.8.0 and WPS 4.7.0")
+    _validate_physics_compatibility(science)
     if science.use_theta_m not in (0, 1) or not (250.0 <= science.base_temp_k <= 320.0):
         raise ValueError("Invalid use_theta_m or base_temp_k")
     if science.hybrid_opt != 2:
@@ -251,11 +269,9 @@ def compile_wps_namelist_sections(
     fmt = "%Y-%m-%d_%H:%M:%S"
     out = compile_geogrid_namelist_sections(domain)
     out["share"].update(
-        {
-            "start_date": start_dt.strftime(fmt),
-            "end_date": end_dt.strftime(fmt),
-            "interval_seconds": interval_s,
-        }
+        start_date=start_dt.strftime(fmt),
+        end_date=end_dt.strftime(fmt),
+        interval_seconds=interval_s,
     )
     out["ungrib"] = {"out_format": "WPS", "prefix": "FILE"}
     out["metgrid"] = {"fg_name": "FILE", "io_form_metgrid": 2}
@@ -330,6 +346,5 @@ def render_fortran_namelist(sections: NamelistSections) -> str:
         lines.append(f"&{sec_name}")
         for key, val in mapping.items():
             lines.append(f" {key} = {_format_fortran_literal(val)},")
-        lines.append(" /")
-        lines.append("")
+        lines.extend((" /", ""))
     return "\n".join(lines)

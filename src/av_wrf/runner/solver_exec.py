@@ -9,6 +9,7 @@ from datetime import timedelta
 from numbers import Integral
 from pathlib import Path
 from tempfile import mkdtemp
+from time import perf_counter
 
 from av_wrf.codecs import (
     check_geogrid_rotation,
@@ -28,6 +29,7 @@ from av_wrf.core import (
 from av_wrf.runner.bundle import LoadedBundle, load_bundle
 from av_wrf.runner.mirrors import resolve_forcing_window, verify_forcing_manifest
 from av_wrf.runner.solver import (
+    _exec_mpi_step,
     _hash_complete_wrfout,
     _install_solved_attempt,
     _link_file,
@@ -35,10 +37,10 @@ from av_wrf.runner.solver import (
     _recover_solved_attempt,
     _resolve_solver_exe,
     _run_native,
-    load_build_manifest,
+    _verify_runtime_build_manifest,
     verify_solver_receipt,
 )
-from av_wrf.runner.stages import _verify_producer_sha256, load_run_lock
+from av_wrf.runner.stages import load_run_lock, verify_producer_sha256
 from av_wrf.runner.store import (
     ObjectStore,
     _copy_sha256_file,
@@ -46,14 +48,6 @@ from av_wrf.runner.store import (
     sha256_file,
     solver_receipt_key,
 )
-
-
-def _verify_runtime_build_manifest(
-    solver_prefix: Path, lock: RunLock, runtime: BuildManifest
-) -> None:
-    installed = load_build_manifest(solver_prefix / "build-manifest.json", runtime.oci_digest)
-    if installed != runtime or runtime != lock.build_manifest:
-        raise ValueError("Installed solver and runtime build manifests must match the RunLock")
 
 
 def _grib_alpha_suffix(index: int) -> str:
@@ -187,37 +181,6 @@ def _stage_wps_attempt(
     return manifest
 
 
-def _exec_mpi_step(
-    attempt_dir: Path,
-    cmd: list[str],
-    marker: str,
-    timeout_s: int | None,
-    *,
-    reject_cfl: bool = False,
-) -> None:
-    for rsl in attempt_dir.glob("rsl.*"):
-        rsl.unlink()
-    _run_native(cmd, attempt_dir, timeout_s)
-    exe_name = Path(cmd[-1]).name
-    rsl0 = attempt_dir / "rsl.error.0000"
-    if not rsl0.is_file():
-        raise RuntimeError(f"{exe_name} produced no rsl.error.0000 log")
-    completed = False
-    for log in sorted(attempt_dir.glob("rsl.*")) if reject_cfl else (rsl0,):
-        with log.open(encoding="utf-8", errors="replace") as stream:
-            for line in stream:
-                if log == rsl0 and marker in line:
-                    completed = True
-                    if not reject_cfl:
-                        break
-                if reject_cfl:
-                    lowered = line.lower()
-                    if "exceeded cfl" in lowered or "points exceeded v_cfl" in lowered:
-                        raise RuntimeError(f"Solver CFL violation detected in {log.name}")
-    if not completed:
-        raise RuntimeError(f"{exe_name} missing completion marker '{marker}' in rsl.error.0000")
-
-
 def _execute_solver_binaries(
     attempt_dir: Path,
     b: LoadedBundle,
@@ -225,9 +188,16 @@ def _execute_solver_binaries(
     solver_prefix: Path,
     mpi_launcher: tuple[str, ...],
     timeout_s: int | None,
-) -> None:
-    for executable in ("ungrib.exe", "metgrid.exe"):
-        _run_native([str(_resolve_solver_exe(solver_prefix, executable))], attempt_dir, timeout_s)
+) -> tuple[tuple[str, float], ...]:
+    wps = tuple(
+        (
+            stage,
+            _run_native(
+                [str(_resolve_solver_exe(solver_prefix, f"{stage}.exe"))], attempt_dir, timeout_s
+            ),
+        )
+        for stage in ("ungrib", "metgrid")
+    )
     mg_lvls, mg_soil = _inspect_metgrid_dims(attempt_dir, b, lock)
     _link_run_tables(solver_prefix / "share" / "wrf" / "run", attempt_dir)
     namelist = compile_wrf_run_namelist(
@@ -242,7 +212,7 @@ def _execute_solver_binaries(
     namelist_path = attempt_dir / "namelist.input"
     namelist_path.write_text(render_fortran_namelist(namelist), encoding="utf-8")
     rank_cmd = [*mpi_launcher, str(lock.mpi_ranks)]
-    _exec_mpi_step(
+    real = _exec_mpi_step(
         attempt_dir,
         [*rank_cmd, str(_resolve_solver_exe(solver_prefix, "real.exe"))],
         "SUCCESS COMPLETE REAL_EM INIT",
@@ -258,13 +228,14 @@ def _execute_solver_binaries(
         metgrid_soil_levels=mg_soil,
     )
     namelist_path.write_text(render_fortran_namelist(integration), encoding="utf-8")
-    _exec_mpi_step(
+    wrf = _exec_mpi_step(
         attempt_dir,
         [*rank_cmd, str(_resolve_solver_exe(solver_prefix, "wrf.exe"))],
         "SUCCESS COMPLETE WRF",
         timeout_s,
         reject_cfl=True,
     )
+    return (*wps, ("real", real), ("wrf", wrf))
 
 
 def run_wrf_cycle(
@@ -294,7 +265,7 @@ def run_wrf_cycle(
     with store.cycle_lock(receipt_key):
         if store.get_bytes(receipt_key) is not None:
             return verify_solver_receipt(store, lock, attempt_dir)
-        _verify_producer_sha256(lock)
+        verify_producer_sha256(lock)
         if attempt_dir.exists() and not attempt_dir.is_dir():
             raise FileExistsError(f"Solver attempt path is not a directory: {attempt_dir}")
         recovered = _recover_solved_attempt(store, receipt_key, lock, attempt_dir)
@@ -321,13 +292,17 @@ def _solve_in_scratch(
     attempt_dir.parent.mkdir(parents=True, exist_ok=True)
     workspace = Path(mkdtemp(prefix=f".{attempt_dir.name}.solve-", dir=attempt_dir.parent))
     scratch = workspace / "work"
+    started = perf_counter()
     try:
         manifest = _stage_wps_attempt(scratch, bundle, lock, grib_dir, geog_file, solver_prefix)
     except Exception:
         shutil.rmtree(workspace)
         raise
     try:
-        _execute_solver_binaries(scratch, bundle, lock, solver_prefix, mpi_launcher, timeout_s)
+        inputs = perf_counter() - started
+        stages = _execute_solver_binaries(
+            scratch, bundle, lock, solver_prefix, mpi_launcher, timeout_s
+        )
     except Exception as exc:
         exc.add_note(f"Native solver logs are in {scratch}")
         raise
@@ -344,5 +319,6 @@ def _solve_in_scratch(
         acquisition_inventory_sha256=(
             manifest.acquisition_inventory[1] if manifest.acquisition_inventory else None
         ),
+        stage_seconds=(("inputs", inputs), *stages),
     )
     return scratch, receipt

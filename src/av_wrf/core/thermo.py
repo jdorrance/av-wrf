@@ -1,8 +1,7 @@
 """Pure vectorized meteorological formulas, THM consistency, and bit-grooming.
 
 WRF inversion uses fixed `WRF_T0_K = 300.0 K`, `r_d = 287.0`, `cp = 1004.5`, `r_v = 461.6`,
-`xlv = 2.5e6`, and `g = 9.81` (`WRF/share/module_model_constants.F`); the MSLP fallback
-uses a continuous plateau adjustment at `290.5 K`.
+`xlv = 2.5e6`, and `g = 9.81` (`WRF/share/module_model_constants.F`).
 """
 
 from __future__ import annotations
@@ -124,18 +123,22 @@ def geometric_w_to_omega_vec(
     return -(pressure_pa / (R_DRY_J_KG_K * tv_k)) * G0_MPS2 * w_mps
 
 
-def hypsometric_mslp_vec(
+def afwa_mslp_vec(
     psfc_pa: npt.NDArray[np.float64],
     terrain_m: npt.NDArray[np.float64],
-    t2_k: npt.NDArray[np.float64],
-    spfh_2m: npt.NDArray[np.float64],
+    first_height_m: npt.NDArray[np.float64],
+    first_temp_k: npt.NDArray[np.float64],
+    first_mixing_ratio: npt.NDArray[np.float64],
 ) -> npt.NDArray[np.float64]:
-    """Reduce surface pressure to sea level with a continuous plateau adjustment."""
-    tv_sfc = t2_k * (1.0 + VIRTUAL_TEMP_COEFF * np.maximum(0.0, spfh_2m))
-    tv_0 = np.where(tv_sfc < 255.0, 0.5 * (255.0 + tv_sfc), tv_sfc)
-    tv_sl = tv_0 + STD_LAPSE_K_PER_M * terrain_m
-    np.minimum(290.5, tv_sl, out=tv_sl, where=terrain_m > 0.0)
-    tv_mean = np.maximum(180.0, 0.5 * (tv_0 + tv_sl))
+    """Reconstruct AFWA sea-level pressure from the lowest mass level."""
+    # WRF AFWA's Shuell correction, written in virtual temperature rather than tau.
+    # https://github.com/wrf-model/WRF/blob/v4.8.0/phys/module_diag_functions.F#L911-L962
+    tv = first_temp_k * (1.0 + 0.608 * first_mixing_ratio)
+    tv_sfc = tv + STD_LAPSE_K_PER_M * (first_height_m - terrain_m)
+    tv_sl = tv + STD_LAPSE_K_PER_M * first_height_m
+    warm_sfc = np.maximum(0.0, tv_sfc - 290.66)
+    tv_sl = np.where(tv_sl > 290.66, 290.66 - 0.005 * warm_sfc**2, tv_sl)
+    tv_mean = 0.5 * (tv_sfc + tv_sl)
     return psfc_pa * np.exp((G0_MPS2 * terrain_m) / (R_DRY_J_KG_K * tv_mean))
 
 
@@ -175,7 +178,7 @@ def max_random_cloud_cover_pct(
     """Return total and low cloud percent from native cloud and descending pressure columns."""
     # ECMWF's sigma layer uses 0.8*PSFC. The producer contract includes the boundary.
     # https://codes.ecmwf.int/grib/param-db/186
-    # The adjacent-layer clear fraction follows IFS Cy49r1 Part II equation 3.24.
+    # Use maximum-random overlap in native vertical order, IFS Cy49r1 Part II eq. 3.24.
     # https://www.ecmwf.int/sites/default/files/elibrary/112024/81624-ifs-documentation-cy49r1.pdf
     cutoff = np.multiply(psfc_pa, 0.8, dtype=np.float64)
     prev = 1.0 - np.clip(cloud[0], 0.0, 1.0, dtype=np.float64)

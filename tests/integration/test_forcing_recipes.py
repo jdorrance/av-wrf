@@ -215,7 +215,7 @@ class TestForcingRecipes(TestCase):
         frame = "wrfout_d01_fixture"
         contents = tuple(files[hour].read_bytes() for hour in HOURS)
 
-        def execute(attempt: Path, *_args: object) -> None:
+        def execute(attempt: Path, *_args: object) -> tuple[tuple[str, float], ...]:
             self.geo.write_bytes(b"changed geography")
             replacement = grib / "replacement"
             replacement.write_bytes(b"changed forcing")
@@ -226,6 +226,7 @@ class TestForcingRecipes(TestCase):
                 tuple(p.read_bytes() for p in sorted(attempt.glob("GRIBFILE.*"))), contents
             )
             (attempt / frame).touch()
+            return ()
 
         with (
             patch("av_wrf.runner.solver_exec._verify_runtime_build_manifest"),

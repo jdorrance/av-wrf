@@ -36,7 +36,7 @@ FORCING_MANIFEST_FILENAME = "forcing_manifest.json"
 _RECIPES = {recipe.identity: recipe for recipe in (GFS, ICON_EU)}
 
 
-class _ForcingSubset(TypedDict):
+class ForcingSubset(TypedDict):
     product_id: str
     cycle_partition: str
     forcing_profile_id: str
@@ -73,9 +73,9 @@ def resolve_forcing_window(
     return recipe, cycle, hours
 
 
-def _forcing_subset(
+def forcing_subset(
     product_id: str, window: RunLock | CycleWindow, source: ForcingProfile, domain: DomainProfile
-) -> tuple[ForcingRecipe, datetime, _ForcingSubset]:
+) -> tuple[ForcingRecipe, datetime, ForcingSubset]:
     """Build the prep document for the resolved source and boundary cycle."""
     recipe, cycle, hours = resolve_forcing_window(window, source, domain=domain)
     return (
@@ -235,3 +235,14 @@ def verify_forcing_manifest(
             raise ValueError(f"Forcing file SHA-256 mismatch for {fpath}")
         recipe.validate_file(staged, cycle, source, domain, fhr)
     return manifest
+
+
+__all__ = [
+    "FORCING_MANIFEST_FILENAME",
+    "ForcingSubset",
+    "find_forcing_recipe",
+    "forcing_subset",
+    "resolve_forcing_window",
+    "verify_forcing_manifest",
+    "write_forcing_manifest",
+]

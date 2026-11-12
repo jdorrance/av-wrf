@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from av_wrf.contracts.config import OutputProfile
+
 ZARR_SCHEMA_ID = "wrf-zarr-v3"
 ZARR_SCHEMA_VERSION = 1
 ZARR_SCHEMA_STATUS = "provisional-phase-1"
@@ -28,6 +30,20 @@ BL_CEILING_AGL_M = 2_000.0
 DEFAULT_SHARD_TIME_STEP = 1
 DEFAULT_INNER_SPATIAL_CHUNK: tuple[int, int] = (64, 64)
 DEFAULT_ZSTD_LEVEL = 3
+
+
+def validate_zarr_output(output: OutputProfile) -> None:
+    """Require the wire schema's fixed shard layout and compression."""
+    if output.schema_id != ZARR_SCHEMA_ID:
+        raise ValueError(
+            f"OutputProfile.schema_id '{output.schema_id}' != locked '{ZARR_SCHEMA_ID}'"
+        )
+    if (output.shard_time_steps, output.inner_chunk_yx, output.zstd_level) != (
+        DEFAULT_SHARD_TIME_STEP,
+        DEFAULT_INNER_SPATIAL_CHUNK,
+        DEFAULT_ZSTD_LEVEL,
+    ):
+        raise ValueError(f"OutputProfile sharding and compression must match {ZARR_SCHEMA_ID}")
 
 
 def zarr_inner_codecs(zstd_level: int = DEFAULT_ZSTD_LEVEL) -> list[dict[str, object]]:
@@ -135,6 +151,7 @@ __all__ = [
     "ZARR_SCHEMA_VERSION",
     "ZarrCoordSpec",
     "ZarrFieldSpec",
+    "validate_zarr_output",
     "zarr_index_codecs",
     "zarr_inner_codecs",
 ]

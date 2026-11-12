@@ -21,10 +21,10 @@ from av_wrf.core.thermo import (  # noqa: E402
     KAPPA_DRY,
     MOIST_THETA_COEFF,
     WRF_T0_K,
+    afwa_mslp_vec,
     clamp_spfh_2m_vec,
     geometric_w_to_omega_vec,
     groom_f32_buf,
-    hypsometric_mslp_vec,
     max_random_cloud_cover_pct,
     mixing_ratio_to_spfh_vec,
     parameterized_gust_10m_vec,
@@ -65,6 +65,10 @@ class TestThermo(unittest.TestCase):
         )
         np.testing.assert_allclose(total, (75.0, 200.0 / 3.0))
         np.testing.assert_array_equal(low, (50.0, 0.0))
+        reordered, _ = max_random_cloud_cover_pct(
+            fractions[[0, 2, 1, 3]], pressures, np.array([100_000, 120_000], np.float32)
+        )
+        np.testing.assert_array_equal(reordered, (62.5, 50.0))
 
     def test_groom_rounds_ties_to_even_and_preserves_special_values(self) -> None:
         step = 2.0**-15
@@ -115,36 +119,28 @@ class TestThermo(unittest.TestCase):
         self.assertLess(e_pa, es_pa)
 
     def test_mslp_plateau_and_signed_height(self) -> None:
-        mslp = hypsometric_mslp_vec(
+        mslp = afwa_mslp_vec(
             _arr(100_000, 85_000, 85_000, 70_000, 70_000, 105_000, 105_000),
             _arr(0, 1500, 1500, 3000, 3000, -400, -400),
+            _arr(25, 1524, 1524, 3023, 3023, -375, -375),
             _arr(250, 250, 284, 290.5, 305, 280, 305),
-            _arr(0),
+            _arr(0.01, 0.005, 0.008, 0.012, 0, 0.01, 0),
         )
-        # Scalar hypsometric references with mean temperatures 257.375, 287.25, 290.5,
-        # 297.75, 278.7 and 303.7 K for the nonzero heights.
+        # WRF v4.8.0 module_diag_functions.F MSLP, compiled in default Fortran REAL.
         np.testing.assert_allclose(
             mslp,
             (
                 100000,
-                103737.291254,
-                101610.114508,
-                99632.169654,
-                98779.495698,
-                99973.216679,
-                100377.761113,
+                103865.3359375,
+                101556.703125,
+                99487.1875,
+                98821.84375,
+                100005.8203125,
+                100281.8515625,
             ),
             rtol=0.0,
-            atol=1e-6,
+            atol=0.02,
         )
-        p_lo, p_hi = hypsometric_mslp_vec(
-            _arr(54_000.0), _arr(5_000.0), _arr(257.99, 258.01), _arr(0)
-        )
-        self.assertLess(abs(p_hi - p_lo), 5.0)
-        p_warm_lo, p_warm_hi = hypsometric_mslp_vec(
-            _arr(70_000.0), _arr(3_000.0), _arr(290.49, 290.51), _arr(0)
-        )
-        self.assertLess(abs(p_warm_hi - p_warm_lo), 5.0)
 
     def test_gust_matches_ifs_similarity_cases(self) -> None:
         gust = parameterized_gust_10m_vec(

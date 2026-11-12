@@ -14,6 +14,7 @@ from av_wrf.codecs.wrf_nc_grid import (
     parse_wrf_timestamp,
     rotation_sine_needs_flip,
     select_cycle_wrfout_slices,
+    slice_nc_var,
     validate_wrfinput_nc,
     verify_local_wrf_nc,
     verify_wrfout_grid_against_domain,
@@ -34,6 +35,8 @@ from av_wrf.contracts import (
     Slab3DF32,
 )
 from av_wrf.core import verify_t_thm_consistency
+
+RRTMG_SHORTWAVE_TOLERANCE_WM2 = 0.01
 
 
 def _f32_buf(arr: np.ndarray[tuple[int, ...], np.dtype[np.float32]]) -> array[float]:
@@ -71,6 +74,44 @@ def _rz_nc(
     return CompStagZ3D(Slab3DF32(nz_faces, ny, nx, _f32_buf(arr)))
 
 
+def _verify_surface_shortwave(
+    v: Mapping[str, object],
+    nc_path: Path,
+    time_index: int,
+    shape: tuple[int, int],
+    science: ScienceProfile | None,
+    *,
+    required: bool,
+) -> None:
+    if science is None or science.ra_sw_physics != 4:
+        return
+    missing = [name for name in ("SWDNB", "SWUPB", "ALBEDO") if name not in v]
+    label = f"{nc_path}: RRTMG surface shortwave [t={time_index}]"
+    if missing:
+        if required:
+            raise ValueError(f"{label} missing {', '.join(missing)}")
+        return
+    # RRTMG stores contemporaneous fluxes at the same bottom plane.
+    # https://github.com/wrf-model/WRF/blob/v4.8.0/phys/module_ra_rrtmg_sw.F#L10790-L10799
+    down = extract_clean_f32_nc(v, nc_path, "SWDNB", time_index, shape)
+    up = extract_clean_f32_nc(v, nc_path, "SWUPB", time_index, shape)
+    tol_wm2 = RRTMG_SHORTWAVE_TOLERANCE_WM2
+    down_min, up_min = float(down.min()), float(up.min())
+    if min(down_min, up_min) < -tol_wm2:
+        raise ValueError(f"{label} negative flux (SWDNB {down_min:g}, SWUPB {up_min:g} W/m²)")
+    excess = float(np.max(up - down))
+    if excess > tol_wm2:
+        raise ValueError(f"{label} SWUPB exceeds SWDNB by {excess:g} W/m²")
+    lit = down > tol_wm2
+    if np.any(lit):
+        albedo = np.ma.asarray(slice_nc_var(v, "ALBEDO", time_index))
+        if albedo.shape != shape or albedo.dtype.kind != "f":
+            raise ValueError(f"{label} ALBEDO expected float shape {shape}")
+        values = albedo[lit]
+        if np.ma.is_masked(values) or not 0.0 <= float(values.min()) <= float(values.max()) <= 1.0:
+            raise ValueError(f"{label} daylight ALBEDO outside [0, 1] or masked")
+
+
 def read_wrfout_baseline_nc(
     nc_path: Path,
     domain: DomainProfile,
@@ -78,8 +119,9 @@ def read_wrfout_baseline_nc(
     time_index: int = 0,
     expected_valid_utc: str | None = None,
     science: ScienceProfile | None = None,
+    require_surface_shortwave: bool = False,
 ) -> RawWrfBaselineInput:
-    """Read minimal 2D accumulator baseline fields + verify grid without loading 3D volumes."""
+    """Read 2D accumulator baseline and verify grid and available RRTMG surface shortwave."""
     verify_local_wrf_nc(nc_path)
     import netCDF4
 
@@ -91,6 +133,9 @@ def read_wrfout_baseline_nc(
         if expected_valid_utc is not None and iso_utc != expected_valid_utc:
             raise ValueError(f"wrfout Times {iso_utc} != expected {expected_valid_utc}")
         v = ds.variables
+        _verify_surface_shortwave(
+            v, nc_path, time_index, (ny, nx), science, required=require_surface_shortwave
+        )
         s2 = {
             k: _r2_nc(v, nc_path, k, time_index, ny, nx)
             for k in ("HGT", "PSFC", "ACHFX", "ACLHF", "RAINC", "RAINNC")
@@ -250,8 +295,9 @@ def read_wrfout_step_nc(
     *,
     time_index: int = 0,
     expected_valid_utc: str | None = None,
+    require_surface_shortwave: bool = False,
 ) -> RawWrfStepInput:
-    """Read one wrfout time with full pressure/cloud columns and export-level hyperslabs."""
+    """Read one wrfout time and verify RRTMG shortwave if present or required by the caller."""
     verify_local_wrf_nc(nc_path)
     import netCDF4
 
@@ -262,6 +308,14 @@ def read_wrfout_step_nc(
         stamp = parse_wrf_timestamp(raw_t)
         if expected_valid_utc is not None and stamp[0] != expected_valid_utc:
             raise ValueError(f"wrfout Times {stamp[0]} != expected {expected_valid_utc}")
+        _verify_surface_shortwave(
+            ds.variables,
+            nc_path,
+            time_index,
+            (dims[0], dims[1]),
+            science,
+            required=require_surface_shortwave,
+        )
         step = _assemble_step_from_vars(ds.variables, nc_path, stamp, time_index, dims, science)
     cosine = np.frombuffer(step.cos_alpha.buf, np.float32).reshape(xlong.shape)
     sine = np.frombuffer(step.sin_alpha.buf, np.float32).reshape(xlong.shape)
@@ -271,6 +325,7 @@ def read_wrfout_step_nc(
 
 
 __all__ = [
+    "RRTMG_SHORTWAVE_TOLERANCE_WM2",
     "RawWrfBaselineInput",
     "RawWrfStepInput",
     "read_wrfout_baseline_nc",

@@ -49,6 +49,7 @@ from av_wrf.contracts import (  # noqa: E402
     PubMass3D,
     Slab2DF32,
     Slab3DF32,
+    parse_output_profile,
     zarr_index_codecs,
     zarr_inner_codecs,
 )
@@ -162,6 +163,8 @@ class TestVendorZarrContract(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, ZARR_SCHEMA_ID),
                 ):
                     build_zarr_v3_store_metadata(b.domain, changed, leads)
+                with self.assertRaisesRegex(ValueError, ZARR_SCHEMA_ID):
+                    parse_output_profile(dataclasses.asdict(changed))
 
         self.assertEqual(cli_main(["check", "--config-dir", str(ROOT / "config")]), 0)
         prod_id = sorted((ROOT / "config" / "products").glob("*.yaml"))[0].stem

@@ -1,8 +1,7 @@
 # `av_wrf.core` (`L1`)
 
 Pure deterministic spherical Lambert geometry, schedule/horizon math, vertical
-level checks, WRF v4.8 namelists, `post_frame` physics, and
-soaring column metrics.
+level checks, WRF v4.8 namelists, `post_frame` physics, and spin-up metrics.
 
 ```python
 from av_wrf.core import (

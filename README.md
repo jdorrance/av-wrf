@@ -42,7 +42,6 @@ python3 scripts/check_repo.py
 - [src/av_wrf/runner](src/av_wrf/runner/README.md): `flock`-serialized local storage,
   GFS and ICON-EU forcing recipes, attempt-staged `post`, full-horizon `publish`, and
   idempotent webhook dispatch.
-- [src/av_wrf/verify](src/av_wrf/verify/README.md): sounding-based soaring proxies.
 - [src/av_wrf/cli](src/av_wrf/cli/README.md): `av-wrf` CLI entrypoint and sole
   `os.environ` reader.
 - [config](config/README.md): sole owner of declarative regional product and

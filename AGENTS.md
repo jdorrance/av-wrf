@@ -61,6 +61,6 @@ its space.
   not in the Zarr writer." State a negative only for deliberate architectural
   absences at a layer boundary.
 - **Cut defensive disclaimers.** Encode units, staggering, and reference frames
-  in types (`TempK`, `EarthWindMps`, `OmegaPaS`, `PubMass3D`) instead of prose.
+  in field names and types such as `PubMass3D`.
 - **Leave schemas and standard specs in code.** Link to the owning module or
   upstream specification rather than restating field bounds in Markdown.

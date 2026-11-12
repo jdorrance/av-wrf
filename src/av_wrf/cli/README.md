@@ -13,7 +13,7 @@ to `publish` and `reconcile` for separate destinations.
 Set `AV_WRF_WEBHOOK_URL` to an HTTPS endpoint with a plain URL path. For an
 authenticated endpoint, set `AV_WRF_WEBHOOK_TOKEN` for Bearer authentication.
 
-- **Allowed imports:** `av_wrf.contracts`, `av_wrf.runner`, `av_wrf.verify`,
+- **Allowed imports:** `av_wrf.contracts`, `av_wrf.runner`,
   and Python CLI/env stdlib modules (`argparse`, `os` in `env.py` only).
 - **Forbidden:** hardcoded product/region defaults, physics math, file codecs,
   retry loops, or direct storage queries.

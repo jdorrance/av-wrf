@@ -17,15 +17,13 @@ from time import sleep
 import httpx
 
 from av_wrf.codecs import IconGribCutout, verify_icon_object
-from av_wrf.core import resolve_cycle_window
-from av_wrf.runner.bundle import LoadedBundle, load_bundle
+from av_wrf.runner.bundle import LoadedBundle, load_forcing_plan
 from av_wrf.runner.forcing_icon import (
     ICON_EU,
     ICON_INPUT_SELECTORS,
     ICON_INVARIANT_FIELDS,
     icon_input_metadata,
 )
-from av_wrf.runner.mirrors import _forcing_subset
 from av_wrf.runner.store import LocalFileStore, json_bytes, put_idempotent, sha256_hex
 
 _WORKERS = 24
@@ -55,17 +53,7 @@ def _retry_delay(error: httpx.HTTPError, delay: float) -> float | None:
 def _read_plan(
     plan_path: Path, config_root: Path
 ) -> tuple[LoadedBundle, datetime, _Bounds, _ObjectKeysByHour]:
-    doc = json.loads(plan_path.read_bytes())
-    if not isinstance(doc, dict):
-        raise ValueError("Expected an ICON-EU forcing_subset.json object")
-    product, partition = doc.get("product_id"), doc.get("cycle_partition")
-    if not isinstance(product, str) or not isinstance(partition, str):
-        raise ValueError("Forcing plan requires product_id and cycle_partition")
-    bundle = load_bundle(config_root, product)
-    window = resolve_cycle_window(bundle.product, bundle.output, partition)
-    recipe, cycle, expected = _forcing_subset(product, window, bundle.primary_source, bundle.domain)
-    if recipe is not ICON_EU or any(doc.get(key) != value for key, value in expected.items()):
-        raise ValueError("Forcing plan differs from the configured ICON-EU inventory")
+    bundle, cycle, expected = load_forcing_plan(plan_path, config_root, ICON_EU)
     groups: _ObjectKeysByHour = {}
     for hour, keys in expected["file_keys"].items():
         if isinstance(keys, str):

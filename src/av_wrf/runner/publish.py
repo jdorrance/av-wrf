@@ -30,7 +30,7 @@ from av_wrf.runner.publish_verify import (
     verify_staged_objects,
 )
 from av_wrf.runner.solver import verify_solver_receipt
-from av_wrf.runner.stages import _verify_producer_sha256, load_run_lock
+from av_wrf.runner.stages import load_run_lock, verify_producer_sha256
 from av_wrf.runner.store import (
     CASConflict,
     ObjectStore,
@@ -239,7 +239,7 @@ def _promote_under_cycle_lock(
             return already
         if not is_synth and lock.producer_sha256 is None:
             raise ValueError("Live publication requires a producer SHA-256; plan a new attempt")
-        _verify_producer_sha256(lock)
+        verify_producer_sha256(lock)
         owner_key = f"{pub_root}/_promotion_owner.json"
         owner_doc = json_bytes({"attempt_id": lock.attempt_id, "post_manifest_sha256": pm_sha256})
         prior_owner, owner_tok = dst_store.get_with_token(owner_key)

@@ -24,8 +24,8 @@ from av_wrf.core import (
     render_fortran_namelist,
     resolve_cycle_window,
 )
-from av_wrf.runner.bundle import LoadedBundle, _require_segment, load_bundle, validate_bundle
-from av_wrf.runner.mirrors import _forcing_subset, find_forcing_recipe
+from av_wrf.runner.bundle import LoadedBundle, load_bundle, require_path_segment, validate_bundle
+from av_wrf.runner.mirrors import find_forcing_recipe, forcing_subset
 from av_wrf.runner.store import ObjectStore, json_bytes, run_lock_key, sha256_file
 
 
@@ -77,7 +77,7 @@ def plan_product_cycle(
     bundle: LoadedBundle | None = None,
 ) -> tuple[str, RunLock]:
     """Persist an immutable RunLock and accept an identical retry."""
-    _require_segment(attempt_id, "attempt_id")
+    require_path_segment(attempt_id, "attempt_id")
     b = load_bundle(config_root, product_id) if bundle is None else bundle
     window = resolve_cycle_window(b.product, b.output, publish_origin_utc)
     validate_bundle(b, publish_origin_utc=window.publish_origin_utc)
@@ -110,7 +110,8 @@ def _producer_sha256() -> str:
     return digest.hexdigest()
 
 
-def _verify_producer_sha256(lock: RunLock) -> None:
+def verify_producer_sha256(lock: RunLock) -> None:
+    """Verify the producer source tree against the recorded run-lock digest."""
     if lock.producer_sha256 is not None and lock.producer_sha256 != _producer_sha256():
         raise ValueError("Producer code SHA-256 drifted from frozen RunLock")
 
@@ -173,8 +174,8 @@ def load_run_lock(
     bundle: LoadedBundle,
 ) -> RunLock:
     """Read a RunLock and verify its attempt key and configured cycle binding."""
-    _require_segment(product_id, "product_id")
-    _require_segment(attempt_id, "attempt_id")
+    require_path_segment(product_id, "product_id")
+    require_path_segment(attempt_id, "attempt_id")
     if not re.fullmatch(r"[0-9]{8}/[0-9]{2}", cycle_partition):
         raise ValueError("cycle_partition must be YYYYMMDD/HH")
     raw_bytes = store.get_bytes(run_lock_key(product_id, cycle_partition, attempt_id))
@@ -223,7 +224,7 @@ def prep_cycle_namelists(
     b = load_bundle(config_root, product_id) if bundle is None else bundle
     lk = load_run_lock(store, product_id, cycle_partition, attempt_id, bundle=b)
     source = b.primary_source
-    _, _, subset = _forcing_subset(lk.product_id, lk, source, b.domain)
+    _, _, subset = forcing_subset(lk.product_id, lk, source, b.domain)
     work_dir.mkdir(parents=True, exist_ok=True)
     wps_path, wrf_path = work_dir / "namelist.wps", work_dir / "namelist.input"
     wps_path.write_text(
@@ -242,3 +243,13 @@ def prep_cycle_namelists(
     )
     (work_dir / "forcing_subset.json").write_bytes(json_bytes(subset))
     return wps_path, wrf_path
+
+
+__all__ = [
+    "check_all_products",
+    "check_product_config",
+    "load_run_lock",
+    "plan_product_cycle",
+    "prep_cycle_namelists",
+    "verify_producer_sha256",
+]

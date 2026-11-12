@@ -22,11 +22,12 @@ uv run av-wrf check
   to preserve their RunLock config hashes.
   Solve uses dimensions observed in `met_em`. Set `use_sh_qv` for inputs that
   preserve specific humidity through WPS into `real.exe`.
-  `check` reports whether the candidate has a solve recipe.
-- `profiles/outputs/*.yaml`: lead hours, interval transitions, and Zarr v3
-  `sharding_indexed` tile/time-step policy.
+  A candidate records a comparison source. `check` reports its recipe
+  availability. The scheduled run uses the primary source.
+- `profiles/outputs/*.yaml`: lead hours, interval transitions, and the fixed
+  Zarr v3 shard settings required by the wire schema.
 
 Unknown keys, templating syntax, and environment interpolation are rejected at
-parse time (`contracts/config.py`), and `scripts/check_repo.py` rejects any
+parse time, and `scripts/check_repo.py` rejects any
 region or product identifier hardcoded outside `config/`. Run
 `uv run python scripts/generate_reference.py` after editing any profile.

@@ -21,13 +21,7 @@ from av_wrf.core.grid import (
     published_lambert_grid_metadata,
     validate_domain_profile,
 )
-from av_wrf.core.metrics import (
-    capping_inversion_strength_k,
-    interpolate_at_height_agl,
-    mixed_layer_depth_agl_m,
-    pressure_tendency_abs_hpa_hr,
-    vector_wind_shear_mps,
-)
+from av_wrf.core.metrics import pressure_tendency_abs_hpa_hr
 from av_wrf.core.namelist import (
     compile_geogrid_namelist_sections,
     compile_wps_namelist_sections,
@@ -61,8 +55,8 @@ from av_wrf.core.thermo import (
     P0_PA,
     R_DRY_J_KG_K,
     WRF_T0_K,
+    afwa_mslp_vec,
     groom_f32_buf,
-    hypsometric_mslp_vec,
     validate_thermodynamic_field,
     verify_t_thm_consistency,
 )
@@ -102,9 +96,9 @@ __all__ = [
     "NormalizedWrfFrame",
     "RawWrfBaselineInput",
     "RawWrfStepInput",
+    "afwa_mslp_vec",
     "auto_eta_faces",
     "build_accum_baseline",
-    "capping_inversion_strength_k",
     "compile_geogrid_namelist_sections",
     "compile_wps_namelist_sections",
     "compile_wrf_namelist_sections",
@@ -118,14 +112,11 @@ __all__ = [
     "crop_sponge_2d",
     "estimate_auto_levels_agl_m",
     "groom_f32_buf",
-    "hypsometric_mslp_vec",
-    "interpolate_at_height_agl",
     "is_cycle_live_fresh",
     "lambert_grid_to_earth_trig",
     "lambert_map_scale",
     "lambert_xy_m_to_latlon",
     "latlon_to_lambert_xy_m",
-    "mixed_layer_depth_agl_m",
     "model_column_spacing",
     "parse_cycle_arg",
     "post_frame",
@@ -146,6 +137,5 @@ __all__ = [
     "validate_thermodynamic_field",
     "validate_vertical_column",
     "validate_wrfinput_columns",
-    "vector_wind_shear_mps",
     "verify_t_thm_consistency",
 ]

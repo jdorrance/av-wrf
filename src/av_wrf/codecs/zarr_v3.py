@@ -12,9 +12,6 @@ import math
 from av_wrf.codecs.zarr_shard import outer_shard_yx, resolve_inner_chunk_yx
 from av_wrf.contracts import (
     CAPE_PARCEL_DEFINITION,
-    DEFAULT_INNER_SPATIAL_CHUNK,
-    DEFAULT_SHARD_TIME_STEP,
-    DEFAULT_ZSTD_LEVEL,
     LOW_CLOUD_DEFINITION,
     MOISTURE_SOURCE_OF_TRUTH,
     TEMPERATURE_DEFINITION,
@@ -22,13 +19,13 @@ from av_wrf.contracts import (
     WRF_ZARR_V3_FIELD_NAMES,
     WRF_ZARR_V3_FIELDS,
     ZARR_FORMAT_VERSION,
-    ZARR_SCHEMA_ID,
     ZARR_SCHEMA_STATUS,
     ZARR_SCHEMA_VERSION,
     DomainProfile,
     OutputProfile,
     ZarrCoordSpec,
     ZarrFieldSpec,
+    validate_zarr_output,
     zarr_index_codecs,
     zarr_inner_codecs,
 )
@@ -145,16 +142,7 @@ def build_zarr_v3_store_metadata(
     lead_hours: tuple[int, ...],
 ) -> dict[str, dict[str, object]]:
     """Build complete Zarr v3 metadata map (root group, 7 coords, and 22 sharded arrays)."""
-    if output.schema_id != ZARR_SCHEMA_ID:
-        raise ValueError(
-            f"OutputProfile.schema_id '{output.schema_id}' != locked '{ZARR_SCHEMA_ID}'"
-        )
-    if (output.shard_time_steps, output.inner_chunk_yx, output.zstd_level) != (
-        DEFAULT_SHARD_TIME_STEP,
-        DEFAULT_INNER_SPATIAL_CHUNK,
-        DEFAULT_ZSTD_LEVEL,
-    ):
-        raise ValueError(f"OutputProfile sharding and compression must match {ZARR_SCHEMA_ID}")
+    validate_zarr_output(output)
     nj, ni = published_grid_shape(domain)
     t_len = len(lead_hours)
     k_len = domain.exported_levels_k

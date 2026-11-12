@@ -47,7 +47,6 @@ DECLARED_MARKDOWN: frozenset[str] = frozenset(
         "src/av_wrf/core/README.md",
         "src/av_wrf/codecs/README.md",
         "src/av_wrf/runner/README.md",
-        "src/av_wrf/verify/README.md",
         "src/av_wrf/cli/README.md",
     }
 )
@@ -59,6 +58,8 @@ def _render_products_section(repo: Path) -> list[str]:
         "## Configured Products",
         "",
         "Source: [`config/products/`](../config/README.md).",
+        "The effective remaining-horizon floor also reflects `max_cycle_age_hours`.",
+        "The configured `min_horizon_hours` sets the lower bound.",
         "",
     ]
     for info in check_all_products(repo / "config"):

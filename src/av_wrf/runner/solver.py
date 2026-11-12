@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import Path
 from tempfile import mkdtemp
+from time import perf_counter
 
 from av_wrf.codecs import select_cycle_wrfout_slices
 from av_wrf.contracts import BuildManifest, CycleWindow, RunLock, SolverReceipt
@@ -26,11 +27,12 @@ from av_wrf.runner.store import (
 _LOCAL_SOLVER_RECEIPT = ".solver-receipt.json"
 
 
-def _run_native(command: list[str], cwd: Path, timeout_s: int | None) -> None:
-    """Run a local native stage and cancel its process group if its deadline expires."""
+def _run_native(command: list[str], cwd: Path, timeout_s: int | None) -> float:
+    """Return native stage wall seconds and cancel its process group on timeout."""
+    started = perf_counter()
     if timeout_s is None:
         subprocess.run(command, cwd=cwd, check=True)
-        return
+        return perf_counter() - started
     if timeout_s < 1:
         raise ValueError("Native stage timeout must be positive")
     with subprocess.Popen(command, cwd=cwd, start_new_session=True) as process:
@@ -42,6 +44,39 @@ def _run_native(command: list[str], cwd: Path, timeout_s: int | None) -> None:
             raise
     if code:
         raise subprocess.CalledProcessError(code, command)
+    return perf_counter() - started
+
+
+def _exec_mpi_step(
+    attempt_dir: Path,
+    cmd: list[str],
+    marker: str,
+    timeout_s: int | None,
+    *,
+    reject_cfl: bool = False,
+) -> float:
+    for rsl in attempt_dir.glob("rsl.*"):
+        rsl.unlink()
+    seconds = _run_native(cmd, attempt_dir, timeout_s)
+    exe_name = Path(cmd[-1]).name
+    rsl0 = attempt_dir / "rsl.error.0000"
+    if not rsl0.is_file():
+        raise RuntimeError(f"{exe_name} produced no rsl.error.0000 log")
+    completed = False
+    for log in sorted(attempt_dir.glob("rsl.*")) if reject_cfl else (rsl0,):
+        with log.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if log == rsl0 and marker in line:
+                    completed = True
+                    if not reject_cfl:
+                        break
+                if reject_cfl:
+                    lowered = line.lower()
+                    if "exceeded cfl" in lowered or "points exceeded v_cfl" in lowered:
+                        raise RuntimeError(f"Solver CFL violation detected in {log.name}")
+    if not completed:
+        raise RuntimeError(f"{exe_name} missing completion marker '{marker}' in rsl.error.0000")
+    return seconds
 
 
 def _resolve_solver_exe(solver_prefix: Path, exe_name: str) -> Path:
@@ -132,6 +167,14 @@ def load_build_manifest(
             f"Missing solver build manifest at {manifest_path}; pass --allow-unpinned-dev for dev"
         )
     return BuildManifest("host-dev-unpinned", "host-unbuilt", "host-unbuilt", (), "host", "host")
+
+
+def _verify_runtime_build_manifest(
+    solver_prefix: Path, lock: RunLock, runtime: BuildManifest
+) -> None:
+    installed = load_build_manifest(solver_prefix / "build-manifest.json", runtime.oci_digest)
+    if installed != runtime or runtime != lock.build_manifest:
+        raise ValueError("Installed solver and runtime build manifests must match the RunLock")
 
 
 def _wrfout_files(wrfout_dir: Path) -> list[Path]:

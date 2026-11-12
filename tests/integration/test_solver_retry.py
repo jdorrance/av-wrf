@@ -75,12 +75,13 @@ def test_native_retry_recovers_output_after_receipt_write_failure(tmp_path: Path
         scratch.mkdir()
         return manifest
 
-    def native(scratch: Path, *_args: object) -> None:
+    def native(scratch: Path, *_args: object) -> tuple[tuple[str, float], ...]:
         calls.append(scratch)
         (scratch / "native.log").touch()
         if len(calls) == 1:
             raise RuntimeError("native failed")
         (scratch / OUTPUT).write_bytes(b"complete WRF output")
+        return (("wrf", 1.5),)
 
     with (
         patch("av_wrf.runner.solver_exec._verify_runtime_build_manifest"),
@@ -102,6 +103,8 @@ def test_native_retry_recovers_output_after_receipt_write_failure(tmp_path: Path
         receipt = run()
     assert len(calls) == 2
     assert receipt.wrfout_sha256s == ((OUTPUT, sha256_file(final / OUTPUT)),)
+    assert dict(receipt.stage_seconds)["wrf"] == 1.5
+    assert "inputs" in dict(receipt.stage_seconds)
     assert len(list(final.parent.glob(".retry.previous-*/work/old.log"))) == 1
 
 

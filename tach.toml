@@ -44,12 +44,6 @@ depends_on = [
     "av_wrf.core",
 ]
 
-[[modules]]
-path = "av_wrf.verify"
-depends_on = [
-    "av_wrf.core",
-]
-
 [[interfaces]]
 expose = [
     "[A-Za-z][A-Za-z0-9_]*",
@@ -59,6 +53,5 @@ from = [
     "av_wrf.core",
     "av_wrf.codecs",
     "av_wrf.runner",
-    "av_wrf.verify",
     "av_wrf.cli",
 ]
