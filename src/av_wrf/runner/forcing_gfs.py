@@ -211,7 +211,7 @@ GFS = ForcingRecipe(
         "SNOW",
         "SEAICE",
     ),
-    metgrid_soil_dimensions=("num_st_layers",),
+    metgrid_soil_dimensions=("num_st_layers", "num_sm_layers"),
 )
 
 __all__ = ["GFS"]

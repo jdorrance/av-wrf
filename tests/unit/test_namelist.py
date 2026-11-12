@@ -97,6 +97,8 @@ class TestNamelist(unittest.TestCase):
             dom, sci, src, metgrid_levels=38, metgrid_soil_levels=4
         )
         self.assertEqual(override["domains"]["num_metgrid_levels"], 38)
+        with self.assertRaisesRegex(ValueError, "at least two"):
+            compile_wrf_namelist_sections(dom, sci, src, metgrid_soil_levels=1)
 
         for bad in (
             dataclasses.replace(sci, opt_runsrf=5),

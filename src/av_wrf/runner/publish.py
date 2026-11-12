@@ -202,7 +202,7 @@ def publish_cycle_receipt(
 
     window = resolve_cycle_window(b.product, b.output, lock.publish_origin_utc)
     pm = validate_post_manifest(json.loads(pm_raw.decode("utf-8")), b, window)
-    if pm.producer_sha256 is not None and pm.producer_sha256 != lock.producer_sha256:
+    if pm.producer_sha256 != lock.producer_sha256:
         raise ValueError("Staged producer SHA-256 differs from the RunLock")
     is_synth = pm.execution_mode == "synthetic"
     if is_synth and not allow_synthetic:

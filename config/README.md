@@ -18,6 +18,8 @@ uv run av-wrf check
   grid spacing after any remapping, WPS table, metgrid level counts, mirrors,
   and dissemination lag. GFS is the verified solve recipe.
   New profiles use `metgrid_levels` and `metgrid_soil_levels` for prep.
+  Existing bundles retain `pressure_level_count` and `soil_layer_centers_cm`
+  to preserve their RunLock config hashes.
   Solve uses dimensions observed in `met_em`. Set `use_sh_qv` for inputs that
   preserve specific humidity through WPS into `real.exe`.
   `check` reports whether the candidate has a solve recipe.
@@ -27,4 +29,4 @@ uv run av-wrf check
 Unknown keys, templating syntax, and environment interpolation are rejected at
 parse time (`contracts/config.py`), and `scripts/check_repo.py` rejects any
 region or product identifier hardcoded outside `config/`. Run
-`python3 scripts/generate_reference.py` after editing any profile.
+`uv run python scripts/generate_reference.py` after editing any profile.

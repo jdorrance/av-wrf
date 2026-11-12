@@ -120,6 +120,8 @@ class TestSolverCompletion(TestCase):
                     ds.createDimension("DateStrLen", 19)
                     ds.createDimension("num_metgrid_levels", 2)
                     ds.createDimension("num_st_layers", 4)
+                    ds.createDimension("num_sm_layers", 4)
+                    ds.setncattr("NUM_METGRID_SOIL_LEVELS", 4)
                     times = ds.createVariable("Times", "S1", ("Time", "DateStrLen"))
                     times[0] = np.frombuffer(stamp.encode("ascii"), dtype="S1")
                     for field in set(GFS.metgrid_fields) | {"TT", "PRES"}:

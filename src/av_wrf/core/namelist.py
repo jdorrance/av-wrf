@@ -129,8 +129,8 @@ def compile_wrf_namelist_sections(
     soil_levels = (
         forcing.metgrid_soil_levels if metgrid_soil_levels is None else metgrid_soil_levels
     )
-    if mg_levels < 2 or soil_levels < 1 or forcing.interval_seconds < 1:
-        raise ValueError("metgrid levels and forcing interval_seconds must be positive")
+    if min(mg_levels, soil_levels) < 2 or forcing.interval_seconds < 1:
+        raise ValueError("WRF requires at least two air and soil levels and a positive interval")
     return {
         "time_control": {
             "interval_seconds": forcing.interval_seconds,

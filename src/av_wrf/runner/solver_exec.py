@@ -7,6 +7,7 @@ import re
 import subprocess
 from collections.abc import Mapping
 from datetime import timedelta
+from numbers import Integral
 from pathlib import Path
 
 from av_wrf.codecs import check_geogrid_rotation, validate_wrfinput_nc, verify_grid_against_domain
@@ -124,19 +125,31 @@ def _inspect_metgrid_dims(attempt_dir: Path, b: LoadedBundle, lock: RunLock) -> 
     files = tuple(attempt_dir / f"met_em.d01.{date}.nc" for date in dates)
     if set(attempt_dir.glob("met_em.d01.*.nc")) != set(files):
         raise RuntimeError("metgrid timestamps differ from the RunLock forcing window")
-    dims_seen: set[tuple[int, tuple[int, ...]]] = set()
+    dimensions = ("num_metgrid_levels", *recipe.metgrid_soil_dimensions)
+    dims_seen: set[tuple[tuple[int, ...], int]] = set()
     for path, date in zip(files, dates, strict=True):
         with netCDF4.Dataset(str(path), mode="r") as ds:
             if bytes(ds["Times"][0].tobytes()).decode("ascii") != date:
                 raise ValueError(f"met_em Times does not match filename: {path}")
-            soil_levels = tuple(len(ds.dimensions[name]) for name in recipe.metgrid_soil_dimensions)
-            dims_seen.add((len(ds.dimensions["num_metgrid_levels"]), soil_levels))
+            try:
+                counts = tuple(len(ds.dimensions[name]) for name in dimensions)
+            except KeyError as exc:
+                raise ValueError(f"Missing met_em dimension {exc} in {path}") from exc
+            # WPS reports the soil temperature count used by real.exe in this attribute.
+            # https://github.com/wrf-model/WPS/blob/v4.7.0/metgrid/src/process_domain_module.F
+            # https://github.com/wrf-model/WRF/blob/v4.8.0/share/input_wrf.F#L612-L640
+            soil_levels: object = getattr(ds, "NUM_METGRID_SOIL_LEVELS", None)
+            if not isinstance(soil_levels, Integral) or int(soil_levels) < 2:
+                raise ValueError(f"Invalid met_em NUM_METGRID_SOIL_LEVELS in {path}")
+            if counts[0] < 2 or min(counts) < 1:
+                raise ValueError(f"Invalid met_em level dimensions in {path}: {counts}")
+            dims_seen.add((counts, int(soil_levels)))
             _verify_wps_values(ds.variables, path, recipe.metgrid_fields)
             verify_grid_against_domain(ds, b.domain, path, wps=True)
     if len(dims_seen) != 1:
         raise ValueError(f"Inconsistent met_em level dimensions across window: {dims_seen}")
-    levels, soil_levels = next(iter(dims_seen))
-    return levels, max(soil_levels)
+    counts, wrf_soil_levels = dims_seen.pop()
+    return counts[0], wrf_soil_levels
 
 
 def _verify_wps_values(

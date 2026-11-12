@@ -207,8 +207,8 @@ def parse_forcing_profile(raw: Mapping[str, object]) -> ForcingProfile:
         raise ValueError("ForcingProfile.vtable_name must be a single WPS Vtable filename")
     if prof.interval_seconds < 3600 or prof.interval_seconds % 3600 != 0:
         raise ValueError("ForcingProfile.interval_seconds must be a positive multiple of 3600")
-    if prof.metgrid_levels < 10 or prof.metgrid_soil_levels < 1:
-        raise ValueError("ForcingProfile requires at least 10 metgrid levels and one soil layer")
+    if prof.metgrid_levels < 10 or prof.metgrid_soil_levels < 2:
+        raise ValueError("ForcingProfile requires at least 10 metgrid levels and two soil layers")
     if prof.source_ready_lag_p95_hours <= 0.0:
         raise ValueError("ForcingProfile requires positive source ready lag")
     return prof

@@ -337,12 +337,13 @@ class TestPublishRecoveryAndConcurrency(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Corrupt Zstd payload"):
             publish()
-        ready_key = f"upstream/{b.product.model_id}/{part}/_ready.json"
-        self.assertIsNone(dst.get_bytes(ready_key))
+        pub_root = f"upstream/{b.product.model_id}/{part}"
+        self.assertIsNotNone(dst.get_bytes(f"{pub_root}/forecast.zarr/zarr.json"))
+        self.assertIsNone(dst.get_bytes(f"{pub_root}/_ready.json"))
         shard_file.write_bytes(valid_shard)
         manifest_file.write_bytes(valid_manifest)
         publish()
-        self.assertIsNotNone(dst.get_bytes(ready_key))
+        self.assertIsNotNone(dst.get_bytes(f"{pub_root}/_ready.json"))
 
 
 if __name__ == "__main__":

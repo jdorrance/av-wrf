@@ -33,13 +33,14 @@ from av_wrf.runner import (  # noqa: E402
     post_cycle_from_inputs,
     post_manifest_key,
     publish_cycle_receipt,
+    run_lock_key,
 )
 from av_wrf.runner.post import _stage_cycle  # noqa: E402
 from tests.integration import stage_sparse_config  # noqa: E402
 
 
 class TestZarrV3RoundTrip(unittest.TestCase):
-    def test_publish_checks_staged_producer_and_accepts_legacy_manifest(self) -> None:
+    def test_publish_checks_staged_producer_and_accepts_legacy_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             cfg = root / "config"
@@ -89,6 +90,13 @@ class TestZarrV3RoundTrip(unittest.TestCase):
                 publish()
             del doc["producer_sha256"]
             manifest.write_bytes(json_bytes(doc))
+            with self.assertRaisesRegex(ValueError, "Staged producer SHA-256 differs"):
+                publish()
+
+            lock_path = store_dir / run_lock_key(product, lock.cycle_partition, lock.attempt_id)
+            lock_doc = json.loads(lock_path.read_bytes())
+            del lock_doc["producer_sha256"]
+            lock_path.write_bytes(json_bytes(lock_doc))
             publish()
 
     def test_rejects_later_terrain_change_before_post_receipt(self) -> None:

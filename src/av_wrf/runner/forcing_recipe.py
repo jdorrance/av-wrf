@@ -19,7 +19,7 @@ class ForcingRecipe:
     file_keys: Callable[[datetime, tuple[int, ...]], Mapping[str, str | tuple[str, ...]]]
     validate_file: Callable[[Path, datetime, ForcingProfile, DomainProfile, int], None]
     metgrid_fields: tuple[str, ...]
-    metgrid_soil_dimensions: tuple[str, ...]
+    metgrid_soil_dimensions: tuple[str, *tuple[str, ...]]
     vtable_text: str | None = None
 
 

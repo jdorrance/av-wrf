@@ -61,13 +61,17 @@ RECIPE = ForcingRecipe(
 )
 
 
-def _write_metgrid(path: Path, stamp: str, moisture_layers: int = 7) -> None:
+def _write_metgrid(
+    path: Path, stamp: str, *, moisture_layers: int = 9, reported_soil_layers: int | None = 8
+) -> None:
     with netCDF4.Dataset(str(path), "w") as ds:
         ds.createDimension("Time", 1)
         ds.createDimension("DateStrLen", 19)
         ds.createDimension("num_metgrid_levels", 5)
         ds.createDimension("num_soilt_levels", 8)
         ds.createDimension("num_soilm_levels", moisture_layers)
+        if reported_soil_layers is not None:
+            ds.setncattr("NUM_METGRID_SOIL_LEVELS", reported_soil_layers)
         ds.createVariable("Times", "S1", ("Time", "DateStrLen"))[0] = np.frombuffer(
             stamp.encode("ascii"), dtype="S1"
         )
@@ -181,6 +185,13 @@ class TestForcingRecipes(TestCase):
             _write_metgrid(path, stamp, moisture_layers=6)
             with self.assertRaisesRegex(ValueError, "Inconsistent met_em level dimensions"):
                 _inspect_metgrid_dims(self.root, self.bundle, self.lock)
+            _write_metgrid(path, stamp, moisture_layers=0)
+            with self.assertRaisesRegex(ValueError, "Invalid met_em level dimensions"):
+                _inspect_metgrid_dims(self.root, self.bundle, self.lock)
+            for reported in (None, 1):
+                _write_metgrid(path, stamp, reported_soil_layers=reported)
+                with self.assertRaisesRegex(ValueError, "Invalid met_em NUM_METGRID_SOIL_LEVELS"):
+                    _inspect_metgrid_dims(self.root, self.bundle, self.lock)
             _write_metgrid(path, stamp)
             with netCDF4.Dataset(str(path), "a") as ds:
                 ds.renameVariable("SPECHUMD", "RH")

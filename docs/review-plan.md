@@ -40,17 +40,19 @@ for the release sequence.
 5. **Forcing (also P2-6).** Resolve GFS through a recipe and provide mirror-relative
    full-file keys to acquisition. Accept both active WPS soil temperature codes
    and reject collisions. The shipped Vtable maps MSLET; its alternate PRMSL
-   entry is commented out. Use observed metgrid dimensions at solve. Qualify
-   ICON-EU or IFS with a real staged cycle, an exact WPS field and soil mapping,
-   regional coverage, and source timing before enabling either. The model-level
+   entry is commented out. Use the WPS soil-level attribute and verify the
+   complete dimension signature across the forcing window. Qualify ICON-EU or
+   IFS with a real staged cycle, an exact WPS field and soil mapping, regional
+   coverage, and source timing before enabling either. The model-level
    ICON path requires packing field files by timestep and carrying analysis-only
    fields forward as prescribed by its Vtable. [WPS variable tables](https://github.com/wrf-model/WPS/tree/v4.7.0/ungrib/Variable_Tables)
-6. **Remote publication.** File storage is the implemented backend. Phase 4
-   starts remote qualification with the first selected destination. It needs
-   conditional writes and fencing that survives takeover, or
-   attempt-addressed immutable data with a conditional commit and consumer support.
-   Test concurrent promotion, lost leases, partial transfer, and retry on the
-   chosen backend. Shared filesystem deployments require coherent exclusive locks.
+6. **Remote publication.** File storage is the implemented backend. Qualify
+   private R2 with the archived GFS pilot. Agree on immutable attempt payload
+   paths with the consumer, commit `_ready.json` conditionally, and update
+   `latest.json` by compare-and-swap. A condition on the lease object protects
+   that object alone. Test competing attempts, interrupted transfer, retry,
+   object hashes, and tile range reads. Shared filesystem deployments require
+   coherent exclusive locks. [R2 S3 API](https://developers.cloudflare.com/r2/api/s3/api/)
 7. **History bytes.** The runtime I/O trial retained all fields consumed by post.
    It reduced the representative frame from 19.76 to 14.72 MB and increased the
    30-minute replay from 55.50 to 62.52 seconds. Keep the default stream. Repeat
@@ -65,13 +67,15 @@ for the release sequence.
    and changed the frame. Four, eight, and 16 ranks took 55.50, 60.66, and
    65.75 s. Repeat across forecast cases and target machines before tuning.
 10. **Publication validation.** Keep the independent decode, SHA and pressure
-    checks at admission. A digest from the writer would attest to its bytes and
-    cannot independently establish readable staged pixels. A full-size fixture
-    with 40 leads through f048 used 878 objects and 825 MB of encoded data.
-    On APFS, publication took 2.46 s median over three runs, including 1.06 s
-    for decode and finite checks. The verified copy-on-write trial took 2.92 s.
-    The fixture retiled and repeated archived pilot data. Stage retention costs
-    one extra copy until `--prune-stage` runs after the final destination.
+    checks at admission. A full-size fixture retiled and repeated archived pilot
+    data over 40 leads through f048 for 878 objects and 825 MB of encoded data.
+    On the arm64 solver image's Docker Desktop filesystem, three fresh publishes
+    took 3.13 s median, with 3.12 s under lock and 1.01 s for decode and finite
+    checks. A failure after 439 writes left `_ready.json` absent. Retry took
+    2.44 s and all object hashes matched. On APFS, verified copy-on-write took
+    2.92 s versus 2.61 s for independent writes. Independent files isolate
+    published bytes from stage repairs. Use `--prune-stage` after the final
+    destination to reclaim the staged bytes.
 
 ## P2 · Durability and contract boundaries
 
@@ -85,9 +89,10 @@ for the release sequence.
    separately from the solver image. The hash covers every installed package
    `.py` file, including CLI and verification code. Run `plan` with a new
    attempt after changing that package. Post checks the running package against
-   the lock. Publish checks the staged identity against the lock when present,
-   so a later publisher can promote sealed outputs. Legacy staging manifests
-   are still readable. A consumer-facing identity requires a wire change.
+   the lock. Publish requires the staged identity to match the lock, including
+   for replay by a later publisher. Legacy attempts can replay when both
+   records predate the digest. Add the published identity with the consumer
+   receipt migration.
 4. **Output layout.** Enforce the vendored Zarr layout for production profiles.
    Keep generic shard codec coverage for multiframe and padding behavior.
 5. **Dateline.** Lambert x/y are projected coordinates and the consumer requires
@@ -98,8 +103,7 @@ for the release sequence.
 
 ## P3 · Cleanup
 
-Move retention and rollout tasks to Phase 4 in the project plan. Reuse the
-producer gravity constant for synthetic geopotential. Enforce nonnegative
+Reuse the producer gravity constant for synthetic geopotential. Enforce nonnegative
 CAPE and PBL height at post. The current schema requires both pressure arrays,
 so paired admission also checks positive surface pressure. Keep units and
 constant choices with their numerical implementations until a shared wire
@@ -150,11 +154,11 @@ assembled inputs. WRF output follows the existing post and publication path.
 
 ## Verification
 
-Both native executables reached input opening with the generated namelists.
-The parser gate rejected an injected unknown key. The new recipe validated all
-23 archived forcing hours and their `met_em` files. GFS prep output matched
-the prior run byte for byte. Replaying post and publish from the sealed pilot
-output produced the same 16 leads and 374 object hashes at each of two local
-destinations. A test-only second recipe exercised grouped keys, a custom
-Vtable, three-hour cadence, and separate soil dimensions. The staged tree
-passed `uv run verify` and the native namelist gate from a clean snapshot.
+Both native executables reached input opening in the clean-snapshot gate.
+The archived GFS replay validated 23 GRIB2 hours and their `met_em` files.
+`real.exe` initialized with 34 atmospheric levels and four soil layers, and
+the new `wrfinput` passed grid and vertical checks. Replaying post and publish
+from sealed pilot output matched all 16 leads and 374 object hashes at each
+of two local destinations. The second recipe fixture exercised grouped keys,
+a custom Vtable, three-hour cadence, and more moisture layers than
+temperature layers. The tree passed `uv run verify`.

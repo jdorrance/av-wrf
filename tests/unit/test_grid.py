@@ -115,6 +115,8 @@ class TestGrid(unittest.TestCase):
                 base_dom, center_lon_deg=179.0, central_meridian_deg=179.0
             )
             aw, _, ae, _ = computational_latlon_bounds(anti_dom)
+            self.assertLess(aw, 180.0)
+            self.assertGreater(ae, 180.0)
             self.assertTrue(0.0 < (ae - aw) < 20.0)
 
             meta = published_lambert_grid_metadata(dom)
