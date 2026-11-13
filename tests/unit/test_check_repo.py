@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.check_repo import audit_repo  # noqa: E402
+from scripts.check_repo import IGNORED_NAMES, audit_repo  # noqa: E402
 from scripts.generate_reference import check_markdown_files  # noqa: E402
 
 
@@ -26,9 +26,7 @@ class TestCheckRepoHarness(unittest.TestCase):
             shutil.copytree(
                 ROOT,
                 clone,
-                ignore=shutil.ignore_patterns(
-                    ".git", "__pycache__", "*.pyc", ".venv", ".import_linter_cache"
-                ),
+                ignore=shutil.ignore_patterns(*IGNORED_NAMES, "*.pyc", "*.egg-info"),
             )
             (clone / "uv.lock").write_text("version = 1\n", encoding="utf-8")
             (clone / ".env").write_text("AV_WRF_MPI_RANKS=8\n", encoding="utf-8")

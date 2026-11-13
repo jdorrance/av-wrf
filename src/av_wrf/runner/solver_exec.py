@@ -33,6 +33,7 @@ from av_wrf.runner.geog import (
     geog_domain_profiles,
     pack_geog_files,
     validate_geo_em,
+    validate_lake_initialization,
     verify_geog_sources,
 )
 from av_wrf.runner.mirrors import resolve_forcing_window, verify_forcing_manifest
@@ -231,12 +232,12 @@ def _execute_solver_binaries(
         timeout_s,
     )
     for tag, profile in geog_domain_profiles(b):
+        wrfinput = attempt_dir / f"wrfinput_{tag}"
         validate_wrfinput_nc(
-            attempt_dir / f"wrfinput_{tag}",
-            profile,
-            b.science,
-            published=tag == domain_tag(lock.active_domain_id),
+            wrfinput, profile, b.science, published=tag == domain_tag(lock.active_domain_id)
         )
+        if b.science.sf_lake_physics == 1 and profile.ocean_seeds_lat_lon_deg:
+            validate_lake_initialization(attempt_dir / f"geo_em.{tag}.nc", wrfinput)
     integration = compile_wrf_run_namelist(
         b.domain,
         b.science,

@@ -28,9 +28,14 @@ class TestSchedule(unittest.TestCase):
     def test_remaining_horizon_caps_live_age(self) -> None:
         cfg = ROOT / "config"
         b = load_bundle(cfg, next((cfg / "products").glob("*.yaml")).stem)
-        age = b.output.map_end_hour - b.product.min_horizon_hours
+        # Keep the horizon boundary before the briefing deadline for any shipped horizon.
+        age = 12
         product = dataclasses.replace(
-            b.product, max_cycle_age_hours=age + 2, region_tz="UTC", local_deadline_hhmm="18:00"
+            b.product,
+            min_horizon_hours=b.output.map_end_hour - age,
+            max_cycle_age_hours=age + 2,
+            region_tz="UTC",
+            local_deadline_hhmm="18:00",
         )
         origin = datetime(2026, 11, 12, product.publish_origin_hour_utc, tzinfo=UTC)
         cutoff = origin + timedelta(hours=age)

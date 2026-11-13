@@ -30,6 +30,43 @@ class TestConfigParsers(TestCase):
         self.assertEqual(domain.nest_trigger_ratio, 3.5)
         self.assertEqual(domain.lai_source, "modis_lai")
         self.assertEqual(domain.varsso_source, "30s")
+        self.assertEqual(domain.ocean_seeds_lat_lon_deg, ())
+
+    def test_ocean_seed_pairs_accept_empty_and_preserve_latitude_longitude_order(self) -> None:
+        raw = parse_declarative_yaml(next((CONFIG / "domains").glob("*.yaml")))
+        empty = parse_domain_profile({**raw, "ocean_seeds_lat_lon_deg": []})
+        self.assertEqual(empty.ocean_seeds_lat_lon_deg, ())
+        explicit = parse_domain_profile({**raw, "ocean_seeds_lat_lon_deg": [[10, 20], (-30.0, 40)]})
+        self.assertEqual(explicit.ocean_seeds_lat_lon_deg, ((10.0, 20.0), (-30.0, 40.0)))
+
+    def test_ocean_seed_pairs_reject_invalid_values(self) -> None:
+        raw = parse_declarative_yaml(next((CONFIG / "domains").glob("*.yaml")))
+        invalid_values: tuple[object, ...] = (
+            None,
+            True,
+            "10,20",
+            [10, 20],
+            [[]],
+            [[10]],
+            [[10, 20, 30]],
+            [[True, 20]],
+            [[10, False]],
+            [["10", 20]],
+            [[10, "20"]],
+            [[float("nan"), 20]],
+            [[10, float("inf")]],
+            [[-91, 20]],
+            [[90, 20]],
+            [[10, -181]],
+            [[10, 181]],
+            [[10, 20], [10.0, 20.0]],
+        )
+        for invalid in invalid_values:
+            with (
+                self.subTest(value=invalid),
+                self.assertRaisesRegex((TypeError, ValueError), "ocean_seeds_lat_lon_deg"),
+            ):
+                parse_domain_profile({**raw, "ocean_seeds_lat_lon_deg": invalid})
 
     def test_omitted_science_options_use_typed_defaults(self) -> None:
         raw = parse_declarative_yaml(next((CONFIG / "science").glob("*.yaml")))

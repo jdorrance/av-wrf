@@ -41,6 +41,8 @@ class DomainProfile:
     parent_grid_ratio: int = 1
     parent_halo_cells: int = 0
     nest_trigger_ratio: float = 3.5
+    # Geographic interior points select complete water bodies for ocean surface treatment.
+    ocean_seeds_lat_lon_deg: tuple[tuple[float, float], ...] = ()
 
 
 @dataclass(frozen=True)

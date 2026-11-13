@@ -26,7 +26,7 @@ from av_wrf.contracts.zarr_schema import (
     ZARR_SCHEMA_VERSION,
 )
 from av_wrf.runner import sha256_file
-from av_wrf.runner.publish import ready_forecast_relpath
+from av_wrf.runner.publish_verify import ready_forecast_relpath
 
 _LEGACY_ALBEDO_SENTINEL = -9999.0
 _SHORTWAVE = ("SWDOWN", "SWNORM", "SWDNB", "SWUPB", "SWDNT", "SWUPT")

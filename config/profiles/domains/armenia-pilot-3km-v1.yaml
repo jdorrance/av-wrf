@@ -5,7 +5,7 @@
 #   and yielding an `84 x 84` (`252 x 252 km`) published interior after 9-cell boundary trim.
 # - Centered at `40.35N, 44.60E` (Mount Ara / Hrazdan corridor), framing Yerevan, Aparan,
 #   Mount Aragats (`4,090 m`), Tsaghkadzor, Dilijan, Lake Sevan (`1,900 m`), Garni/Azat,
-#   Vedi, Vayots Dzor, and Mount Ararat (`5,137 m`) in 3.2x fewer columns than `armenia-3km-v1`.
+#   Vedi, Vayots Dzor, and Mount Ararat (`5,137 m`) within the compact pilot footprint.
 # - `dzbot_m: 50.0` keeps the lowest mass midpoint (~25.3 m valley / ~21.9 m over 5,137 m Ararat)
 #   strictly above consumer `minimumLevelAglM = 20 m`.
 # References:
@@ -35,6 +35,9 @@ min_bl_levels_2km_agl: 17
 terrain_elevations_m: [800.0, 4090.0, 5137.0]
 dem_source: default
 landuse_source: default
+# Stock MODIS sea labels require whole-water-body corrections before lake initialization.
+# https://forum.mmm.ucar.edu/threads/how-to-change-land-use-category-for-black-sea.10277/
+ocean_seeds_lat_lon_deg: [[42.0, 41.0], [42.4, 48.2]]
 lai_source: modis_lai
 varsso_source: 30s
 parent_grid_ratio: 3

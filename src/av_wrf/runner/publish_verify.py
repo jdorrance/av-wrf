@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -101,24 +102,24 @@ def _verified_object(store: ObjectStore, key: str, digest: str) -> bytes:
 
 
 def _verify_diagnostics_receipt(
-    store: ObjectStore, root: str, lock: RunLock, exp_sha: str | None
+    store: ObjectStore, root: str, identity: RunLock | ReadyReceipt, exp_sha: str
 ) -> bytes:
     key = f"{root}/_diagnostics.json"
     diag_raw = store.get_bytes(key)
     if diag_raw is None:
         raise FileNotFoundError(f"Missing {key}")
-    if exp_sha is not None and sha256_hex(diag_raw) != exp_sha:
+    if sha256_hex(diag_raw) != exp_sha:
         raise ValueError(f"Corrupt {key}")
     diag_obj = json.loads(diag_raw)
     if not isinstance(diag_obj, dict):
         raise ValueError("Expected JSON object in _diagnostics.json")
     diag = DiagnosticsReceipt.from_doc(diag_obj)
     if (diag.model_id, diag.cycle_partition, diag.attempt_id) != (
-        lock.model_id,
-        lock.cycle_partition,
-        lock.attempt_id,
+        identity.model_id,
+        identity.cycle_partition,
+        identity.attempt_id,
     ):
-        raise ValueError(f"Diagnostics provenance does not match RunLock: {key}")
+        raise ValueError(f"Diagnostics provenance does not match publication: {key}")
     nonnegative = (
         diag.max_cfl,
         diag.total_precip_mm,
@@ -132,13 +133,40 @@ def _verify_diagnostics_receipt(
     return diag_raw
 
 
+def ready_forecast_relpath(receipt: ReadyReceipt) -> str:
+    """Validate the Zarr path relative to its cycle receipt."""
+    path = receipt.zarr_relpath
+    if path != "forecast.zarr":
+        match = re.fullmatch(
+            r"attempts/([A-Za-z0-9][A-Za-z0-9_.-]*)/[0-9a-f]{64}/forecast\.zarr", path
+        )
+        if match is None or match[1] != receipt.attempt_id:
+            raise ValueError("Invalid attempt-scoped forecast path in ready receipt")
+    return path
+
+
+def verify_published_diagnostics(
+    store: ObjectStore, root: str, receipt: ReadyReceipt, retained_sha256: str | None = None
+) -> None:
+    """Require a committed or retained manifest digest before recovery or notification."""
+    digest = receipt.diagnostics_sha256
+    if retained_sha256 is not None and digest not in (None, retained_sha256):
+        raise ValueError("Published diagnostics SHA-256 differs from the staged manifest")
+    digest = digest or retained_sha256
+    if digest is None:
+        raise ValueError("Legacy ready receipt requires a retained diagnostics SHA-256")
+    # Object-store diagnostics share the attempt payload prefix; local cycles use the root.
+    diag_root = f"{root}/{ready_forecast_relpath(receipt)}".rsplit("/", 1)[0]
+    _verify_diagnostics_receipt(store, diag_root, receipt, digest)
+
+
 def verify_published_objects(
     store: ObjectStore,
     root: str,
     receipt: ReadyReceipt,
     b: LoadedBundle,
     window: CycleWindow,
-    lock: RunLock,
+    retained_diagnostics_sha256: str | None = None,
 ) -> None:
     """Check the committed inventory and hashes before acknowledging a publish retry."""
     meta, coords = _expected_canonical_bytes(b, window)
@@ -147,7 +175,7 @@ def verify_published_objects(
     if len(receipt.shard_sha256s) != len(keys) or digests.keys() != keys:
         raise ValueError("Published Zarr inventory differs from the expected store hierarchy")
     zarr_root = f"{root}/{receipt.zarr_relpath}"
-    _verify_diagnostics_receipt(store, zarr_root.rsplit("/", 1)[0], lock, None)
+    verify_published_diagnostics(store, root, receipt, retained_diagnostics_sha256)
     canonical = meta | coords
     for rel_key, digest in digests.items():
         payload = _verified_object(store, f"{zarr_root}/{rel_key}", digest)
@@ -237,4 +265,10 @@ def write_verified_payload(
     write("_diagnostics.json", diag_raw)
 
 
-__all__ = ["validate_post_manifest", "verify_published_objects", "write_verified_payload"]
+__all__ = [
+    "ready_forecast_relpath",
+    "validate_post_manifest",
+    "verify_published_diagnostics",
+    "verify_published_objects",
+    "write_verified_payload",
+]

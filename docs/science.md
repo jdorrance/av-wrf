@@ -152,8 +152,13 @@ their respective sides of the Zarr v3 contract:
   [WRF radiation driver](https://github.com/wrf-model/WRF/blob/v4.8.0/phys/module_radiation_driver.F#L1403-L1416)
 - **Lake physics:** The CLM lake model uses `LAKE_DEPTH` through `geo_em` and
   `met_em`. `sf_lake_physics`, `use_lakedepth`, `lakedepth_default`, and
-  `lake_min_elev` carry one value per active domain. The configured geography
-  resolution selects the LAI and VAR_SSO tables.
+  `lake_min_elev` carry one value per active domain. Explicit lake categories
+  bypass WRF's elevation cutoff. Configured `ocean_seeds_lat_lon_deg` identify
+  four-connected water bodies that use external water temperatures: geography
+  sealing transfers their lake fractions and category to `ISWATER`, preserving
+  terrain, water coverage and other lakes. Solve rejects uncorrected geography.
+  [NCAR's MODIS sea classification guidance](https://forum.mmm.ucar.edu/threads/how-to-change-land-use-category-for-black-sea.10277/)
+  The configured geography resolution selects the LAI and VAR_SSO tables.
 - **Steep-eta 6th-order filtering (`diff_6th_slopeopt = 1`,
   `diff_6th_thresh = 0.10`):** Suppresses cross-inversion mixing along tilted
   eta surfaces over Ararat/Aragats while retaining the 6th-order filter on

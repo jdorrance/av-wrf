@@ -1,6 +1,5 @@
-# Fast local-build Central Armenia 3 km pilot product (~7.8x less solver compute than 48h full).
-# Integrates 6 h nocturnal spin-up (18Z->00Z) + 16 h daylight window (01Z..16Z = 05:00..20:00 AMT)
-# on a 101x101x55 grid using the identical frozen `convection-permitting-3km-v1` physics suite.
+# Compact Central Armenia pilot: six-hour spin-up plus sixteen published hours.
+# Uses the 102x102 mass grid and the same science suite as the full-region product.
 product_id: wrf-armenia-pilot-3km
 model_id: wrf-armenia-pilot-3km
 label: WRF Armenia Pilot 3 km

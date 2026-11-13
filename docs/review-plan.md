@@ -9,6 +9,8 @@ profile changes unless stated.
 
 The local ARM64 pair used the 2026-11-11 18Z GFS and ICON-EU cycles, the same
 geography and physics, four MPI ranks, and byte-identical native executables.
+That archived pair used YSU and surface-layer scheme 1. The current MYNN/lake/
+adaptive suite has separate qualification.
 Each integrated 22 hours and published 16 leads on the 84 × 84 interior.
 Post and publish replays preserved all 748 Zarr object hashes.
 
@@ -111,14 +113,39 @@ thickness. Ice-bearing regions require qualified coverage fractions.
   The WRF process took 208.8 s, including 149.1 s in integration steps.
   Post and local publication took 0.92 s and 0.23 s. This nighttime
   scratch run used a zero-spin-up override and predates the current parent
-  buffer and geometry. The full delivery budget remains a target-host
-  measurement. All 55 GFS forcing files passed
+  buffer and geometry. All 55 GFS forcing files passed
   native initialization for the full 54-hour bracket in 206.1 s.
 - **Publish.** A retiled 40-lead fixture held 878 objects and 825 MB. ARM64
   Docker Desktop median publish took 3.13 s, including 1.01 s for decode and
   finite checks. A failure after 439 writes left the ready receipt absent.
   Retry took 2.44 s and all hashes matched. On APFS, verified copy-on-write
   took 2.92 s versus 2.61 s for independent writes.
+
+## Expanded full-horizon run (2026-11-13)
+
+The corrected nested GFS run completed 6 spin-up hours and a 72-hour forecast
+through 2026-11-16 00Z. Its 204 × 174 published grid has 40 levels and 48 leads;
+the area increased 31.5% from the preceding profile. All 73 hourly native frames
+passed face-order checks. Independent Zarr decoding verified 22 finite fields
+and all 1,046 object hashes. All 73 native radiation frames passed unchanged
+gates across 1,240,314 daylight samples. The diagnostics digest matched its ready receipt.
+
+On an Apple M4 Max with Docker configured for 12 CPUs and 75 GiB, solve took
+4 h 46 min 28 s, used 56.77 CPU-hours and peaked at 14.48 GiB of cgroup memory.
+The paced GFS acquisition took 36 min 49 s for 282.77 MB; cached revalidation
+took 22 s. Full native face checks took 8 s, post 31 s and publication 7 s.
+The forecast holds 1.29 GB; retained solver work holds 11.44 GB of logical data.
+Local compute incurred no purchased-instance charge; electricity was unmeasured.
+
+Publication completed at 04:30:38Z. The cycle was archived, and the 04:30Z
+deadline correctly withheld latest promotion. This cycle establishes cost and
+physical admission; operational delivery still needs runtime margin and repeated cycles.
+Independent audits ran against the frozen source on the host, where the development
+Zarr reader is installed. The archived timestep-zero placeholders were unmeasured;
+future diagnostics omit them while legacy receipts remain readable.
+
+- Config SHA-256: `76f3312081fb8302bd6c01696fe36ea032d657af3d9551da4752af8d24b230ee`.
+- Image ID: `sha256:52ac9ff4ecf33d15cdc761b449dd1016c6688199491de45bfa0c99b131dc6c7c`.
 
 ## Reference systems and implemented decisions (2026-11)
 
@@ -133,5 +160,5 @@ and durable commit/recovery fences.
 Thompson table prebaking, GFS/IFS indexed range fetching, direct ICON WPS
 intermediates, and S3 conditional writes are implemented. Competitor designs
 provide architectural references; the paired replays measure numerical behavior
-and source disagreement. Full-horizon timing, live R2/consumer delivery and
+and source disagreement. Delivery margin, live R2/consumer delivery and
 observation scoring remain [qualification gates](review-remediation.md#remaining-qualification).

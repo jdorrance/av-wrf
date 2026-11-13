@@ -1,7 +1,8 @@
-# Armenia 3 km computational & published domain + vertical stretching profile.
+# Expanded Armenia 3 km domain: 222x192 mass cells, 204x174 published after trim.
+# Published footprint is 612x522 km; the 9 km parent provides lateral-boundary separation.
 # Assumptions & Terrain Constraints:
-# - Spherical datum: R = 6,370,000 m (`WPS/geogrid/src/module_map_utils.F`); standard parallels
-#   38.5N / 41.8N keep Lambert map scale within 0.9996..1.0004 (< 0.05% ground-step distortion).
+# - Spherical datum: R = 6,370,000 m (`WPS/geogrid/src/module_map_utils.F`).
+#   Physics preflight bounds the time step using Lambert map scale over the footprint.
 # - `dem_source: default` / `landuse_source: default` resolves stock WPS v4.7 `GEOGRID.TBL.ARW`
 #   (`topo_gmted2010_30s` + `modis_landuse_20class_30s_with_lakes`); switch `dem_source` to a
 #   custom `GEOGRID.TBL` Copernicus GLO-30 entry once local WPS binary DEM tiles are staged.
@@ -16,7 +17,7 @@
 # - WPS domain sizing (>= 100x100): https://www2.mmm.ucar.edu/wrf/site/documentation/namelist.wps_best_practices.html
 # - WRF auto_levels_opt = 2: https://www2.mmm.ucar.edu/wrf/site/users_guide/real_initialization.html
 # - Surface-layer dzbot >= 25 m: https://forum.mmm.ucar.edu/threads/increase-eta-level-and-decrease-dzbot.8325/
-profile_id: armenia-3km-v1
+profile_id: armenia-3km-v2
 earth_radius_m: 6370000.0
 center_lat_deg: 40.20
 center_lon_deg: 44.50
@@ -25,8 +26,8 @@ std_parallel_2_deg: 41.80
 central_meridian_deg: 44.50
 dx_m: 3000.0
 dy_m: 3000.0
-e_we: 199
-e_sn: 169
+e_we: 223
+e_sn: 193
 bdy_trim_cells: 9
 e_vert: 55
 exported_levels_k: 40
@@ -40,6 +41,9 @@ min_bl_levels_2km_agl: 17
 terrain_elevations_m: [800.0, 4090.0, 5137.0]
 dem_source: default
 landuse_source: default
+# Stock MODIS sea labels require whole-water-body corrections before lake initialization.
+# https://forum.mmm.ucar.edu/threads/how-to-change-land-use-category-for-black-sea.10277/
+ocean_seeds_lat_lon_deg: [[42.0, 41.0], [42.4, 48.2]]
 lai_source: modis_lai
 varsso_source: 30s
 parent_grid_ratio: 3

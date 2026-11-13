@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,6 +25,7 @@ from av_wrf.core import (
 )
 from av_wrf.runner.bundle import LoadedBundle, load_bundle
 from av_wrf.runner.publish_verify import (
+    ready_forecast_relpath,
     validate_post_manifest,
     verify_published_objects,
     write_verified_payload,
@@ -128,18 +128,6 @@ def _read_ready(
     return receipt
 
 
-def ready_forecast_relpath(receipt: ReadyReceipt) -> str:
-    """Validate the Zarr path relative to its cycle receipt."""
-    path = receipt.zarr_relpath
-    if path != _FORECAST:
-        match = re.fullmatch(
-            rf"attempts/([A-Za-z0-9][A-Za-z0-9_.-]*)/[0-9a-f]{{64}}/{re.escape(_FORECAST)}", path
-        )
-        if match is None or match[1] != receipt.attempt_id:
-            raise ValueError("Invalid attempt-scoped forecast path in ready receipt")
-    return path
-
-
 def _check_existing_published_ready(
     store: ObjectStore,
     root: str,
@@ -161,9 +149,13 @@ def _check_existing_published_ready(
     path = committed.zarr_relpath
     if path != _FORECAST and pm_sha256 is not None and path.split("/")[2] != pm_sha256:
         raise ValueError("Published forecast path differs from the staged manifest")
-    if committed != _build_ready_receipt(lock, b, window, digests, synthetic, path):
+    if committed != _build_ready_receipt(
+        lock, b, window, digests, synthetic, path, committed.diagnostics_sha256
+    ):
         raise ValueError("Published receipt provenance or inventory does not match the RunLock")
-    verify_published_objects(store, root, committed, b, window, lock)
+    verify_published_objects(
+        store, root, committed, b, window, pm.diagnostics_sha256 if pm is not None else None
+    )
     store.ensure_durable(f"{root}/_ready.json")
     return committed
 
@@ -209,6 +201,7 @@ def _build_ready_receipt(
     digests: tuple[tuple[str, str], ...],
     is_synth: bool,
     zarr_relpath: str,
+    diagnostics_sha256: str | None,
 ) -> ReadyReceipt:
     grid_meta = {
         **published_lambert_grid_metadata(b.domain),
@@ -234,6 +227,7 @@ def _build_ready_receipt(
         lock.config_sha256,
         _FIXTURE if is_synth else lock.forcing_profile_id,
         _FIXTURE if is_synth else lock.build_manifest.oci_digest,
+        diagnostics_sha256,
     )
 
 
@@ -263,7 +257,13 @@ def _promote_under_cycle_lock(
         local = dst_store if isinstance(dst_store, LocalFileStore) else None
         zarr_relpath = _FORECAST if local is not None else f"{payload_prefix}/{_FORECAST}"
         receipt = _build_ready_receipt(
-            lock, b, window, (*pm.meta_sha256s, *pm.shard_sha256s), is_synth, zarr_relpath
+            lock,
+            b,
+            window,
+            (*pm.meta_sha256s, *pm.shard_sha256s),
+            is_synth,
+            zarr_relpath,
+            pm.diagnostics_sha256,
         )
         ready_raw = json_bytes(receipt.to_doc())
         if local is not None:
@@ -346,4 +346,4 @@ def load_ready_receipt(store: ObjectStore, model_id: str, cycle_partition: str) 
     return receipt
 
 
-__all__ = ["load_ready_receipt", "publish_cycle_receipt", "ready_forecast_relpath"]
+__all__ = ["load_ready_receipt", "publish_cycle_receipt"]

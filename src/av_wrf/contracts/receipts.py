@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -223,12 +224,19 @@ class ReadyReceipt:
     config_sha256: str
     forcing_profile_id: str
     oci_digest: str
+    diagnostics_sha256: str | None = None
 
     def to_doc(self) -> dict[str, object]:
-        return dataclasses.asdict(self)
+        doc = dataclasses.asdict(self)
+        if self.diagnostics_sha256 is None:
+            del doc["diagnostics_sha256"]
+        return doc
 
     @classmethod
     def from_doc(cls, doc: Mapping[str, object]) -> ReadyReceipt:
+        digest = req_str(doc, "diagnostics_sha256") if "diagnostics_sha256" in doc else None
+        if digest is not None and re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError("Invalid diagnostics_sha256 in ReadyReceipt")
         raw_grid = doc.get("grid")
         if not isinstance(raw_grid, Mapping):
             raise ValueError("Expected mapping for 'grid'")
@@ -256,6 +264,7 @@ class ReadyReceipt:
             req_str(doc, "config_sha256"),
             req_str(doc, "forcing_profile_id"),
             req_str(doc, "oci_digest"),
+            digest,
         )
 
 
@@ -272,8 +281,6 @@ class DiagnosticsReceipt:
     mean_sensible_flux_wm2: float
     mean_latent_flux_wm2: float
     total_precip_mm: float
-    adaptive_dt_min_s: float = 0.0
-    adaptive_dt_max_s: float = 0.0
 
     def to_doc(self) -> dict[str, object]:
         return dataclasses.asdict(self)
@@ -295,6 +302,4 @@ class DiagnosticsReceipt:
             req_float(doc, "mean_sensible_flux_wm2"),
             req_float(doc, "mean_latent_flux_wm2"),
             req_float(doc, "total_precip_mm"),
-            req_float(doc, "adaptive_dt_min_s") if "adaptive_dt_min_s" in doc else 0.0,
-            req_float(doc, "adaptive_dt_max_s") if "adaptive_dt_max_s" in doc else 0.0,
         )

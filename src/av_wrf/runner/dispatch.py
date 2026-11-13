@@ -14,6 +14,7 @@ from time import monotonic
 import httpx
 
 from av_wrf.contracts import ReadyReceipt
+from av_wrf.runner.publish_verify import verify_published_diagnostics
 from av_wrf.runner.store import (
     CASConflict,
     ObjectStore,
@@ -148,6 +149,8 @@ def reconcile_dispatch(
     now_unix_s: float | None = None,
 ) -> bool:
     """Single-flight per-destination webhook delivery with expiring lease recovery."""
+    root = published_cycle_prefix(receipt.model_id, receipt.cycle_partition)
+    verify_published_diagnostics(store, root, receipt)
     started = monotonic()
     now_s = time.time() if now_unix_s is None else now_unix_s
     if not math.isfinite(now_s) or not math.isfinite(lease_seconds) or lease_seconds <= 0:

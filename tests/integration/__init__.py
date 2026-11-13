@@ -6,9 +6,32 @@ import dataclasses
 import shutil
 from pathlib import Path
 
+from av_wrf.contracts import DiagnosticsReceipt, ReadyReceipt
 from av_wrf.runner.bundle import LoadedBundle, load_bundle
 from av_wrf.runner.forcing_recipe import ForcingRecipe
 from av_wrf.runner.mirrors import find_forcing_recipe
+from av_wrf.runner.store import ObjectStore, json_bytes, published_cycle_prefix, sha256_hex
+
+
+def ready_with_diagnostics(store: ObjectStore, receipt: ReadyReceipt) -> ReadyReceipt:
+    """Bind isolated dispatch fixtures to valid committed diagnostics."""
+    raw = json_bytes(
+        DiagnosticsReceipt(
+            receipt.model_id,
+            receipt.cycle_partition,
+            receipt.attempt_id,
+            (),
+            0.0,
+            (),
+            0.0,
+            0.0,
+            0.0,
+        ).to_doc()
+    )
+    root = published_cycle_prefix(receipt.model_id, receipt.cycle_partition)
+    parent = f"{root}/{receipt.zarr_relpath}".rsplit("/", 1)[0]
+    store.put_if_absent(f"{parent}/_diagnostics.json", raw)
+    return dataclasses.replace(receipt, diagnostics_sha256=sha256_hex(raw))
 
 
 def bundle_for_recipe(config: Path, recipe: ForcingRecipe) -> LoadedBundle:

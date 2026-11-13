@@ -28,9 +28,8 @@ tables, runtime files, and the build manifest.
 Mount [WPS geography](https://www2.mmm.ucar.edu/wrf/site/access_code/geog_data.html)
 at the configured `geog_data_path`, including lake depth for lake physics.
 Pass `geog` output to `plan` and `solve`; seal inputs with `forcing-manifest`.
-Set `AV_WRF_OCI_DIGEST` to the solver
-image digest for both `plan` and `solve`. Set `AV_WRF_STORE_URI` to a mounted
-store for live runs. See [solver patches](patches/README.md) for build provenance.
+Set `AV_WRF_OCI_DIGEST` to the solver image digest for `plan` and `solve`.
+Set `AV_WRF_STORE_URI` to a mounted store. See [solver patches](patches/README.md) for provenance.
 
 The [image workflow](../.github/workflows/images.yml) keeps separate runtime and
 solver [BuildKit caches](https://docs.docker.com/build/ci/github-actions/cache/)

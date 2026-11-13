@@ -13,6 +13,9 @@ owns the paired pilot, albedo replay, and publication benchmarks.
   and synthetic single-domain and nested WPS/WRF execution.
 - **Publication.** Fresh promotion decodes every required shard and checks native
   column gates. Recovery verifies committed hashes and canonical metadata.
+  New ready receipts bind the diagnostics digest through pruning and notification.
+  Legacy receipts remain readable; recovery requires a retained trusted manifest,
+  and standalone notification requires the bound digest.
   Local writes retain data and ancestor-directory sync; promotion installs a
   complete sibling tree under the cycle lock. S3 uses immutable attempt payloads,
   conditional ready creation, and conditional latest updates. Pruning and post
@@ -25,13 +28,17 @@ owns the paired pilot, albedo replay, and publication benchmarks.
 - **Nesting.** Resolved locks freeze one-way parent buffers for coarse GFS/IFS
   forcing. WPS, geography, initialization and receipts cover active domains;
   published coordinates describe the fine domain. ICON can retain the same fine
-  coordinates without a parent. Nested skill and full-horizon cost need measurement.
+  coordinates without a parent. Nested skill needs observation scoring;
+  the [expanded run](review-plan.md#expanded-full-horizon-run-2026-11-13) records cost.
 - **Science.** The pinned Noah-MP albedo guard, native radiation checks, AFWA
   MUCAPE admission, Shuell MSLP fallback, WRF constants, humidity conversion,
   rainfall windows, hybrid coordinate and wind rotation are implemented.
   Coupled MYNN output uses the current total `CLDFRA_BL`; `CLDFRA` is the older
   radiation snapshot. Lake, mixing and drag arrays carry per-domain values.
+  Native face ordering is checked before midpoint conversion. Audit and admission
+  apply albedo validity to daylight cells while checking fluxes at every time.
   Sampled Courant diagnostics use saved `DT`, face thickness and Lambert scale.
+  Unpopulated timestep diagnostics were removed; legacy receipts remain readable.
 - **Cost and scope.** Thompson tables are prebaked and checked with read-only
   reuse. The solver defaults to a portable ISA with explicit optimized targets.
   CI persists native BuildKit layers and cancels superseded PR jobs. Base images
@@ -41,6 +48,7 @@ owns the paired pilot, albedo replay, and publication benchmarks.
 - **Configuration.** Typed profiles own optional defaults. Individual checks and
   planning reject duplicate model namespaces and mismatched preloaded identities.
   The geography bundle digest owns lock identity; the unused digest list was removed.
+  Prep emits the history sidecar referenced by its integration namelist.
 
 ## Archived science evidence (2026-11)
 
@@ -134,8 +142,31 @@ separate. [Science conventions](science.md) records the physical assumptions.
 - **Table reuse and diagnostics.** Five archived runs produced byte-identical
   374 MB Thompson tables, motivating current prebaking. Area weighting changed
   hourly pilot flux means by under 0.0005 W/m²; diagnostics retain grid-cell means.
+- **Sea/lake geography.** Official MODIS tiles classify two regional seas as
+  lakes; archived initialization propagated their default 10 m depths into the
+  lake model. Configured seeds now select complete water bodies for external
+  water temperatures, including elevated coastal cells. The expanded-grid check
+  changed 4,081 parent and 2,142 child cells while preserving terrain, water
+  coverage, total water fractions and inland lakes. Initialization admission
+  checks the sealed lake mask before integration. Thirty-two regressions cover
+  topology, malformed geography, immutable admission and initialization failures.
+  [NCAR guidance](https://forum.mmm.ucar.edu/threads/how-to-change-land-use-category-for-black-sea.10277/)
 
 ## Remaining qualification
+
+Evidence is scoped to source, grid/nesting, physics, architecture and weather regime.
+Current ARM64 synthetic tests cover single/nested MYNN, lake physics and adaptive
+steps. Archived GFS/ICON real cases cover their original profile hashes. IFS has
+acquisition/normalization tests; a live-format native run remains open. The expanded
+nested GFS cycle passed full-horizon physical gates and missed latest promotion by
+39 seconds. Observation skill, winter ice coverage and reliable delivery margin
+remain unqualified.
+
+Archive each qualification with the exact config and producer snapshots, OCI/build
+manifest, geography and forcing inventories, namelists/sidecars, native logs,
+run/solver/ready receipts, diagnostics, audit version and hardware. Record wall time,
+peak memory, core-hours, scratch usage and transfer bytes beside the price basis.
+These immutable identities carry qualification across profile revisions.
 
 1. **Consumer and remote publication.** Complete a real Zarr provider, shared
    receipt/identity agreement, authenticated trigger replay and served tile,
@@ -145,9 +176,9 @@ separate. [Science conventions](science.md) records the physical assumptions.
    stubbed S3 tests establish application behavior; live service behavior needs
    this deployment test.
    [R2 conditional operations](https://developers.cloudflare.com/r2/api/s3/conditional-operations/)
-2. **Current full-horizon delivery.** Time acquisition, initialization, nested
-   WRF, post, publish and consumer work for a complete forecast on intended
-   hardware. Repeat enough cycles to measure arrival variability and retry
+2. **Current full-horizon delivery.** Add delivery margin to the measured producer
+   run and time consumer work on deployment hardware. Repeat enough cycles to
+   measure arrival variability and retry
    margin. Test mount permissions for the deployment UID and bind both runtime
    and solver image digests when deploying separate images.
 3. **Observation scorecard.** Score cold and warm cycles, lowlands and high

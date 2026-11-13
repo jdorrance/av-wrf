@@ -34,7 +34,7 @@ from av_wrf.runner import (  # noqa: E402
     reconcile_dispatch,
     sha256_hex,
 )
-from tests.integration import stage_sparse_config  # noqa: E402
+from tests.integration import ready_with_diagnostics, stage_sparse_config  # noqa: E402
 
 
 class TestLocalFileStoreAndDispatch(unittest.TestCase):
@@ -156,6 +156,7 @@ class TestLocalFileStoreAndDispatch(unittest.TestCase):
                 "noaa-gfs-0p25-v1",
                 "sha256:test",
             )
+            receipt = ready_with_diagnostics(store, receipt)
             with self.assertRaises(ValueError):
                 reconcile_dispatch(store, receipt, lambda r: post_webhook_json("", r))
 

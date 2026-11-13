@@ -35,12 +35,12 @@ from av_wrf.runner import (
 from av_wrf.runner.forcing_gfs import GFS
 from av_wrf.runner.publish import _advance_latest_pointer_with_retry
 from av_wrf.runner.store import CASConflict, synthetic_cycle_prefix
-from tests.integration import bundle_for_recipe, stage_sparse_config
+from tests.integration import bundle_for_recipe, ready_with_diagnostics, stage_sparse_config
 
 
 @pytest.fixture
-def receipt() -> ReadyReceipt:
-    return ReadyReceipt(
+def receipt(tmp_path: Path) -> ReadyReceipt:
+    result = ReadyReceipt(
         "wrf-zarr-v3",
         1,
         "model",
@@ -60,6 +60,7 @@ def receipt() -> ReadyReceipt:
         "source",
         "image",
     )
+    return ready_with_diagnostics(LocalFileStore(tmp_path), result)
 
 
 def test_cycle_lock_survives_prefix_removal_and_delete_syncs_parent(tmp_path: Path) -> None:
@@ -311,9 +312,7 @@ def test_rejected_webhook_can_retry_delivery(tmp_path: Path, receipt: ReadyRecei
     assert not reconcile_dispatch(store, receipt, lambda _: pytest.fail("Already delivered"))
 
 
-def test_dispatch_adopts_both_lost_conditional_write_responses(
-    tmp_path: Path, receipt: ReadyReceipt
-) -> None:
+def test_dispatch_adopts_lost_write_responses(tmp_path: Path, receipt: ReadyReceipt) -> None:
     store = LocalFileStore(tmp_path)
     cas = store.compare_and_swap
 

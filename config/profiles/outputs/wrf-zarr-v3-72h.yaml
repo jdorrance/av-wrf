@@ -2,9 +2,9 @@
 # References:
 # - Zarr v3 sharding_indexed & zstd/crc32c codecs: https://zarr.readthedocs.io/en/stable/api/zarr/codecs/
 # - GeoZarr CRS conventions: https://github.com/zarr-developers/geozarr-spec
-profile_id: wrf-zarr-v3-48h
+profile_id: wrf-zarr-v3-72h
 schema_id: wrf-zarr-v3
-map_end_hour: 48
+map_end_hour: 72
 hourly_through_hour: 36
 tail_step_hours: 3
 shard_time_steps: 1

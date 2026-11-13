@@ -112,6 +112,23 @@ def _opt_bool(raw: Mapping[str, object], key: str, default: bool) -> bool:
     return _req_bool(raw, key) if key in raw else default
 
 
+def _ocean_seeds(raw: Mapping[str, object]) -> tuple[tuple[float, float], ...]:
+    key = "ocean_seeds_lat_lon_deg"
+    items = raw.get(key, DomainProfile.ocean_seeds_lat_lon_deg)
+    if not isinstance(items, (list, tuple)):
+        raise TypeError(f"Expected sequence for '{key}'")
+    seeds: list[tuple[float, float]] = []
+    for item in items:
+        pair = _req_float_tuple({key: item}, key)
+        if len(pair) != 2 or not (-90.0 < pair[0] < 90.0 and -180.0 <= pair[1] <= 180.0):
+            raise ValueError(f"Expected valid Lambert latitude/longitude pair for '{key}'")
+        seed = pair[0], pair[1]
+        if seed in seeds:
+            raise ValueError(f"Duplicate latitude/longitude pair in '{key}'")
+        seeds.append(seed)
+    return tuple(seeds)
+
+
 def parse_domain_profile(raw: Mapping[str, object]) -> DomainProfile:
     optional = frozenset(
         f.name for f in dataclasses.fields(DomainProfile) if f.default is not dataclasses.MISSING
@@ -148,6 +165,7 @@ def parse_domain_profile(raw: Mapping[str, object]) -> DomainProfile:
         parent_grid_ratio=_opt_int(raw, "parent_grid_ratio", DomainProfile.parent_grid_ratio),
         parent_halo_cells=_opt_int(raw, "parent_halo_cells", DomainProfile.parent_halo_cells),
         nest_trigger_ratio=_opt_float(raw, "nest_trigger_ratio", DomainProfile.nest_trigger_ratio),
+        ocean_seeds_lat_lon_deg=_ocean_seeds(raw),
     )
     if dom.earth_radius_m <= 0.0 or dom.dx_m <= 0.0 or dom.dy_m <= 0.0 or dom.p_top_pa <= 0.0:
         raise ValueError("Domain radius, grid spacing, and p_top_pa must be positive")
