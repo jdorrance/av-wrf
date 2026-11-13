@@ -6,7 +6,7 @@ profile_id: wrf-zarr-v3-72h
 schema_id: wrf-zarr-v3
 map_end_hour: 72
 hourly_through_hour: 36
-tail_step_hours: 3
+tail_step_hours: 1
 shard_time_steps: 1
 inner_chunk_yx: [64, 64]
 zstd_level: 3

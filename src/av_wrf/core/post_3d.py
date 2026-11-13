@@ -114,7 +114,7 @@ def _post_mslp(
 
 
 def _cloud_and_thermo(
-    raw: RawWrfStepInput, domain: DomainProfile, science: ScienceProfile, shared_2d: SharedSurface
+    raw: RawWrfStepInput, domain: DomainProfile, shared_2d: SharedSurface
 ) -> tuple[
     ArrF64,
     array[float],
@@ -130,12 +130,7 @@ def _cloud_and_thermo(
     shp3 = (k_exp, ny, nx)
     p_all, p_buf = _validate_and_groom_3d_pressure(raw, psfc, trim, k_exp)
     cloud_shape = (raw.cldfra.nz, ny, nx)
-    # Coupled MYNN radiation stores an older CLDFRA_BL snapshot; use its current total.
-    # https://github.com/wrf-model/WRF/blob/v4.8.0/phys/module_radiation_driver.F#L1403-L1416
-    cloud_source = raw.cldfra
-    if science.bl_pbl_physics == 5 and science.icloud_bl > 0 and raw.cldfra_bl is not None:
-        cloud_source = raw.cldfra_bl
-    cloud = _mass_view(cloud_source, trim, cloud_shape)
+    cloud = _mass_view(raw.cldfra, trim, cloud_shape)
     cld_tot, cld_low = max_random_cloud_cover_pct(
         cloud, p_all, _crop_sponge_2d_view(raw.psfc_pa, trim)
     )
@@ -206,9 +201,7 @@ def post_3d_slabs(
 ) -> tuple[dict[str, PubMass3D], dict[str, PubMass2D], tuple[float, float, int, float]]:
     k_exp = domain.exported_levels_k
     phi = staggered_face_phi(raw, domain.bdy_trim_cells, k_exp)
-    p_pa, p_buf, z_buf, t_buf, tk, spfh, columns = _cloud_and_thermo(
-        raw, domain, science, shared_2d
-    )
+    p_pa, p_buf, z_buf, t_buf, tk, spfh, columns = _cloud_and_thermo(raw, domain, shared_2d)
     u_e, v_e, omega, stats = _wind_stats(
         raw, domain, science, shared_2d, (p_pa, z_buf, tk, spfh, phi)
     )

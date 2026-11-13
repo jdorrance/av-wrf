@@ -181,8 +181,10 @@ def physics_and_dynamics_sections(science: ScienceProfile, max_dom: int) -> Name
         "noah_mp": {"opt_runsrf": science.opt_runsrf, "opt_runsub": science.opt_runsub},
         "dynamics": dynamics,
         "afwa": {
-            "afwa_diag_opt": science.afwa_diag_opt,
-            "afwa_buoy_opt": science.afwa_buoy_opt,
+            # Explicit arrays match the Registry; WRF also enables every domain if any is on.
+            # https://github.com/wrf-model/WRF/blob/v4.8.0/share/module_check_a_mundo.F#L120-L189
+            "afwa_diag_opt": per_domain(science.afwa_diag_opt, max_dom),
+            "afwa_buoy_opt": per_domain(science.afwa_buoy_opt, max_dom),
         },
     }
 

@@ -27,6 +27,7 @@ from av_wrf.contracts import (
 from av_wrf.core import (
     compile_wrf_namelist_sections,
     estimate_auto_levels_agl_m,
+    nesting_active,
     resolve_cycle_window,
     validate_horizon_policy,
     validate_vertical_column,
@@ -185,7 +186,12 @@ def validate_bundle(
         validate_horizon_policy(b.product, b.primary_source, b.output, publish_origin_utc=origin)
         for origin in (window.publish_origin_utc, *origins[1:])
     )
-    compile_wrf_namelist_sections(b.domain, b.science, b.primary_source)
+    compile_wrf_namelist_sections(
+        b.domain,
+        b.science,
+        b.primary_source,
+        nested=nesting_active(b.domain, b.primary_source.grid_spacing_deg),
+    )
     if not b.candidate_source.fail_closed:
         raise ValueError("Candidate ForcingProfile must enforce fail_closed=True")
     bl_counts = [

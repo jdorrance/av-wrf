@@ -63,13 +63,12 @@ class RawWrfStepInput:
     phb_stag_m2s2: CompStagZ3D
     theta_pert_k: CompMass3D
     qvapor_kgkg: CompMass3D
+    # Selected current cloud fraction across the full native column.
     cldfra: CompMass3D
     u_stag_mps: CompStagX3D
     v_stag_mps: CompStagY3D
     w_stag_mps: CompStagZ3D
     afwa_mslp_pa: CompMass2D | None = None
-    # Current MYNN total cloud fraction; live MYNN radiation coupling requires this field.
-    cldfra_bl: CompMass3D | None = None
     # WRF adaptive RK3 step length at this output time; falls back to science.time_step_s.
     dt_s: float | None = None
 

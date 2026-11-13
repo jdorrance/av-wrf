@@ -76,13 +76,55 @@ def test_live_mynn_history_requires_cloud_fraction(tmp_path: Path) -> None:
         ds.renameVariable("CLDFRA_BL", "unavailable")
     with pytest.raises(ValueError, match=r"Missing required MYNN history field CLDFRA_BL"):
         read_wrfout_step_nc(path, domain, science, require_mynn_clouds=True)
+    archive = read_wrfout_step_nc(path, domain, science)
+    assert archive.cldfra.buf[0] == pytest.approx(0.1)
     for pbl_scheme, coupling in ((1, 1), (5, 0)):
         inactive = replace(science, bl_pbl_physics=pbl_scheme, icloud_bl=coupling)
         step = read_wrfout_step_nc(path, domain, inactive, require_mynn_clouds=True)
-        assert step.cldfra_bl is None
+        assert step.cldfra.buf[0] == pytest.approx(0.1)
     with netCDF4.Dataset(str(path), mode="r+") as ds:
         ds.renameVariable("unavailable", "CLDFRA_BL")
         ds["CLDFRA_BL"][:] = 0.25
     step = read_wrfout_step_nc(path, domain, science, require_mynn_clouds=True)
-    assert step.cldfra_bl is not None
-    assert step.cldfra_bl.buf[0] == 0.25
+    assert step.cldfra.buf[0] == 0.25
+
+
+@pytest.mark.parametrize("pbl_scheme,coupling", ((5, 1), (1, 1), (5, 0)))
+def test_reader_loads_only_selected_full_cloud_column(
+    tmp_path: Path, pbl_scheme: int, coupling: int
+) -> None:
+    domain, science = _small_domain_and_science()
+    domain = replace(domain, exported_levels_k=3)
+    science = replace(science, bl_pbl_physics=pbl_scheme, icloud_bl=coupling)
+    selected = "CLDFRA_BL" if pbl_scheme == 5 and coupling else "CLDFRA"
+    unused = "CLDFRA" if selected == "CLDFRA_BL" else "CLDFRA_BL"
+    path = tmp_path / "wrfout"
+    _write_real_wrfout(path, domain, "2026-11-12_04:00:00")
+    with netCDF4.Dataset(path, mode="r+") as ds:
+        ds[selected][:] = 0.25
+        ds[selected][0, -1] = 0.5
+        # Invalid unused data exposes accidental reads of the second cloud volume.
+        ds[unused][:] = np.nan
+    step = read_wrfout_step_nc(path, domain, science, require_mynn_clouds=True)
+    assert step.cldfra.nz == domain.e_vert - 1
+    assert step.cldfra.buf[0] == 0.25
+    assert step.cldfra.buf[-1] == 0.5
+    with netCDF4.Dataset(path, mode="r+") as ds:
+        ds.renameVariable(unused, "unused")
+    read_wrfout_step_nc(path, domain, science, require_mynn_clouds=True)
+    with netCDF4.Dataset(path, mode="r+") as ds:
+        ds[selected][0, -1] = np.nan
+    with pytest.raises(ValueError, match=f"{selected}.*fill or non-finite"):
+        read_wrfout_step_nc(path, domain, science, require_mynn_clouds=True)
+
+
+@pytest.mark.parametrize("field", ("P", "PB"))
+def test_reader_validates_pressure_above_exported_column(tmp_path: Path, field: str) -> None:
+    domain, science = _small_domain_and_science()
+    domain = replace(domain, exported_levels_k=3)
+    path = tmp_path / "wrfout"
+    _write_real_wrfout(path, domain, "2026-11-12_04:00:00")
+    with netCDF4.Dataset(path, mode="r+") as ds:
+        ds[field][0, -1] = np.nan
+    with pytest.raises(ValueError, match=f"{field}.*fill or non-finite"):
+        read_wrfout_step_nc(path, domain, science)

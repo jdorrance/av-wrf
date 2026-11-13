@@ -44,13 +44,10 @@ class TestPost3d(unittest.TestCase):
             crop2_f64(self.raw.sin_alpha, trim, "SINALPHA"),
         )
 
-    def test_mynn_cloud_cover_uses_current_fraction_and_archive_fallback(self) -> None:
-        np.frombuffer(self.raw.cldfra.buf, np.float32).fill(0.75)
-        assert self.raw.cldfra_bl is not None
-        # A dissipating or disappearing cloud must replace its older radiation snapshot.
+    def test_selected_cloud_cover_preserves_clear_and_overcast_columns(self) -> None:
         for fraction in (0.25, 0.0, 1.0):
             with self.subTest(fraction=fraction):
-                np.frombuffer(self.raw.cldfra_bl.buf, np.float32).fill(fraction)
+                np.frombuffer(self.raw.cldfra.buf, np.float32).fill(fraction)
                 _, fields, _ = post_3d_slabs(
                     self.raw, self.domain, self.bundle.science, self.shared
                 )
@@ -58,27 +55,16 @@ class TestPost3d(unittest.TestCase):
                     np.testing.assert_array_equal(
                         np.frombuffer(fields[name].buf, np.float32), fraction * 100.0
                     )
-        _, fallback, _ = post_3d_slabs(
-            dataclasses.replace(self.raw, cldfra_bl=None),
-            self.domain,
-            self.bundle.science,
-            self.shared,
-        )
-        for name in ("cloud_total_pct", "cloud_low_pct"):
-            np.testing.assert_array_equal(np.frombuffer(fallback[name].buf, np.float32), 75.0)
 
-    def test_inactive_mynn_field_preserves_radiation_cloud(self) -> None:
-        np.frombuffer(self.raw.cldfra.buf, np.float32).fill(0.75)
-        assert self.raw.cldfra_bl is not None
-        np.frombuffer(self.raw.cldfra_bl.buf, np.float32).fill(0.25)
-        for pbl_scheme, coupling in ((1, 1), (5, 0)):
-            with self.subTest(pbl_scheme=pbl_scheme, coupling=coupling):
-                science = dataclasses.replace(
-                    self.bundle.science, bl_pbl_physics=pbl_scheme, icloud_bl=coupling
-                )
-                _, fields, _ = post_3d_slabs(self.raw, self.domain, science, self.shared)
-                for name in ("cloud_total_pct", "cloud_low_pct"):
-                    np.testing.assert_array_equal(np.frombuffer(fields[name].buf, np.float32), 75.0)
+    def test_pressure_validation_includes_levels_above_exported_column(self) -> None:
+        pb = np.frombuffer(self.raw.pb_pa.buf, np.float32).reshape(
+            self.raw.pb_pa.nz, self.raw.pb_pa.ny, self.raw.pb_pa.nx
+        )
+        for value, message in ((0.0, "Non-positive"), (88_000.0, "Non-monotonic")):
+            with self.subTest(value=value):
+                pb[-1].fill(value)
+                with self.assertRaisesRegex(ValueError, message):
+                    post_3d_slabs(self.raw, self.domain, self.bundle.science, self.shared)
 
     def test_sampled_timestep_and_column_diagnostics(self) -> None:
         _, f2d, (min_dz, max_dz, bl, cfl) = post_3d_slabs(

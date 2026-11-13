@@ -187,13 +187,112 @@ These immutable identities carry qualification across profile revisions.
    separately. The 9 km parent's convection choice also needs a controlled
    comparison. Publication gates check physical admissibility.
 4. **Vertical references and velocity.** Qualify native/subgrid terrain datum
-   conversion and the consumer inverse of moist hydrostatic `omega`; version
-   the wire contract if geometric velocity becomes necessary.
+   conversion and align the consumer inverse with the producer's moist-density
+   encoding. A direct geometric-velocity field requires a coordinated wire change
+   only if consumer design warrants it.
 5. **Long integrations and new donors.** Measure accumulation rounding in warm
    long forecasts against higher-precision sums; evaluate radiation interpolation
    separately. Qualify actual ice coverage before accepting ice-bearing donors.
    Observe complete source inventories over multiple cycles before changing
    primary forcing or dissemination allowances.
+
+## Feedback disposition (2026-11-13)
+
+Reviewed the supplied comprehensive report against the pinned WRF source,
+current callers, and retained forecast bytes. Original attachment SHA-256:
+`b86d9501467209bbc4ca6da6447ae742085b80ad141a09166fec61994d603041`.
+The retained local `output/forecast-20261113/evidence/review-feedback-audit.json`
+contains input hashes, source links and reproduction code; SHA-256:
+`7b81813fdd3e047e29eb37c00f98bb48782539f2722f059f8780a09c5aeae896`.
+This section owns each decision; the [follow-up plan](plan.md#6-feedback-follow-through)
+owns remaining work. Numerical conventions and upstream links live in
+[science notes](science.md); operator sources live in [review evidence](review-plan.md#external-nesting-evidence-researched-2026-11-13).
+
+- **AFWA cardinality: implemented.** Emit both options per active domain and
+  guard emitted namelist shapes against the pinned Registry. The reported P0
+  omitted WRF's subsequent all-domain normalization. The archived d02 contains
+  finite, unmasked `AFWA_CAPE_MU` at the first, middle and final histories, with
+  maxima 0, 10.025 and 101.273 J/kg. Its successful publication is consistent
+  with that source behavior. Calling AFWA options scalar/global was also
+  imprecise: their Registry shape is per-domain; effective activation is global
+  in this solver. Rechecking retained bytes resolves the alleged contradiction
+  without another full integration.
+- **Nested configuration admission: implemented.** `validate_bundle` compiles
+  the actual single/nested layout. The Registry regression covers emitted keys
+  and supported conditional branches; source revisions require snapshot review.
+  Live post continues to require the selected domain's native MUCAPE. Reuse the
+  existing missing-MUCAPE reader regression; its error already names the file
+  and `afwa_buoy_opt`. Source normalization and retained d02 output supply the
+  native nesting evidence beyond a synthetic fixture.
+- **Vertical velocity: corrected diagnosis.** The matching moist inverse
+  recovers geometric velocity algebraically, including wave motion. Across
+  1,419,840 samples in the first published frame, maximum absolute error against
+  native destaggered W was 0.00007685 m/s using rounded published inputs.
+  Regression tests cover signed/zero velocity, moisture, wire rounding and the
+  existing consumer dry-inverse bias. Aligning that consumer inverse remains
+  open; an emergency schema v4 or extra field has no demonstrated need.
+- **Pressure and humidity: retained.** `P + PB` is total thermodynamic pressure,
+  so the proposed vapor-pressure correction would introduce an error.
+  `use_sh_qv` controls later interpolation/reconstruction; GFS supplies RH.
+  Removing this option would change IFS/ICON initialization.
+- **Vertical headroom: qualify.** Keep the configured BL-level floor and hard
+  column gates. The 861 failures came from an artificial 4% column stretch.
+  Lower stretching changes BL density, exported top and meteorology. Test the
+  measured lower/upper-stretch pair across full horizons before promotion;
+  automatically setting 1.09, accepting 16 levels or making failures warnings
+  would discard the existing quality requirement.
+- **Hourly tail: implemented for future runs.** The long profile now emits all
+  72 hourly leads. The archived schedule has 48 leads: 36 hourly plus 12 tail
+  steps. This adds 24 frames, or 50% temporal output, using existing hourly native
+  histories. Post, storage and consumer cost increase; solver horizon stays fixed.
+  Preserve the requested 72-hour horizon. A shorter product needs usage evidence.
+- **Parent halo: retain pending experiment.** The actual parent has 134 × 124
+  mass cells; the child has 222 × 192. At a 3:1 time-step ratio the parent accounts
+  for about 11.5% of ideal cell-step work. Halos 10/12 fail the current minimum
+  grid dimensions. Halo 18 is geometrically admitted and saves about 3.9% ideal
+  work; meteorological adequacy and real runtime remain unmeasured.
+  [WPS placement and timestep guidance](https://www2.mmm.ucar.edu/wrf/users/namelist_best_prac_wps.html).
+- **Adaptive stepping: retain pending experiment.** NCAR recommends child
+  `max_step_increase_pct = 51` to permit nested step adjustment. The value alone
+  does not demonstrate timestep churn. Compare fixed/adaptive steps and MPI
+  layouts separately; the report's 15–25% savings remain unsupported. The saved
+  78-hour integration used 16,615 child steps, about 0.6% above an ideal constant
+  17-second run. Constant 15 seconds would require about 12.7% more steps;
+  these counts alone cannot predict wall time.
+  [NCAR adaptive stepping](https://www2.mmm.ucar.edu/wrf/site/documentation/users_guide/running_wrf.html#adaptive-time-stepping).
+- **Provider inventory: implemented.** Recipes own supported provider
+  level identities; profiles declare expected metgrid dimensions including the
+  surface. Derive duplicated internal counts from recipe inventories and reject
+  incompatible profiles early. Retain serialized fields needed for lock replay.
+  An arbitrary count cannot specify a replacement provider vertical coordinate.
+- **Cloud I/O: implemented.** Read one effective full-column cloud
+  field and carry one cloud slab. Full P/PB remain reachable for pressure ordering
+  and low-cloud selection. Current MYNN `CLDFRA_BL` is total cloud; clipping it
+  to exported levels would lose upper cloud. Preserve strict live selection and
+  sparse-archive fallback.
+- **Operational errors: planned with a caller.** Keep precise inventory errors
+  and fail-closed admission. Add structured drift classification with the actual
+  alert/monitoring integration and migration fixtures; an unused exception class
+  would enlarge the API without improving delivery.
+- **Module size: simplify where touched.** Cloud ownership removes duplicate
+  state. Existing file/function budgets guard growth. Split at a demonstrated
+  boundary when needed; no speculative baseline/step module split.
+- **Publication and sharding: retain integrity.** Verify every destination's
+  payload. Reuse validation only with measured mirror cost and identity-bound
+  destination verification. Keep one-time-step shards; larger temporal shards
+  need consumer range-read and cost evidence plus a coordinated contract change.
+- **Competitor conclusions: use corrected evidence.** CanadaRASP publishes its
+  processing source and moved from WRF to direct model output. SoaringMeteo's
+  historical solver guide and newer Scala processing code describe different
+  systems. The report's grades and comparative superiority claims have no matched
+  benchmark. Retain the producer/consumer split, bounded streaming, immutable
+  provenance and independent oracles; observation skill remains unqualified.
+- **Positive physics audit: retained as corroboration.** Constants, coordinate
+  construction, T/THM, MSLP, gust, saturation, cloud overlap, accumulation windows,
+  wind rotation, CFL, ICON normalization, WPS layout, GFS inventory and Zarr codec
+  already have focused checks. The reported schedule margin is superseded by
+  the measured 39-second latest-promotion miss. New work preserves oracle
+  tolerances and the [remaining qualification](#remaining-qualification).
 
 ## Infrastructure decisions
 

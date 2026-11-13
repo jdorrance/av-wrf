@@ -17,6 +17,7 @@ for p in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(p))
 
 from av_wrf.contracts import CompMass3D, Slab3DF32  # noqa: E402
+from av_wrf.contracts.zarr_schema import WRF_ZARR_V3_FIELDS  # noqa: E402
 from av_wrf.core.thermo import (  # noqa: E402
     KAPPA_DRY,
     MOIST_THETA_COEFF,
@@ -56,6 +57,37 @@ class TestThermo(unittest.TestCase):
     def test_omega_uses_moist_hydrostatic_density(self) -> None:
         omega = geometric_w_to_omega_vec(_arr(2.0), _arr(85_000.0), _arr(285.0), _arr(0.0, 0.01))
         np.testing.assert_allclose(omega, (-20.38877682009903, -20.265489209784448), rtol=1e-12)
+
+    def test_native_w_survives_complete_published_moist_round_trip(self) -> None:
+        w = _arr(-12.375, -0.0001, 0.0, 0.0001, 12.375)[:, None]
+        pressure = _arr(25_123.7, 65_412.3, 99_876.5)
+        temp = _arr(220.123, 272.345, 299.789)
+        humidity = _arr(0.0, 0.01, 0.025)
+        omega = geometric_w_to_omega_vec(w, pressure, temp, humidity)
+        keepbits = {field.name: field.keepbits for field in WRF_ZARR_V3_FIELDS}
+        fields = dict(pressure_pa=pressure, temp_k=temp, spfh_kgkg=humidity, omega_pas=omega)
+        encoded = {
+            name: np.asarray(groom_f32_buf(values, keepbits[name]), np.float64).reshape(
+                values.shape
+            )
+            for name, values in fields.items()
+        }
+        # Independent WRF constants; the proxy is reversible even for strong wave motion.
+        recovered = (
+            -encoded["omega_pas"]
+            * 287.0
+            * encoded["temp_k"]
+            * (1.0 + (461.6 / 287.0 - 1.0) * encoded["spfh_kgkg"])
+            / (encoded["pressure_pa"] * 9.81)
+        )
+        np.testing.assert_allclose(recovered, np.broadcast_to(w, omega.shape), rtol=4e-5)
+        np.testing.assert_array_equal(np.sign(recovered), np.sign(np.broadcast_to(w, omega.shape)))
+
+    def test_consumer_dry_inverse_has_documented_moisture_bias(self) -> None:
+        omega = geometric_w_to_omega_vec(_arr(2.0), _arr(85_000.0), _arr(285.0), _arr(0.01))
+        # Existing consumer uses dry density and WMO constants; track the cross-repo mismatch.
+        recovered = -omega * 287.05 * 285.0 / (85_000.0 * 9.80665)
+        np.testing.assert_allclose(recovered / 2.0, _arr(0.9944659240146819), rtol=1e-12)
 
     def test_cloud_overlap_and_surface_relative_boundary(self) -> None:
         fractions = np.array([[0.25, 0.5], [0.5, 0.25], [0.0, 0.5], [0.5, 0.0]], np.float32)

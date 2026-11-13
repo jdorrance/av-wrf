@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,6 +16,7 @@ import pytest
 
 from av_wrf.codecs import read_wps_intermediate_fields
 from av_wrf.core import computational_latlon_bounds, forcing_domain
+from av_wrf.runner.bundle import validate_bundle
 from av_wrf.runner.forcing_gfs import GFS
 from av_wrf.runner.forcing_ifs import AIR, IFS, LEVELS, REQUIRED, SURFACE
 from av_wrf.runner.ifs_acquire import _download, _fetch, _index, _normalize, _wanted, _write_hour
@@ -205,6 +207,21 @@ class TestIfsForcing(TestCase):
         IFS.check_window(bundle.candidate_source, bundle.domain, CYCLE, (0, 3))
         with self.assertRaisesRegex(ValueError, "three-hourly"):
             IFS.check_window(bundle.candidate_source, bundle.domain, CYCLE, (0, 1))
+        for source in (
+            replace(bundle.candidate_source, use_sh_qv=False),
+            replace(bundle.candidate_source, metgrid_levels=16),
+            replace(bundle.candidate_source, metgrid_soil_levels=5),
+        ):
+            with (
+                self.subTest(source=source),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "IFS requires specific humidity, 15 metgrid levels and 4 soil layers",
+                ),
+            ):
+                validate_bundle(
+                    replace(bundle, primary_source=source), publish_origin_utc="20261112/00"
+                )
 
 
 @pytest.mark.parametrize(

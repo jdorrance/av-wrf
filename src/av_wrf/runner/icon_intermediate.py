@@ -22,6 +22,7 @@ from av_wrf.runner.forcing_icon import (
     _AIR,
     _FIXED,
     _HEIGHT,
+    _LEVELS,
     _SOIL_CENTERS_CM,
     _SOIL_LAYERS,
     _SOIL_TEMP,
@@ -199,7 +200,7 @@ def write_icon_intermediate(
 def _expected(vtable: str) -> dict[tuple[str, float], str]:
     expected: dict[tuple[str, float], str] = {}
     for selector, rows in _vtable_rows(vtable).items():
-        levels = range(1, 75) if selector[3] == 150 else (201300 if selector[3] == 101 else 200100,)
+        levels = _LEVELS if selector[3] == 150 else (201300 if selector[3] == 101 else 200100,)
         for name, units, _, _, bottom in rows:
             if selector[3] == 106 and bottom is not None:
                 units = "m3 m-3"

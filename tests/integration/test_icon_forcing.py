@@ -15,6 +15,7 @@ import numpy as np
 
 from av_wrf.codecs.wrf_nc_grid import normalize_rows
 from av_wrf.contracts import BuildManifest
+from av_wrf.runner.bundle import validate_bundle
 from av_wrf.runner.forcing_icon import _REQUIRED, _SOIL_TEMP, _SOIL_TEMP_SELECTORS, ICON_EU
 from av_wrf.runner.grib import GRIB_FIELD_KEYS
 from av_wrf.runner.icon_acquire import _assemble, _download, _read_plan
@@ -213,6 +214,19 @@ class TestIconForcing(TestCase):
         with self.assertRaisesRegex(ValueError, "requires use_sh_qv"):
             source = replace(bundle.primary_source, use_sh_qv=False)
             ICON_EU.check_window(source, bundle.domain, CYCLE, (0, 22))
+        for source in (
+            replace(bundle.primary_source, metgrid_levels=76),
+            replace(bundle.primary_source, metgrid_soil_levels=9),
+        ):
+            with (
+                self.subTest(source=source),
+                self.assertRaisesRegex(
+                    ValueError, "ICON-EU requires 75 metgrid levels and 8 soil layers"
+                ),
+            ):
+                validate_bundle(
+                    replace(bundle, primary_source=source), publish_origin_utc="20261112/00"
+                )
         by_hour = ICON_EU.file_keys(CYCLE, (0, 7))
         zero, seven = by_hour["0"], by_hour["7"]
         self.assertIsInstance(zero, tuple)

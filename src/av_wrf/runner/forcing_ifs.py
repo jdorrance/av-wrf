@@ -82,8 +82,12 @@ def _check_window(
         raise ValueError("IFS requires a synoptic cycle and three-hourly forecast steps")
     if hours[-1] > (144 if cycle.hour in (0, 12) else 90):
         raise ValueError("IFS requested forecast exceeds the available three-hourly horizon")
-    if not source.use_sh_qv or source.metgrid_levels != 15 or source.metgrid_soil_levels != 4:
-        raise ValueError("IFS requires specific humidity, 15 metgrid levels and four soil layers")
+    expected = (len(LEVELS) + 1, len(SOIL_SUFFIXES))
+    if not source.use_sh_qv or (source.metgrid_levels, source.metgrid_soil_levels) != expected:
+        raise ValueError(
+            f"IFS requires specific humidity, {expected[0]} metgrid levels "
+            f"and {expected[1]} soil layers"
+        )
     if domain.p_top_pa < min(LEVELS) * 100:
         raise ValueError("IFS pressure levels do not reach the WRF model top")
 

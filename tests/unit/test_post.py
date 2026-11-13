@@ -92,11 +92,10 @@ def _synthetic_step(
         phb_stag_m2s2=CompStagZ3D(Slab3DF32.from_values(nz + 1, ny, nx, phb_vals)),
         theta_pert_k=c3(12.0),
         qvapor_kgkg=c3(0.006),
-        cldfra=c3(0.25),
+        cldfra=c3(0.2),
         u_stag_mps=CompStagX3D(Slab3DF32.from_values(nz, ny, nx + 1, u_buf)),
         v_stag_mps=CompStagY3D(Slab3DF32.from_values(nz, ny + 1, nx, v_buf)),
         w_stag_mps=CompStagZ3D(Slab3DF32.from_values(nz + 1, ny, nx, w_vals)),
-        cldfra_bl=c3(0.2),
         dt_s=15,
     )
 

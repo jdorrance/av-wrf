@@ -186,7 +186,7 @@ class TestNamelist(unittest.TestCase):
         self.assertNotIn("afwa_severe_opt", wrf_txt)
         self.assertNotIn("bucket_J", wrf_txt)
         self.assertIn("shinhong_scu_mixing = .false.,", wrf_txt)
-        self.assertIn("afwa_buoy_opt = 1,", wrf_txt)
+        self.assertIn("afwa_buoy_opt = 1, 1,", wrf_txt)
         self.assertIn("&namelist_quilt\n nio_tasks_per_group = 0,\n nio_groups = 1,", wrf_txt)
         self.assertNotIn("prec_acc_dt", wrf_txt)
 

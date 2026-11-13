@@ -157,6 +157,12 @@ def _check_window(
         raise ValueError(f"No qualified {cycle:%H}Z forcing cycle for {source.profile_id}")
     if hours[-1] > 78:
         raise ValueError(f"ICON-EU hourly cadence ends at f078; cycle requires f{hours[-1]:03d}")
+    # WPS adds a surface level to the native mass levels; soil temperature uses layer centers.
+    expected = (len(_LEVELS) + 1, len(_SOIL_LAYERS))
+    if (source.metgrid_levels, source.metgrid_soil_levels) != expected:
+        raise ValueError(
+            f"ICON-EU requires {expected[0]} metgrid levels and {expected[1]} soil layers"
+        )
     if not source.use_sh_qv:
         raise ValueError("ICON-EU requires use_sh_qv for native model-level specific humidity")
 

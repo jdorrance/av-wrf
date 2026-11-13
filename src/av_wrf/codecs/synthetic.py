@@ -130,11 +130,10 @@ def build_synthetic_wrf_step(
         phb_stag_m2s2=phb,
         theta_pert_k=c3(8.0),
         qvapor_kgkg=c3(0.005),
-        cldfra=c3(0.15),
+        cldfra=c3(0.25),
         u_stag_mps=u_s,
         v_stag_mps=v_s,
         w_stag_mps=w_s,
-        cldfra_bl=c3(0.25),
         dt_s=15,
     )
 

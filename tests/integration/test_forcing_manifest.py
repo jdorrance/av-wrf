@@ -11,10 +11,16 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from av_wrf.contracts import BuildManifest, RunLock, parse_iso_utc
-from av_wrf.core import computational_latlon_bounds, required_forcing_forecast_hours
+from av_wrf.core import (
+    compile_wrf_namelist_sections,
+    computational_latlon_bounds,
+    nesting_active,
+    required_forcing_forecast_hours,
+)
 from av_wrf.runner import (
     LocalFileStore,
     check_product_config,
+    load_bundle,
     plan_product_cycle,
     prep_cycle_namelists,
 )
@@ -131,6 +137,29 @@ class TestForcingManifest(TestCase):
         bad_cycle = replace(bundle.product, forcing_cycle_hour_utc=1)
         with self.assertRaisesRegex(ValueError, "No 01Z forcing cycle"):
             validate_bundle(replace(bundle, product=bad_cycle))
+
+    def test_bundle_admission_compiles_the_active_source_topology(self) -> None:
+        config = ROOT / "config"
+        seen: set[bool] = set()
+        for path in sorted((config / "products").glob("*.yaml")):
+            bundle = load_bundle(config, path.stem)
+            nested = nesting_active(bundle.domain, bundle.primary_source.grid_spacing_deg)
+            seen.add(nested)
+            with patch(
+                "av_wrf.runner.bundle.compile_wrf_namelist_sections",
+                wraps=compile_wrf_namelist_sections,
+            ) as compile_sections:
+                validate_bundle(bundle, publish_origin_utc="20261112/00")
+                compile_sections.assert_called_once_with(
+                    bundle.domain, bundle.science, bundle.primary_source, nested=nested
+                )
+            if nested:
+                broken = replace(bundle.domain, parent_halo_cells=0)
+                with self.assertRaisesRegex(ValueError, "parent_domain_shape"):
+                    validate_bundle(
+                        replace(bundle, domain=broken), publish_origin_utc="20261112/00"
+                    )
+        self.assertEqual(seen, {False, True})
 
     def test_prep_lists_source_files_and_gfs_rejects_missing_hourly_tail(self) -> None:
         config = ROOT / "config"

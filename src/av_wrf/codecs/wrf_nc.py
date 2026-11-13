@@ -169,6 +169,11 @@ def _read_3d_fields(
     CompStagZ3D,
 ]:
     ny, nx, k_exp, nz_full = dims
+    # MYNN's full-column cloud fraction is current; CLDFRA is a radiation-time snapshot.
+    # https://github.com/wrf-model/WRF/blob/v4.8.0/phys/module_radiation_driver.F#L1403-L1416
+    cloud = "CLDFRA"
+    if sc.bl_pbl_physics == 5 and sc.icloud_bl > 0 and MYNN_CLOUD_FIELD in v:
+        cloud = MYNN_CLOUD_FIELD
     p_pert = _r3_nc(v, nc_path, "P", t_i, nz_full, ny, nx, crop=False)
     pb = _r3_nc(v, nc_path, "PB", t_i, nz_full, ny, nx, crop=False)
     t_dry = _r3_nc(v, nc_path, "T", t_i, k_exp, ny, nx, crop=True)
@@ -185,7 +190,7 @@ def _read_3d_fields(
         pb,
         t_dry,
         qv,
-        _r3_nc(v, nc_path, "CLDFRA", t_i, nz_full, ny, nx, crop=False),
+        _r3_nc(v, nc_path, cloud, t_i, nz_full, ny, nx, crop=False),
         _rz_nc(v, nc_path, "PH", t_i, k_exp + 1, ny, nx),
         _rz_nc(v, nc_path, "PHB", t_i, k_exp + 1, ny, nx),
         CompStagX3D(Slab3DF32(k_exp, ny, nx + 1, _f32_buf(u_arr))),
@@ -281,9 +286,6 @@ def _assemble_step_from_vars(
         w_s,
         afwa_mslp_pa=afwa_mslp,
         dt_s=dt_s,
-        cldfra_bl=_r3_nc(v, nc_path, MYNN_CLOUD_FIELD, t_i, dims[3], ny, nx, crop=False)
-        if MYNN_CLOUD_FIELD in v
-        else None,
     )
 
 
@@ -308,10 +310,8 @@ def read_wrfout_step_nc(
         stamp = parse_wrf_timestamp(raw_t)
         if expected_valid_utc is not None and stamp[0] != expected_valid_utc:
             raise ValueError(f"wrfout Times {stamp[0]} != expected {expected_valid_utc}")
-        required_clouds = (
-            require_mynn_clouds and science.bl_pbl_physics == 5 and science.icloud_bl > 0
-        )
-        if required_clouds and MYNN_CLOUD_FIELD not in ds.variables:
+        need_clouds = require_mynn_clouds and science.bl_pbl_physics == 5 and science.icloud_bl > 0
+        if need_clouds and MYNN_CLOUD_FIELD not in ds.variables:
             raise ValueError(f"{nc_path}: Missing required MYNN history field {MYNN_CLOUD_FIELD}")
         _verify_surface_shortwave(
             ds.variables,

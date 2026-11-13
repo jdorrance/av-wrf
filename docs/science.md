@@ -48,6 +48,11 @@ their respective sides of the Zarr v3 contract:
    or invalid values at the file boundary.
 2. **Specific humidity & omission of `rhPercent`:** WRF `QVAPOR` and `Q2` are
    water-vapor mixing ratios $r$ (`kg/kg dry air`), converted via $q = r / (1 + r)$.
+   Published `pressure_pa = P + PB` is total thermodynamic pressure. WRF's moist
+   equation of state includes vapor; the dry hydrostatic coordinate pressure
+   in §3 is a separate quantity.
+   [WRF output definitions](https://www2.mmm.ucar.edu/wrf/site/documentation/users_guide/output.html),
+   [pinned equation of state](https://github.com/wrf-model/WRF/blob/06d4240ae989cc3e50af412bb472df3d9048783c/dyn_em/module_big_step_utilities_em.F#L1056-L1075).
    Model-level `rhPercent` is intentionally omitted because `windy-av-layer`
    (`packages/forecast/src/native-fields.ts`) computes dewpoint directly from
    `spfhKgKg` and `pressurePa`, matching `ICON-EU` and `RRFS`.
@@ -56,6 +61,12 @@ their respective sides of the Zarr v3 contract:
    `av-wrf` caps its converted `spfh_2m_kgkg` at consumer Bolton (1980) liquid saturation
    ($e_s = 6.112 \exp(17.67 T_c / (T_c + 243.5))\text{ hPa}$, $\epsilon = 0.622$)
    with $2^{-14}$ mantissa headroom so `keepbits = 15` rounding never exceeds `100%` RH.
+4. **Initialization humidity:** `use_sh_qv` selects direct vertical interpolation
+   of mixing ratio from specific-humidity inputs. Its false branch reconstructs
+   mixing ratio from interpolated RH and temperature after pressure is available.
+   GFS supplies RH; the IFS and ICON recipes supply specific humidity.
+   [WRF interpolation](https://github.com/wrf-model/WRF/blob/06d4240ae989cc3e50af412bb472df3d9048783c/dyn_em/module_initialize_real.F#L1743-L1759),
+   [final humidity conversion](https://github.com/wrf-model/WRF/blob/06d4240ae989cc3e50af412bb472df3d9048783c/dyn_em/module_initialize_real.F#L4113-L4144).
 
 ## 3. Vertical Coordinate, Mountain Compression, & Consumer `20 m` / `1,000 m` Gates
 
@@ -99,8 +110,11 @@ their respective sides of the Zarr v3 contract:
    uses grid-relative output winds and nominal cell spacing as a diagnostic proxy.
 2. **Hydrostatic pressure-velocity proxy (`geometric_w_to_omega_vec`):** The producer
    encodes native WRF geometric $w$ as $-\rho_m g w$ using moist density and WRF
-   constants. A matching inverse recovers $w$ within storage rounding. Material
-   pressure velocity also depends on pressure evolution and advection.
+   constants. With specific humidity $q$ and $\delta = R_v/R_d - 1$, the inverse is
+   $w = -\omega R_d T(1 + \delta q)/(pg)$, including nonhydrostatic motion within
+   storage rounding. Material pressure velocity also depends on pressure evolution
+   and advection. [Round-trip evidence](review-remediation.md#feedback-disposition-2026-11-13)
+   checks the saved native velocity against the published fields.
    The consumer's dry-density inverse underestimates $|w|$ by about 0.55% at
    `q = 0.01 kg/kg`.
 3. **10 m gust and flux time support:** The endpoint gust estimate adapts the
@@ -118,7 +132,11 @@ their respective sides of the Zarr v3 contract:
    [Native WRF AFWA MSLP](https://github.com/wrf-model/WRF/blob/06d4240ae989cc3e50af412bb472df3d9048783c/phys/module_diag_functions.F#L911-L962)
 5. **CAPE provenance (`afwa_buoy_opt = 1`, strict `AFWA_CAPE_MU`):** Enabling
    `afwa_buoy_opt = 1` in `&afwa` ([`registry.afwa`](https://github.com/wrf-model/WRF/blob/v4.8.0/Registry/registry.afwa))
-   computes `AFWA_CAPE_MU`. WRF initializes the parcel at the lowest model level
+   computes `AFWA_CAPE_MU`. Both AFWA options are per-domain Registry arrays;
+   compilation emits every active value explicitly. The pinned solver also
+   normalizes an enabled option across all domains during consistency checks.
+   [WRF AFWA normalization](https://github.com/wrf-model/WRF/blob/06d4240ae989cc3e50af412bb472df3d9048783c/share/module_check_a_mundo.F#L120-L189).
+   WRF initializes the parcel at the lowest model level
    and searches for maximum equivalent potential temperature at pressures above
    the absolute `500 hPa` cutoff. [WRF `Buoyancy`](https://github.com/wrf-model/WRF/blob/06d4240ae989cc3e50af412bb472df3d9048783c/phys/module_diag_functions.F#L556-L603)
    The Zarr group and producer contract record this method.

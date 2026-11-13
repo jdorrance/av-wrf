@@ -149,7 +149,7 @@ future diagnostics omit them while legacy receipts remain readable.
 
 ## Reference systems and implemented decisions (2026-11)
 
-Reference systems inspected: `soaringmeteo/soarWRF` (18/6/2 km 3:1),
+Reference systems inspected: SoaringMeteo's operator guide (18/6/2 km 3:1),
 `sfalmo/rasp-from-scratch` (MYNN2.5, adaptive CFL, SRTM/CORINE),
 `DavidRasp/blipmaps.nl` (GFS+ICON, sidecar post), `canadarasp.ca` (S3 `.idx`
 byte ranges), `raspit`/`raspnw` (ephemeral VMs, legacy NCL). Lessons applied
@@ -162,3 +162,170 @@ intermediates, and S3 conditional writes are implemented. Competitor designs
 provide architectural references; the paired replays measure numerical behavior
 and source disagreement. Delivery margin, live R2/consumer delivery and
 observation scoring remain [qualification gates](review-remediation.md#remaining-qualification).
+
+## External nesting evidence (researched 2026-11-13)
+
+These sources inform the [nesting implementation and experiments](plan.md#5-configurable-nesting-implementation-plan).
+Operator histories establish operational experience; papers establish results for
+their tested cases. Repository configurations establish what was implemented.
+None establishes forecast skill for our target region. Dates below refer to the
+publication or reported experiment, rather than search-engine crawl dates.
+
+### Regional soaring operators and source code
+
+- **CanadaRASP: evaluate operational value.** Its operator reports that 400 m WRF
+  forecasts in 2013–2014 revealed useful valley-flow detail but regularly
+  overpredicted local winds. Slow tuning/evaluation and hardware failures led to
+  retirement of WRF and use of HRDPS output. The changelog also records wind-arrow
+  rotation fixes in June 2026 and source-format migration failures. These are
+  self-reported outcomes, with no paired verification dataset on that page.
+  Preserve direct-model baselines, fast experiments, rotation tests, and source
+  migration fixtures. [History and changelog](https://www.canadarasp.com/aboutcanadarasp.html),
+  [public processing code](https://github.com/ajberkley/canadarasp).
+
+- **SoaringMeteo: nested coverage and maintainability.** Its 2013 operator guide
+  describes 18/6/2 km grids with several fine regions and unreliable edge rows.
+  The later soarV2 migration explains that maintenance and evolution of the old
+  system had become difficult; reducing computation and extending coverage were
+  explicit goals. Shared parents and declarative regions fit that experience.
+  Its historical five-row edge warning describes those grids; our buffers require
+  their own validation. [2013 guide](https://soarwrf4.soaringmeteo.org/soarWRFEN.pdf),
+  [migration rationale](https://soaringmeteo.org/towards-soarV2/),
+  [soarV2 processing source](https://github.com/soaringmeteo/soaringmeteo).
+
+- **wxToFly lineage and newer RASP code: inspect the actual implementation.**
+  Historical `raspnw-v2` contains wxToFly/RASP-NW files. The newer `rasp-windgram`
+  credits TJ Olney's windgram design; its October 2026 snapshot documents shared
+  Lambert placement and real-geogrid alignment tests. It also reports footprint
+  changes causing mountain instability and NaNs despite a completion message.
+  Adopt coordinate/finite-state checks and controlled case experiments. Its
+  square-domain/fixed-buffer heuristics remain unqualified choices. This snapshot
+  does not establish the current wxToFly deployment or a verified Git fork.
+  [Historical code](https://github.com/nw-paragliding/raspnw-v2),
+  [pinned design and failure investigation](https://github.com/nw-paragliding/rasp-windgram/blob/326891595937107871f643bcd8c0187aecb5a4bc/ARCHITECTURE.md).
+
+- **RASP configuration diversity:** a June 2026 `rasp-from-scratch` configuration
+  uses 10/2 km, ratio 5, two-way feedback, and different parent/child cumulus
+  settings. It establishes an implemented alternative, without proving superior
+  skill. Our proposed one-way/ratio-3 policy selects an initial subset of WRF; future
+  ratios and physics combinations need their own tests.
+  [Pinned namelist](https://github.com/sfalmo/rasp-from-scratch/blob/96d9dd4c8b4608603edf40593ab306672091cd8e/rasp/TIR/namelist.input).
+
+- **XC Therm / Regtherm: represent the processes controlling thermals.** The
+  operator describes terrain-defined regions, valley volume, moisture transport
+  between regions, seasonal vegetation, and shading by all cloud layers. Regtherm
+  derives soaring guidance from upstream weather models. This supports choosing
+  physically connected focus areas and preserving radiation, moisture, and
+  vertical profiles at the producer boundary. The public description supplies no
+  independent comparative skill score. [Method description](https://xctherm.com/en/regtherm).
+
+- **SkySight: distinguish native and derived resolution.** Its 9 September 2026
+  announcement describes 100 m wind/ridge guidance produced by a CFD-trained AI
+  downscaler driven by 900 m weather-model output; it lists thermal models at
+  1–2 km. Reported accident-case backtests are operator claims without a released
+  benchmark there. The architectural lesson is separate qualification of native
+  forecasts and terrain-flow downscaling. The advertised 100 m product supplies
+  no justification for a 100 m full-WRF integration here.
+  [Technical announcement](https://skysight.io/news/100-metre-wind-and-ridge-forecast/).
+
+- **MeteoSwiss: qualify changes through observations and delivery.** Its 2026
+  ICON deployment paper reports scheduled comparisons beginning in 2021 before
+  operational replacement in May 2024. Several scores improved while cloud-cover
+  skill and valley-temperature/precipitation deficiencies remained. It separates
+  computational consistency tests from multi-season observational verification
+  and measures end-to-end runtime against a delivery deadline. Adopt that
+  separation at a smaller scale; its GPU speedups do not predict WRF performance.
+  [Deployment and verification study](https://gmd.copernicus.org/articles/19/755/2026/).
+
+### Controlled scientific comparisons
+
+- **Wagner, Gohm and Rotach (2014), idealized valley.** WRF comparisons included
+  50 m LES and 1–10 km grids, with additional matched smoothed-terrain runs.
+  Strong smoothing removed inversion/circulation structure; much of the change
+  arose from lost valley geometry. The particular valley was 20 km wide and
+  1.5 km deep. Inspect cross-sections, valley depth/volume, and passes as well as
+  summits; its resolution result is conditional on that geometry.
+  [Study](https://journals.ametsoc.org/abstract/journals/mwre/142/9/mwr-d-14-00002.1.xml).
+
+- **Horvath et al. (2012), Nevada mountain winds.** Downscaling to 1 km and
+  333 m improved vertical shear relative to coarser grids, but wind-speed bias
+  and RMSE did not improve systematically; 333 m generally added little over
+  1 km. Evaluation used four towers in two months. Fine-domain extent, roughly
+  900 m source terrain, and inherited boundary errors were possible limitations
+  identified by the authors; their individual effects were not isolated. Score
+  processes and domain placement alongside aggregate surface-wind error.
+  [Study](https://doi.org/10.1029/2012JD017432).
+
+- **Bonekamp, Collier and Immerzeel (2018), Himalayan valley.** In two seasonal
+  periods, 500 m improved temperature/wind agreement while precipitation errors
+  persisted. Of 12-hour, 24-hour, three-day and five-day spin-ups, 24 hours worked
+  best; longer spin-up did not consistently help. Land-cover changes also altered
+  precipitation. Test our initialization duration and surface data separately;
+  this result does not establish a universal 24-hour requirement.
+  [Study](https://journals.ametsoc.org/view/journals/hydr/19/10/jhm-d-17-0212_1.xml).
+
+- **Sabetghadam, Fletcher and Erler (2025), Canadian snow.** One-way 9/3/1 km
+  WRF/Noah-MP simulations were evaluated over the 2017–2018 water year, including
+  nine snow-pillow stations. Mean peak SWE underestimation was about 6% at 3 km
+  and 3% at 1 km; annual SWE remained underestimated. Elevation mismatch was
+  associated with snow bias. This is evidence for a useful refinement experiment,
+  with different forcing, physics, and duration from our short-range forecasts.
+  [Study](https://hess.copernicus.org/articles/29/887/2025/).
+
+- **Angevine et al. (2020), boundary-layer gray zone.** In 600 m shallow-cumulus
+  experiments, the tested reduction in parameterized MYNN mass flux performed
+  worse: resolved motion failed to compensate and clouds developed late with too
+  little liquid water. This concerns particular WRF 4.1 cases. Retain the current
+  coupled scheme during the nesting comparison and test any physics change
+  independently against cloud timing and mixing.
+  [NOAA-hosted paper](https://repository.library.noaa.gov/view/noaa/29421).
+
+- **Nardon et al. (2026), paragliding validation.** A roughly 104 m WRF study
+  used 170 tracks over eight selected summer days. Thermal occurrence was strongly
+  underforecast; more localized explicit structures gave mixed skill changes.
+  Flight coverage was sparse and the study did not compare horizontal resolutions.
+  It demonstrates useful flight-data verification and the limits of detailed
+  deterministic thermal maps. Score sampled air motion separately from soaring
+  diagnostics; retain observation masks and distinguish lift mechanisms.
+  [Study, 13 October 2026](https://link.springer.com/article/10.1007/s00703-026-01215-x).
+
+- **Abolafia-Rosenzweig et al. (2025), snow and temperature.** Revised snow
+  parameterizations reduced western-US maximum-temperature cold bias by 17–24%,
+  but a deliberately extreme snow-cover underestimate still left mountain cold
+  bias. Snow error was insufficient to explain the whole problem. Audit snow,
+  radiation, temperature, and turbulent fluxes together before selecting a fix.
+  [Study](https://doi.org/10.1029/2025JD044191).
+
+### WRF operational constraints and failure reports
+
+- **Domain placement:** NCAR recommends ample parent coverage, room upwind, and
+  boundaries away from complex terrain. A reported 9/3 km mountain case retained
+  boundary instability after timestep reduction. Treat geometric alignment as
+  necessary and terrain/flow review as a separate admission step.
+  [WPS guidance](https://www2.mmm.ucar.edu/wrf/site/namelist.wps_best_practices.html),
+  [operator case and support response](https://forum.mmm.ucar.edu/threads/nesting-boundary-over-mountainous-terrain.10245/).
+
+- **MPI and offline nesting:** NCAR's processor guidance makes the smallest
+  domain constrain useful parallelism; its 25-cell patch guideline is a starting
+  heuristic. Benchmark the entire tree at 6 and 12 ranks. Offline `ndown` can
+  reuse parents but handles one child per invocation and requires its own input
+  and history workflow. Add it when measured reuse savings justify that workflow.
+  [Processor guidance](https://forum.mmm.ucar.edu/threads/choosing-an-appropriate-number-of-processors.5082/),
+  [multiple-child support response](https://forum.mmm.ucar.edu/threads/using-ndown-to-multiple-wrfinput.17530/).
+
+- **Snow initialization:** a documented GFS/HRRR snow merge produced inconsistent
+  SWE/depth and a Noah-MP water-budget failure. A 2026 report of rapid snow-cover
+  rebound after MODIS initialization remains unresolved. These support tracing
+  surface state through preprocessing and spin-up; they establish no generally
+  valid snow correction. [Consistency failure](https://forum.mmm.ucar.edu/threads/noah-mp-error-using-hrrr-snow-cover.10016/),
+  [unresolved rebound report](https://forum.mmm.ucar.edu/threads/unexpected-increase-in-snowc-after-modis-based-snow-initialization-in-wrf-noah-mp.28523/).
+
+### Transfer limits
+
+Public evidence does not support a controlled accuracy ranking across these
+services. Operator descriptions, isolated incidents, idealized LES, annual
+reanalysis downscaling, and short-range forecasts answer different questions.
+Borrow explicit geometry, independent validation, reusable processing, and
+failure handling. Qualify physical settings on our own held-out cases. Advertising
+resolution, attractive maps, source-code availability, and native completion
+alone are insufficient evidence of local forecast skill.
