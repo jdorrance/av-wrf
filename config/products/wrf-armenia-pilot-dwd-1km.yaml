@@ -1,0 +1,16 @@
+product_id: wrf-armenia-pilot-dwd-1km
+model_id: wrf-armenia-pilot-dwd-1km
+label: WRF North Armenia 1km ICON comparison
+region_tz: Asia/Yerevan
+domain_profile: armenia-1km-c1
+science_profile: convection-permitting-1km-comparison-v1
+primary_source_profile: dwd-icon-eu-v1
+candidate_source_profile: noaa-gfs-0p25-v1
+output_profile: wrf-zarr-v3-24h
+spinup_hours: 6
+forcing_cycle_hour_utc: 18
+publish_origin_hour_utc: 0
+local_deadline_hhmm: "08:30"
+min_horizon_hours: 18
+max_cycle_age_hours: 6
+schedule_cron_utc: "30 21 * * *"

@@ -81,14 +81,19 @@ class TestSchedule(unittest.TestCase):
             floor = validate_horizon_policy(prod, src, out)
             self.assertGreaterEqual(floor, prod.min_horizon_hours)
 
-            # Invalid IANA timezone or unreachable local_deadline_hhmm is rejected
+            # Pin the rejection clock: earlier source arrivals can meet this deadline.
             with self.assertRaises(ValueError):
                 validate_horizon_policy(
                     dataclasses.replace(prod, region_tz="Invalid/Zone"), src, out
                 )
             with self.assertRaises(ValueError):
                 validate_horizon_policy(
-                    dataclasses.replace(prod, local_deadline_hhmm="04:05"),
+                    dataclasses.replace(
+                        prod,
+                        region_tz="UTC",
+                        local_deadline_hhmm="00:05",
+                        schedule_cron_utc="15 23 * * *",
+                    ),
                     src,
                     out,
                     publish_origin_utc=f"2026-11-12T{prod.publish_origin_hour_utc:02d}:00:00Z",

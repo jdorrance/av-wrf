@@ -85,7 +85,16 @@ class TestConfigParsers(TestCase):
         domain = parse_declarative_yaml(next((CONFIG / "domains").glob("*.yaml")))
         science = parse_declarative_yaml(next((CONFIG / "science").glob("*.yaml")))
         self.assertEqual(
-            parse_domain_profile({**domain, "parent_grid_ratio": 3}).parent_grid_ratio, 3
+            parse_domain_profile(
+                {
+                    **domain,
+                    "parent_grid_ratio": 3,
+                    "parent_halo_cells": 33,
+                    "e_we": 175,
+                    "e_sn": 133,
+                }
+            ).parent_grid_ratio,
+            3,
         )
         self.assertEqual(
             parse_science_profile({**science, "max_time_step_s": 21}).max_time_step_s, 21

@@ -117,7 +117,7 @@ def _check_no_hardcoded_regions(repo: Path, errors: list[str]) -> None:
     word_pat = re.compile(r"\b(" + "|".join(ordered) + r")\b", re.IGNORECASE)
     exempt = {"docs/reference.md", "THIRD_PARTY_NOTICES.txt"}
     for path in sorted(repo.rglob("*")):
-        if not path.is_file() or any(p in IGNORED_NAMES for p in path.parts):
+        if not path.is_file() or any(p in IGNORED_NAMES for p in path.relative_to(repo).parts):
             continue
         rel = path.relative_to(repo).as_posix()
         if rel.startswith(("config/", "vendor/")) or rel in exempt or path.suffix == ".lock":
@@ -167,7 +167,7 @@ def _iter_repo_python_files(repo: Path) -> list[tuple[Path, str, str | None]]:
         if not base.is_dir():
             continue
         for py_file in sorted(base.rglob("*.py")):
-            if any(part in IGNORED_NAMES for part in py_file.parts):
+            if any(part in IGNORED_NAMES for part in py_file.relative_to(repo).parts):
                 continue
             rel = py_file.relative_to(repo).as_posix()
             parts = Path(rel).parts

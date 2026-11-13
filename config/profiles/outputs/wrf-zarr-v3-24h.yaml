@@ -1,0 +1,8 @@
+profile_id: wrf-zarr-v3-24h
+schema_id: wrf-zarr-v3
+map_end_hour: 24
+hourly_through_hour: 24
+tail_step_hours: 1
+shard_time_steps: 1
+inner_chunk_yx: [64, 64]
+zstd_level: 3

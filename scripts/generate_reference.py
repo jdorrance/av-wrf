@@ -40,6 +40,7 @@ DECLARED_MARKDOWN: frozenset[str] = frozenset(
         "docs/reference.md",
         "docs/science.md",
         "config/README.md",
+        "config/comparisons/README.md",
         "docker/README.md",
         "docker/patches/README.md",
         "vendor/producer-contract/README.md",
@@ -135,7 +136,7 @@ def check_markdown_files(repo: Path) -> list[str]:
 
     found_md: set[str] = set()
     for md in sorted(repo.rglob("*.md")):
-        if any(p in IGNORED_NAMES for p in md.parts):
+        if any(p in IGNORED_NAMES for p in md.relative_to(repo).parts):
             continue
         rel = md.relative_to(repo).as_posix()
         found_md.add(rel)
