@@ -8,7 +8,11 @@ from pathlib import Path
 
 from scripts.export_comparison import export_registry
 
-from av_wrf.core.grid import latlon_to_lambert_xy_m, published_lambert_grid_metadata
+from av_wrf.core.grid import (
+    computational_latlon_bounds,
+    latlon_to_lambert_xy_m,
+    published_lambert_grid_metadata,
+)
 from av_wrf.core.namelist import compile_wrf_namelist_sections
 from av_wrf.core.nesting import forcing_domain, nesting_active
 from av_wrf.runner import load_bundle
@@ -67,7 +71,7 @@ def test_consumer_export_is_repeatable_and_preserves_other_models(tmp_path: Path
         "modelId": campaign["consumer"]["template_model"],
         "coverage": {},
         "capabilities": {},
-        "execution": {"schedule": []},
+        "execution": {"schedule": ["active-template-schedule"]},
     }
     registry = tmp_path / "registry.json"
     original = {"models": [template, {"modelId": "unchanged"}]}
@@ -84,3 +88,10 @@ def test_consumer_export_is_repeatable_and_preserves_other_models(tmp_path: Path
         assert model["grid"] == published_lambert_grid_metadata(bundle.domain)
         assert model["forecast"]["window"]["endHour"] == 24
         assert model["terrainSubdivisionFactor"] == 1
+        assert model["execution"]["schedule"] == []
+        coverage = model["coverage"]
+        west, south, east, north = computational_latlon_bounds(
+            bundle.domain, halo_deg=0, snap_deg=0.0001
+        )
+        assert west < coverage["west"] < coverage["east"] < east
+        assert south < coverage["south"] < coverage["north"] < north

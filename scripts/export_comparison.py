@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -23,10 +24,11 @@ def export_registry(config: Path, campaign: Path, registry: Path) -> dict[str, o
         bundle = load_bundle(config, product)
         domain, spec, output = bundle.domain, bundle.product, bundle.output
         model = copy.deepcopy(template)
-        west, south, east, north = computational_latlon_bounds(
-            domain, halo_deg=0, snap_deg=0.000001
-        )
-        coverage = copy.deepcopy(cast(dict[str, object], template["coverage"]))
+        # Consumer coverage encloses the published cells after lateral sponge trimming.
+        trim = 2 * domain.bdy_trim_cells
+        cropped = replace(domain, e_we=domain.e_we - trim, e_sn=domain.e_sn - trim)
+        west, south, east, north = computational_latlon_bounds(cropped, halo_deg=0, snap_deg=0.0001)
+        coverage = cast(dict[str, object], model["coverage"])
         coverage.update(
             id=f"{spec.model_id}-land",
             description=spec.label,
@@ -52,6 +54,7 @@ def export_registry(config: Path, campaign: Path, registry: Path) -> dict[str, o
             upstream={"protocol": "wrf-zarr-v3", "provider": "av-wrf", "modelId": spec.model_id},
             terrainSubdivisionFactor=consumer["terrain_subdivision_factor"],
         )
+        cast(dict[str, object], model["execution"])["schedule"] = []
         model["forecast"] = {
             "intervalHours": 1,
             "cycleHoursUtc": [spec.publish_origin_hour_utc],
@@ -66,11 +69,9 @@ def export_registry(config: Path, campaign: Path, registry: Path) -> dict[str, o
             },
         }
         model["freshness"] = {"maxCycleAgeHours": spec.max_cycle_age_hours}
-        cast(dict[str, object], model["capabilities"])["maxVerticalLevels"] = (
-            domain.exported_levels_k
-        )
-        models[:] = [m for m in models if m["modelId"] != spec.model_id]
-        models.append(model)
+        capabilities = cast(dict[str, object], model["capabilities"])
+        capabilities["maxVerticalLevels"] = domain.exported_levels_k
+        models[:] = [m for m in models if m["modelId"] != spec.model_id] + [model]
     return result
 
 
