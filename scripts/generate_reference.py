@@ -40,6 +40,7 @@ DECLARED_MARKDOWN: frozenset[str] = frozenset(
         "docs/reference.md",
         "docs/science.md",
         "config/README.md",
+        "config/comparisons/README.md",
         "docker/README.md",
         "docker/patches/README.md",
         "vendor/producer-contract/README.md",

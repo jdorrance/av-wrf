@@ -1,0 +1,84 @@
+{
+  "baseline_model": "icon-eu",
+  "products": [
+    "wrf-armenia-pilot-dwd-3km",
+    "wrf-armenia-pilot-dwd-1km"
+  ],
+  "sites": [
+    {
+      "id": "yerevan-north",
+      "lat": 40.27,
+      "lon": 44.52,
+      "name": "yerevan-north",
+      "region": "europe-caucasus",
+      "terrain": "valley",
+      "timezone": "Asia/Yerevan",
+      "source": "Comparison probe; attach collocated quality-controlled observations"
+    },
+    {
+      "id": "sevan",
+      "lat": 40.55,
+      "lon": 44.96,
+      "name": "sevan",
+      "region": "europe-caucasus",
+      "terrain": "valley",
+      "timezone": "Asia/Yerevan",
+      "source": "Comparison probe; attach collocated quality-controlled observations"
+    },
+    {
+      "id": "aparan",
+      "lat": 40.59,
+      "lon": 44.36,
+      "name": "aparan",
+      "region": "europe-caucasus",
+      "terrain": "valley",
+      "timezone": "Asia/Yerevan",
+      "source": "Comparison probe; attach collocated quality-controlled observations"
+    },
+    {
+      "id": "gyumri",
+      "lat": 40.79,
+      "lon": 43.85,
+      "name": "gyumri",
+      "region": "europe-caucasus",
+      "terrain": "valley",
+      "timezone": "Asia/Yerevan",
+      "source": "Comparison probe; attach collocated quality-controlled observations"
+    },
+    {
+      "id": "aragats-south",
+      "lat": 40.4,
+      "lon": 44.22,
+      "name": "aragats-south",
+      "region": "europe-caucasus",
+      "terrain": "slope",
+      "timezone": "Asia/Yerevan",
+      "source": "Comparison probe; attach collocated quality-controlled observations"
+    },
+    {
+      "id": "aragats-north",
+      "lat": 40.64,
+      "lon": 44.2,
+      "name": "aragats-north",
+      "region": "europe-caucasus",
+      "terrain": "slope",
+      "timezone": "Asia/Yerevan",
+      "source": "Comparison probe; attach collocated quality-controlled observations"
+    }
+  ],
+  "layers": [
+    "wind-10m-u",
+    "wind-10m-v",
+    "sfc-temp-c",
+    "sfc-dewpoint-c",
+    "cloud-cover-low",
+    "thermal-top-msl",
+    "thermal-velocity",
+    "usable-lift-msl"
+  ],
+  "consumer": {
+    "template_model": "av-wrf",
+    "terrain_subdivision_factor": 1
+  },
+  "forcing_profile": "dwd-icon-eu-v1"
+}

@@ -31,3 +31,5 @@ Unknown keys, templating syntax, and environment interpolation are rejected at
 parse time, and `scripts/check_repo.py` rejects any
 region or product identifier hardcoded outside `config/`. Run
 `uv run python scripts/generate_reference.py` after editing any profile.
+
+[Comparisons](comparisons/README.md) owns paired products, probes and consumer handoff.

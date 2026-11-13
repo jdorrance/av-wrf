@@ -30,6 +30,8 @@ The configured `min_horizon_hours` sets the lower bound.
 - `wrf-armenia-3km`: published grid `204 x 174` (`x0M = -304500.0`, `y0M = -259500.0`), primary `noaa-gfs-0p25-v1` (candidate `ecmwf-ifs-0p1-v1`, recipe available), `72` leads, `17` BL levels (`0-2 km` AGL), remaining-horizon floor `66 h`, `time_step = 15 s`.
 - `wrf-armenia-pilot-3km-dwd`: published grid `84 x 84` (`x0M = -124500.0`, `y0M = -124500.0`), primary `dwd-icon-eu-v1` (candidate `noaa-gfs-0p25-v1`, recipe available), `16` leads, `17` BL levels (`0-2 km` AGL), remaining-horizon floor `10 h`, `time_step = 15 s`.
 - `wrf-armenia-pilot-3km`: published grid `84 x 84` (`x0M = -124500.0`, `y0M = -124500.0`), primary `noaa-gfs-0p25-v1` (candidate `ecmwf-ifs-0p1-v1`, recipe available), `16` leads, `17` BL levels (`0-2 km` AGL), remaining-horizon floor `10 h`, `time_step = 15 s`.
+- `wrf-armenia-pilot-dwd-1km`: published grid `156 x 114` (`x0M = -77500.0`, `y0M = -56500.0`), primary `dwd-icon-eu-v1` (candidate `noaa-gfs-0p25-v1`, recipe available), `24` leads, `17` BL levels (`0-2 km` AGL), remaining-horizon floor `18 h`, `time_step = 5 s`.
+- `wrf-armenia-pilot-dwd-3km`: published grid `106 x 92` (`x0M = -157500.0`, `y0M = -136500.0`), primary `dwd-icon-eu-v1` (candidate `noaa-gfs-0p25-v1`, recipe available), `24` leads, `17` BL levels (`0-2 km` AGL), remaining-horizon floor `18 h`, `time_step = 15 s`.
 
 ## Wire Schema `wrf-zarr-v3` (v1, `provisional-phase-1`)
 
