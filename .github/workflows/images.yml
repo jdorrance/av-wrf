@@ -34,7 +34,8 @@ concurrency:
 jobs:
   images:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 45
+    # A cold ARM solver build takes ~44 minutes; retain time for export and native checks.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
