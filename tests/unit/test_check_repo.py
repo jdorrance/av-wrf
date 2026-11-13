@@ -22,7 +22,8 @@ class TestCheckRepoHarness(unittest.TestCase):
 
     def test_tolerates_local_artifacts_and_catches_agent_loopholes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            clone = Path(tmp) / "repo"
+            # Hosted checkouts live below a directory named work; only repo children are ignored.
+            clone = Path(tmp) / "work" / "repo"
             shutil.copytree(
                 ROOT,
                 clone,
